@@ -744,6 +744,7 @@ function makeTopLevelRunner(opts: {
       }
     }),
     conversationId: opts.conversationId,
+    modelInfo: { slug: "base-model", contextWindow: 65_536 },
     providerService,
     permissionModeRegistry,
     get sessionConfiguration() {
@@ -945,6 +946,7 @@ function makeTopLevelRunner(opts: {
   };
   const bootstrap = vi.fn(async () => ({
     workspaceRoot,
+    modelInfo: { slug: "base-model", contextWindow: 65_536 },
     configStore,
     get configuredExecutionAuthority() {
       return configuredExecutionAuthority;
@@ -9604,6 +9606,128 @@ describe("AgenC delegate background-agent runner", () => {
     await expect(
       runner.getAgentSnapshot("session-completed-turn-status"),
     ).resolves.toMatchObject({ status: "idle" });
+  });
+
+  it("[managed-thread] snapshots the live model window, prompt, and per-model cost authority", async () => {
+    const { runner, session, sessionState } = makeTopLevelRunner({
+      conversationId: "session-context-accounting",
+      totalTokenUsage: () => ({
+        inputTokens: 2_000,
+        outputTokens: 100,
+        totalTokens: 2_100,
+      }),
+    });
+    const hasUnknownModelCost = vi.fn(() => false);
+    const getTotalCostUsd = vi.fn(() => 1.2345);
+    const getSessionTotals = vi.fn(() => ({
+      inputTokens: 2_000,
+      outputTokens: 100,
+      totalTokens: 2_100,
+    }));
+    Object.assign(session.services, {
+      costSidecar: {
+        getTotalCostUsd,
+        getSessionTotals,
+        hasUnknownModelCost,
+      },
+    });
+
+    await runner.startAgent({
+      objective: "inspect live context accounting",
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+
+    // Model switching updates the live Session, not bootstrap.modelInfo.
+    // Keep the bootstrap fixture at 65,536 to catch stale-window reads.
+    Object.assign(session, {
+      modelInfo: { slug: "kimi-k2.6", contextWindow: 262_144 },
+    });
+    sessionState.sessionConfiguration = {
+      ...sessionState.sessionConfiguration,
+      provider: { slug: "kimi" },
+      collaborationMode: { model: "kimi-k2.6" },
+      baseInstructions:
+        "These are the active session base instructions after the model switch.",
+    };
+
+    const snapshot = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+
+    expect(snapshot.tokenUsage).toEqual({
+      inputTokens: 2_000,
+      outputTokens: 100,
+      totalTokens: 2_100,
+      costUsd: 1.2345,
+      costKnown: true,
+    });
+    expect(snapshot.contextBreakdown).toMatchObject({
+      provider: "kimi",
+      model: "kimi-k2.6",
+      estimated: true,
+      windowTokens: 262_144,
+      systemPromptTokens: expect.any(Number),
+    });
+    expect(snapshot.contextBreakdown?.systemPromptTokens).toBeGreaterThan(0);
+    expect(getTotalCostUsd).toHaveBeenCalled();
+    expect(getSessionTotals).toHaveBeenCalled();
+    expect(hasUnknownModelCost).toHaveBeenCalled();
+
+    hasUnknownModelCost.mockReturnValue(true);
+    const partiallyKnown = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+    expect(partiallyKnown.tokenUsage).toMatchObject({
+      costUsd: 1.2345,
+      costKnown: false,
+    });
+
+    hasUnknownModelCost.mockReturnValue(false);
+    sessionState.initialTokenUsage = {
+      promptTokens: 1_500,
+      completionTokens: 50,
+      totalTokens: 1_550,
+    };
+    const resumedWithoutRestoredCosts = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+    expect(resumedWithoutRestoredCosts.tokenUsage).toMatchObject({
+      costUsd: 1.2345,
+      costKnown: false,
+    });
+
+    delete sessionState.initialTokenUsage;
+    getSessionTotals.mockReturnValue({
+      inputTokens: 1_999,
+      outputTokens: 100,
+      totalTokens: 2_099,
+    });
+    const incompleteSidecar = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+    expect(incompleteSidecar.tokenUsage).toMatchObject({
+      costUsd: 1.2345,
+      costKnown: false,
+    });
+
+    delete (
+      session.services as typeof session.services & {
+        costSidecar?: unknown;
+      }
+    ).costSidecar;
+    const withoutSidecar = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+    expect(withoutSidecar.tokenUsage).toMatchObject({
+      costUsd: 0,
+      costKnown: false,
+    });
   });
 
   it("[managed-thread] interruptAgentTurn aborts the active session and submits interrupt op on managed thread", async () => {

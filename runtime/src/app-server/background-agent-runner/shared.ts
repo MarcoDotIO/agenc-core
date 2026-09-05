@@ -777,6 +777,8 @@ interface AgentTerminalUsage {
   readonly outputTokens: number;
   readonly totalTokens: number;
   readonly costUsd: number;
+  /** False when historical coverage or a per-model price is incomplete. */
+  readonly costKnown: boolean;
 }
 
 function positiveSequence(value: unknown): number | undefined {

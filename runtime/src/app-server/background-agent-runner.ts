@@ -2430,6 +2430,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         outputTokens: finiteNumber(usage.outputTokens),
         totalTokens: finiteNumber(usage.totalTokens),
         costUsd: finiteNumber(usage.costUsd),
+        costKnown: usage.costKnown,
       },
       cacheStats: cache,
       ...(breakdown !== undefined ? { contextBreakdown: breakdown } : {}),
@@ -2502,6 +2503,17 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       }
 
       const state = bootstrap.session.state?.unsafePeek?.();
+      const sessionConfiguration = (
+        state as
+          | {
+              sessionConfiguration?: {
+                baseInstructions?: unknown;
+                collaborationMode?: { model?: unknown };
+                provider?: { slug?: unknown };
+              };
+            }
+          | undefined
+      )?.sessionConfiguration;
       const history = Array.isArray(
         (state as { history?: unknown[] } | undefined)?.history,
       )
@@ -2517,18 +2529,38 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       }
 
       const instructions =
-        (
-          bootstrap.session as unknown as {
-            baseInstructions?: string;
-            instructions?: string;
-          }
-        ).baseInstructions ??
-        (bootstrap.session as unknown as { instructions?: string })
-          .instructions ??
-        "";
+        typeof sessionConfiguration?.baseInstructions === "string"
+          ? sessionConfiguration.baseInstructions
+          : "";
+      const liveModelInfo = (
+        bootstrap.session as unknown as {
+          readonly modelInfo?: {
+            readonly slug?: unknown;
+            readonly contextWindow?: unknown;
+          };
+        }
+      ).modelInfo;
+      const liveBinding = bootstrap.session.services.providerService?.current();
+      const model =
+        typeof liveBinding?.model === "string"
+          ? liveBinding.model
+          : typeof liveModelInfo?.slug === "string"
+            ? liveModelInfo.slug
+            : typeof sessionConfiguration?.collaborationMode?.model === "string"
+              ? sessionConfiguration.collaborationMode.model
+              : undefined;
+      const provider =
+        typeof liveBinding?.provider === "string"
+          ? liveBinding.provider
+          : typeof sessionConfiguration?.provider?.slug === "string"
+            ? sessionConfiguration.provider.slug
+            : undefined;
 
       return {
-        windowTokens: finiteNumber(bootstrap.modelInfo.contextWindow ?? 0),
+        ...(provider !== undefined ? { provider } : {}),
+        ...(model !== undefined ? { model } : {}),
+        estimated: true,
+        windowTokens: finiteNumber(liveModelInfo?.contextWindow ?? 0),
         messageTokens: finiteNumber(messageTokens),
         systemPromptTokens: finiteNumber(estimate(instructions)),
         systemToolTokens: finiteNumber(systemToolTokens),

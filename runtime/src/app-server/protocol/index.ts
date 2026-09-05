@@ -2707,6 +2707,8 @@ export interface RunUsageTotals extends JsonObject {
   readonly outputTokens: number;
   readonly totalTokens: number;
   readonly costUsd: number;
+  /** False when historical coverage or model pricing is incomplete. */
+  readonly costKnown?: boolean;
 }
 
 /** Terminal output committed by M4 and readable after disconnect/restart. */
@@ -2998,6 +3000,8 @@ export interface SessionSnapshotResult extends JsonObject {
     readonly outputTokens: number;
     readonly totalTokens: number;
     readonly costUsd: number;
+    /** False when historical coverage or model pricing is incomplete. */
+    readonly costKnown?: boolean;
   };
   /** Cumulative cache metrics across API calls this session. */
   readonly cacheStats: {
@@ -3014,6 +3018,11 @@ export interface SessionSnapshotResult extends JsonObject {
    * which is why a UI showing them had to make numbers up.
    */
   readonly contextBreakdown?: {
+    /** Active provider/model whose context window this estimate describes. */
+    readonly provider?: string;
+    readonly model?: string;
+    /** Counts use the runtime's rough estimator rather than provider tokens. */
+    readonly estimated?: boolean;
     /** The model's real window, so shares are against the truth. */
     readonly windowTokens: number;
     readonly messageTokens: number;
