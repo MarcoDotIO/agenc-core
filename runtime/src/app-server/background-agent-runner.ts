@@ -4859,6 +4859,35 @@ function prepareDaemonUserPrompt(params: {
   );
 }
 
+async function consumeDaemonPendingProviderSwitches(
+  session: LocalRuntimeBootstrap["session"],
+  configStore: LocalRuntimeBootstrap["configStore"],
+): Promise<void> {
+  while (session.pendingProviderSwitch !== null) {
+    const pending = session.pendingProviderSwitch;
+    const outcome = await runWithCurrentRuntimeSession(session, () =>
+      runWithCanonicalSettingsAuthority(configStore, () =>
+        session.consumePendingProviderSwitch(),
+      ),
+    );
+    if (outcome.applied) continue;
+
+    // A concurrent replacement may supersede the switch while it is being
+    // prepared. Let the loop consume that successor. If the owned switch was
+    // rejected or left unchanged, fail the submit instead of silently running
+    // the user's prompt on the previous provider/model.
+    if (
+      session.pendingProviderSwitch !== null &&
+      session.pendingProviderSwitch !== pending
+    ) {
+      continue;
+    }
+    throw new Error(
+      `provider switch to ${pending.provider}/${pending.model} could not be applied before turn: ${outcome.reason}`,
+    );
+  }
+}
+
 // Install the daemon turn driver. Prompt ingress normally runs before durable
 // message publication, while this driver retains the same authority for direct
 // Session.submit callers that do not cross the daemon message boundary.
@@ -4902,6 +4931,12 @@ function installDaemonTurnDriverHooks(
         turnInput = prepared.input;
         promptDisplayText = prepared.displayInput ?? promptDisplayText;
       }
+      // `setAgentModel` stages a prepared provider binding for the next turn.
+      // Consume it before freezing the immutable TurnContext. Passing an
+      // already-built context to Session.runTurn deliberately preserves newer
+      // mid-turn switches, so omitting this boundary would make the kernel see
+      // the staged switch and close this user turn without sampling.
+      await consumeDaemonPendingProviderSwitches(session, configStore);
       const baseCtx = (
         session as unknown as { newDefaultTurn: () => unknown }
       ).newDefaultTurn();
