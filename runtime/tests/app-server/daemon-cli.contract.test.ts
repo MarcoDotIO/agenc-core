@@ -38,6 +38,10 @@ import { AGENC_DAEMON_PROTOCOL_VERSION } from "./protocol/index.js";
 import { AgenCDaemonSessionManager } from "./session-lifecycle.js";
 import { ensureAgenCDaemonAutostart } from "./daemon-autostart.js";
 import {
+  AGENC_DAEMON_HEARTBEAT_FRESH_MS,
+  resolveAgenCDaemonHeartbeatPath,
+} from "./daemon-heartbeat.js";
+import {
   AGENC_DAEMON_PID_MAX_BYTES,
   AGENC_DAEMON_READY_TIMEOUT_MS_ENV,
   AGENC_DAEMON_WEBSOCKET_DEFAULT_HOST,
@@ -3013,6 +3017,88 @@ describe("AgenC daemon CLI", () => {
     expect(host.runningPids.has(4602)).toBe(true);
 
     await rm(agencHome, { recursive: true, force: true });
+  });
+
+  // #2225: while the replacement daemon recovers its agent runs it is serving
+  // but has not committed its identity; the heartbeat proves it is alive, so
+  // status says so instead of "indeterminate".
+  async function statusOfUnboundPid(
+    heartbeat: { readonly pid: number; readonly ageMs: number } | null,
+  ): Promise<{
+    readonly code: number;
+    readonly out: string;
+    readonly err: string;
+    readonly terminatedPids: readonly number[];
+    readonly healthProbes: number;
+  }> {
+    const agencHome = await tempAgencHome();
+    const host = { ...createHost(agencHome), platform: "darwin" as const };
+    const io = createIo();
+    host.runningPids.add(4602);
+    await writeAgenCDaemonPid(resolveAgenCDaemonPidPath(host.env, host.userHome), 4602);
+    if (heartbeat !== null) {
+      writeFileSync(
+        resolveAgenCDaemonHeartbeatPath(agencHome),
+        JSON.stringify({
+          pid: heartbeat.pid,
+          beat: 45,
+          at: new Date(Date.now() - heartbeat.ageMs).toISOString(),
+          uptimeS: 225,
+          rssMb: 950,
+          heapUsedMb: 700,
+          eventLoopLagMs: 12,
+        }),
+      );
+    }
+    const requestHealthStats = vi.fn(async () => {
+      throw new Error("must not probe an unbound pid");
+    });
+    const code = await runAgenCDaemonCli(
+      { kind: "command", action: "status" },
+      { host, io, requestHealthStats },
+    );
+    await rm(agencHome, { recursive: true, force: true });
+    return {
+      code,
+      out: io.stdoutText(),
+      err: io.stderrText(),
+      terminatedPids: host.terminatedPids,
+      healthProbes: requestHealthStats.mock.calls.length,
+    };
+  }
+
+  it("reports an unbound live pid as alive but not yet bound when its heartbeat is fresh", async () => {
+    const result = await statusOfUnboundPid({ pid: 4602, ageMs: 2_000 });
+    expect(result.code).toBe(1);
+    expect(result.out).toContain("AgenC daemon alive but not yet bound (pid 4602)");
+    expect(result.out).toContain("identity: not published yet");
+    expect(result.out).toMatch(
+      /heartbeat: \d+ s ago, rss 950 MB, heap 700 MB, event-loop lag 12 ms, up 4 min/u,
+    );
+    expect(result.out).not.toContain("daemon running");
+    expect(result.err).not.toContain("indeterminate");
+    expect(result.healthProbes).toBe(0);
+    expect(result.terminatedPids).toEqual([]);
+  });
+
+  it("keeps an unbound pid indeterminate when its heartbeat is stale, and says how old it is", async () => {
+    const result = await statusOfUnboundPid({
+      pid: 4602,
+      ageMs: AGENC_DAEMON_HEARTBEAT_FRESH_MS + 45_000,
+    });
+    expect(result.code).toBe(1);
+    expect(result.out).not.toContain("alive but not yet bound");
+    expect(result.err).toContain("indeterminate for unbound pid 4602");
+    expect(result.err).toMatch(/its last heartbeat is \d+ s old .* so the process may be hung/u);
+  });
+
+  it("does not vouch for an unbound pid on another process's heartbeat", async () => {
+    const result = await statusOfUnboundPid({ pid: 4601, ageMs: 2_000 });
+    expect(result.code).toBe(1);
+    expect(result.out).not.toContain("alive but not yet bound");
+    expect(result.err).toContain(
+      "indeterminate for unbound pid 4602; no portable instance identity is available",
+    );
   });
 
   it("reload targets the authenticated sidecar instead of a live reused pid", async () => {

@@ -4,8 +4,11 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  AGENC_DAEMON_HEARTBEAT_FRESH_MS,
   describeDaemonHeartbeat,
+  describeUnboundDaemonHeartbeat,
   installAgenCDaemonHeartbeat,
+  isDaemonHeartbeatFresh,
   readAgenCDaemonHeartbeat,
   reportLastDaemonHeartbeat,
   resolveAgenCDaemonHeartbeatPath,
@@ -35,6 +38,38 @@ afterEach(() => {
 });
 
 describe("daemon heartbeat", () => {
+  // #2225: the replacement daemon's heartbeat while it recovers, before its identity is published.
+  const unbound = {
+    pid: 149,
+    beat: 45,
+    at: "2026-09-06T12:38:57.000Z",
+    uptimeS: 225,
+    rssMb: 950,
+    heapUsedMb: 700,
+    eventLoopLagMs: 12,
+  };
+
+  // #2225: a daemon that is beating but has not published its identity is
+  // reported as alive and not yet bound, not as indeterminate.
+  it("treats a heartbeat within three intervals as fresh and older ones as stale", () => {
+    const sent = Date.parse(unbound.at);
+    const heartbeat = unbound;
+    expect(isDaemonHeartbeatFresh(heartbeat, sent)).toBe(true);
+    expect(isDaemonHeartbeatFresh(heartbeat, sent + AGENC_DAEMON_HEARTBEAT_FRESH_MS)).toBe(true);
+    expect(isDaemonHeartbeatFresh(heartbeat, sent + AGENC_DAEMON_HEARTBEAT_FRESH_MS + 1)).toBe(false);
+    // A clock that runs behind the writer must not turn a live daemon stale.
+    expect(isDaemonHeartbeatFresh(heartbeat, sent - 60_000)).toBe(true);
+  });
+
+  it("describes an unbound daemon with its pid, the pending identity and its vitals", () => {
+    const text = describeUnboundDaemonHeartbeat(unbound, Date.parse("2026-09-06T12:39:00.000Z"));
+    expect(text.split("\n").filter(Boolean)).toEqual([
+      "AgenC daemon alive but not yet bound (pid 149)",
+      "  identity: not published yet (still starting, or the runtime record was removed); lifecycle commands wait for it",
+      "  heartbeat: 3 s ago, rss 950 MB, heap 700 MB, event-loop lag 12 ms, up 4 min",
+    ]);
+  });
+
   it("writes a beat at once and on every interval, with pid, memory and lag", () => {
     const dispose = installAgenCDaemonHeartbeat({ path, intervalMs: 1_000, proc });
     try {
