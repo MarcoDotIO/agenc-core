@@ -4998,7 +4998,9 @@ snapshot_max_bytes = 64
     expect(agentList.agents[1]).toMatchObject({
       agentId: "run-restart",
       objective: "recover daemon state",
-      status: "running",
+      // Restored with nothing to resume: idle until its next prompt. The
+      // run's own persisted status stays "running" in the recovery metadata.
+      status: "idle",
       activeSessionIds: ["session-restart"],
       metadata: {
         recovery: {
@@ -5031,7 +5033,7 @@ snapshot_max_bytes = 64
     });
     expect(agentList.agents[0]).toMatchObject({
       agentId: "run-other",
-      status: "running",
+      status: "idle",
       metadata: {
         recovery: {
           runStatus: "blocked",
@@ -6200,7 +6202,7 @@ snapshot_max_bytes = 64
     );
     expect(recovered).toMatchObject({
       agentId: createdAgentId,
-      status: "running",
+      status: "idle",
       metadata: {
         recovery: {
           runnable: true,
