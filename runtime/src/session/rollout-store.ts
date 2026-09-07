@@ -3705,6 +3705,16 @@ export class RolloutStore {
     this.store.setFsyncImplForTest(impl);
   }
 
+  /**
+   * Register (or clear) a listener for successful rollout appends.
+   * `FileThreadStore` uses this to keep `thread_rollout_items` current.
+   */
+  setOnRolloutCommitted(
+    listener: ((rolloutPath: string) => void) | undefined,
+  ): void {
+    this.store.setOnRolloutCommitted(listener);
+  }
+
   close(): void {
     this.scheduler.stop();
     this.stateDriver.close();
