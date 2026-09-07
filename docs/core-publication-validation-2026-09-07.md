@@ -119,3 +119,26 @@ size rejection; its file passed **108 tests with seven existing skips**.
 These checks use disposable hermetic state in the isolated integration worktree.
 No live Core process, runtime binary, credentials, sessions, or configuration
 were changed.
+
+## Credential fallback correction
+
+Hosted CI on `32c47ef` exposed an actual integration regression: a generic
+`mode-required` guard intended to block OpenAI/Grok OAuth fallback also blocked
+Gemini's explicitly selected API-key mode from reading saved BYOK. The fallback
+policy now uses only the OpenAI/Grok selectable preference. Gemini keeps its own
+credential-plan rules; access-token and ADC modes still cannot become API-key
+mode. Selected OpenAI/Grok OAuth cannot read saved paid keys, and either explicit
+selection cannot obtain managed credentials instead.
+
+The new Gemini provenance regression failed before the source fix. Afterward,
+the existing bootstrap file passed all **56 tests**, and the expanded credential
+authority/Grok factory checks passed **54 tests**. Runtime, test-support, and SDK
+no-emit checks plus generated SDK consistency passed. The broad local diagnostic
+was stopped before changing source after this hosted failure; it has no complete
+or passing result and does not replace hosted CI.
+
+Fresh main subsequently advanced to `16277d7` (PR #2264, atomic task ID/alias
+claims). It was merged without conflicts. Its identifier tests and the preceding
+task-settlement/signal-cleanup regressions passed **45 tests in three files**.
+The original publication remains ancestry and protocol/SDK mirror bytes remain
+unchanged. Hosted checks must pass again on the final integrated head.
