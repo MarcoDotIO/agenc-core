@@ -88,3 +88,34 @@ environment names. That bounded change retains redaction, adds a mixed-case
 ordering/redaction regression, and passed all **14 MCP management tests** plus
 the three no-emit TypeScript checks. Hosted checks remain pending until their
 results appear on the PR.
+
+## Protocol fixture and refreshed-main follow-up
+
+Hosted CI reached an unchanged consumer still treating protocol 1.10 as a future
+version. Four consumer fixtures now explicitly expect current 1.10, reject future
+1.11 before authentication, and retain the authentication assertions. SDK
+downgrade coverage now also includes the older 1.9 daemon. A disposable canonical
+SDK home replaces a hard-coded `/tmp` spelling. These checks passed **203 tests
+in six files**.
+
+A fresh-main guard then found upstream `d9764469dfe9c168caeeb890386a50725e2ec20f`
+(PR #2262). Its shutdown-cleanup and task-settlement fixes were merged without
+conflicts, preserving both the publication and current main. Their focused
+regressions passed **27 tests in two files**; all three no-emit TypeScript checks
+and generated SDK consistency passed. Compared with the previously reviewed
+`97d6bcdf3a8735b050f8818168dc77a089d90a68`, production changes are confined to
+upstream's daemon CLI, signal handlers, and task lifecycle. Protocol and SDK
+mirror bytes are unchanged.
+
+The full affected-test selection is derived from `scripts/run-fast-checks.mjs`
+against the refreshed main. The local diagnostic run uses its same 81 runtime
+inputs and two-worker cap, removing early bail only to collect failures. It is
+not yet a passing full-lane result. A focused CLI/autostart run encountered 27
+macOS/native-identity fixture failures; authentication expectations were not
+relaxed. Hosted pinned Linux CI remains required. A separate quarantine fixture
+keeps each path below macOS PATH_MAX while still asserting the same aggregate
+size rejection; its file passed **108 tests with seven existing skips**.
+
+These checks use disposable hermetic state in the isolated integration worktree.
+No live Core process, runtime binary, credentials, sessions, or configuration
+were changed.

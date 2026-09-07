@@ -3242,8 +3242,10 @@ describe("WorkspaceMutationCoordinator", () => {
       buffers: [],
     });
     await coordinator.flushQuarantinePersistence();
+    // Keep individual paths below macOS PATH_MAX while the 512-entry snapshot
+    // still exceeds the persisted quarantine byte limit.
     const longRelativePrefix = Array.from(
-      { length: 12 },
+      { length: 9 },
       (_, index) => `segment-${index}-${"x".repeat(80)}`,
     ).join("/");
     const buffers = Array.from({ length: 512 }, (_, index) => {
