@@ -61,6 +61,8 @@ export interface RemoteRuntimeAuthSecureStorage {
 
 /** Channel and surface credentials owned by the standalone gateway process. */
 export interface GatewaySecureStorage {
+  readonly ownerControlBotToken?: string
+  readonly ownerControlAgentTokens?: Readonly<Record<string, string>>
   readonly environment?: Readonly<Record<string, string>>
   readonly generatedTokens?: {
     readonly hooks?: string
@@ -98,6 +100,8 @@ export interface SecureStorageData {
       serverUrl: string
       accessToken: string
       refreshToken?: string
+      /** Explicit-login generation; delayed refreshes must not overwrite a newer login. */
+      authorizationGeneration?: string
       expiresAt: number
       scope?: string
       clientId?: string

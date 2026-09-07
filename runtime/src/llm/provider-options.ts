@@ -37,6 +37,7 @@ import {
   resolveBuiltInProviderInfo,
 } from "./registry/provider-info.js";
 import { resolveGrokProviderCredential } from "./xai-capability-config.js";
+import { providerAuthPreference } from "./provider-auth-selection.js";
 import type { ProviderFactoryOptions, ProviderName } from "./provider.js";
 import {
   assertNoRetiredGeminiRuntimeFields,
@@ -276,7 +277,8 @@ function projectProviderCredentialState(params: {
   }
   if (
     params.provider === "grok" &&
-    isGrokComposerModel(params.factoryOptions.model)
+    isGrokComposerModel(params.factoryOptions.model) &&
+    providerAuthPreference("grok", params.snapshot) === "auto"
   ) {
     return Object.freeze({
       status: "not-required",
@@ -459,6 +461,17 @@ function resolveProviderCredentialAuthorityCore(
     );
   }
   const snapshot = snapshotProviderEnvironment(env);
+  const authPreference = provider === "openai" || provider === "grok"
+    ? providerAuthPreference(provider, snapshot)
+    : "auto";
+  if (
+    provider === "openai" && authPreference === "api-key" &&
+    (requested.extra?.authMode === "oauth" ||
+      requested.extra?.chatgptBackend === true ||
+      requested.extra?.oauth !== undefined)
+  ) {
+    throw new Error("OpenAI API-key selection conflicts with OAuth factory options");
+  }
   const home = requested.credentialHome;
   const credentialEnvironment =
     provider === "gemini"
@@ -481,10 +494,14 @@ function resolveProviderCredentialAuthorityCore(
       : undefined;
   let apiKey =
     provider === "grok" && home !== undefined
-      ? (grokCredential?.value ?? nonEmpty(candidates.savedApiKey))
+      ? (grokCredential?.value ??
+        (authPreference === "oauth" ? undefined : nonEmpty(candidates.savedApiKey)))
       : (explicitApiKey ??
         environmentApiKey ??
         nonEmpty(candidates.savedApiKey));
+  if (provider === "grok" && authPreference === "oauth" && grokCredential?.isOAuth !== true) {
+    apiKey = undefined;
+  }
   if (authToken !== undefined) {
     apiKey = undefined;
   }
@@ -503,10 +520,14 @@ function resolveProviderCredentialAuthorityCore(
     if (organization !== undefined) resolvedExtra.organization = organization;
     if (project !== undefined) resolvedExtra.project = project;
 
-    if (nonEmpty(requested.apiKey) === undefined) {
+    if (authPreference === "oauth") apiKey = undefined;
+    if (
+      authPreference !== "api-key" &&
+      (nonEmpty(requested.apiKey) === undefined || authPreference === "oauth")
+    ) {
       const stored =
         home === undefined ? undefined : readOpenAiOauthCredentials(home);
-      if (stored?.apiKey !== undefined) {
+      if (stored?.apiKey !== undefined && authPreference !== "oauth") {
         apiKey = stored.apiKey;
         baseURL = assertOpenAiOauthBaseUrl(baseURL);
         openAiNativeAuthMode = "api-key";
@@ -568,6 +589,15 @@ function resolveProviderCredentialAuthorityCore(
             ...chatGptSubscriptionHeaders(subscription.accountId),
           };
         }
+      }
+    }
+    if (authPreference === "api-key" && apiKey === undefined && home !== undefined) {
+      const stored = readOpenAiOauthCredentials(home);
+      if (stored?.apiKey !== undefined) {
+        apiKey = stored.apiKey;
+        baseURL = assertOpenAiOauthBaseUrl(baseURL);
+        openAiNativeAuthMode = "api-key";
+        forcedExtra.authMode = "api_key";
       }
     }
   }
@@ -728,17 +758,26 @@ function resolveProviderCredentialAuthorityCore(
   };
   return Object.freeze({
     factoryOptions,
-    credential: projectProviderCredentialState({
-      provider,
-      requested,
-      snapshot,
-      candidates,
-      factoryOptions,
-      credentialEnvironment,
-      grokCredential,
-      openAiNativeAuthMode,
-      geminiCredentialPlan,
-    }),
+    credential: authPreference === "oauth" &&
+      ((provider === "openai" && openAiNativeAuthMode !== "oauth") ||
+        (provider === "grok" && grokCredential?.isOAuth !== true))
+      ? missingCredential(
+          `${provider} OAuth selected`,
+          `stored ${provider} OAuth sign-in`,
+          undefined,
+          "mode-required",
+        )
+      : projectProviderCredentialState({
+          provider,
+          requested,
+          snapshot,
+          candidates,
+          factoryOptions,
+          credentialEnvironment,
+          grokCredential,
+          openAiNativeAuthMode,
+          geminiCredentialPlan,
+        }),
   });
 }
 
@@ -828,6 +867,7 @@ export async function resolveProviderRuntimeAuthority(
   const info = resolveBuiltInProviderInfo(provider);
   if (
     resolved.credential.status === "missing" &&
+    resolved.credential.reason !== "mode-required" &&
     info?.onboarding.access === "api-key" &&
     runtime.readSavedApiKey !== undefined
   ) {
@@ -841,6 +881,9 @@ export async function resolveProviderRuntimeAuthority(
   const sessionId = nonEmpty(runtime.sessionId);
   const managedCredential =
     resolved.credential.status === "missing" &&
+    resolved.credential.reason !== "mode-required" &&
+    (!(provider === "openai" || provider === "grok") ||
+      providerAuthPreference(provider, env) === "auto") &&
     runtime.managedKeysEnabled === true &&
     info?.onboarding.supportsManagedKeyAccess === true &&
     runtime.authBackend !== undefined &&

@@ -4220,6 +4220,24 @@ describe("AgenC delegate background-agent runner", () => {
     });
   });
 
+  it.each(["completed", "error", "max_turns", "cancelled"] as const)("finalizes a routine's %s phase as the matching canonical outcome", async (stopReason) => {
+    const agentId = "session-routine-finalize";
+    const { runner, rolloutItems, control, session } = makeTopLevelRunner({ conversationId: agentId });
+    await runner.startAgent({ objective: "one routine", deferInitialTurn: true, unattendedAllow: [], unattendedDeny: [] });
+    control.sendInput.mockImplementationOnce(async () => { session.emitPhaseEvent({ type: "turn_complete", content: "done", stopReason, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } }); });
+    await runner.submitAgentMessage(agentId, { sessionId: agentId, content: "inspect", originalContent: "inspect", messageId: "routine-message", streamId: "routine-stream", acceptedAt: "2026-05-09T00:00:00.000Z" });
+    await expect(runner.finishAgentRun(agentId, "unrelated-message")).rejects.toThrow("unknown routine message");
+    const status = stopReason === "completed" ? "completed" : stopReason === "cancelled" ? "cancelled" : "failed";
+    expect(await runner.finishAgentRun(agentId, "routine-message")).toBe(status);
+    const terminal = rolloutItems.flatMap((item) => {
+      const event = (item as { payload?: { msg?: { type?: string; payload?: unknown } } }).payload?.msg;
+      return event?.type === "run_terminal" ? [event.payload] : [];
+    });
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]).toMatchObject({ status, exitCode: status === "completed" ? 0 : status === "cancelled" ? 130 : 1, stopReason: `routine_${status}` });
+    await expect(runner.getAgentSnapshot(agentId)).resolves.toBeNull();
+  });
+
   it("suspends a daemon-shutdown idle run without poisoning it terminal", async () => {
     let clock = "2026-05-09T00:00:00.000Z";
     const { runner, rolloutItems, rolloutStore } = makeTopLevelRunner({

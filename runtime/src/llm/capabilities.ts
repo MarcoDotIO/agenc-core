@@ -8,6 +8,7 @@ import {
 import { resolveModelCapabilityHints } from "./registry/model-catalog.js";
 import { supportsGrokServerSideTools } from "./provider-native-search.js";
 import { normalizeProviderIdentity } from "../provider-identity.js";
+import { isVerifiedOpenAiReasoningModel } from "./registry/openai-reasoning-models.js";
 
 export interface ProviderModelCapabilities {
   readonly provider: string;
@@ -221,7 +222,7 @@ function matchesModelFamily(model: string, pattern: RegExp): boolean {
 }
 
 function isOpenAIReasoningModel(model: string): boolean {
-  return matchesModelFamily(
+  return isVerifiedOpenAiReasoningModel(model) || matchesModelFamily(
     model,
     // branding-scan: allow OpenAI model family identifier
     /(?:^|[/:])(?:gpt-5|o1|o3|o4|codex|chatgpt-5)(?:$|[-_.:])/,

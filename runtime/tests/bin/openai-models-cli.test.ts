@@ -42,6 +42,24 @@ function captureIo(fetchImpl: OpenAiModelsCliIo['fetchImpl']) {
 }
 
 describe('headless OpenAI model discovery CLI', () => {
+  test('explicit API mode uses the API endpoint/key even when ChatGPT is signed in', async () => {
+    mocks.read.mockReturnValue({ authMode: 'chatgpt', accessToken: ACCESS_TOKEN, accountId: 'acct-1' })
+    const fetchImpl = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ data: [{ id: 'gpt-5.4' }] }) }))
+    const { io, stdout } = captureIo(fetchImpl)
+    expect(await runOpenAiModelsCli({ kind: 'list', json: true }, { home, environment: { OPENAI_AUTH_MODE: 'api-key', OPENAI_API_KEY: 'selected-api-key' } }, io)).toBe(0)
+    expect(fetchImpl).toHaveBeenCalledWith('https://api.openai.com/v1/models', { headers: { Authorization: 'Bearer selected-api-key' } })
+    expect(lastHeadlessJson(stdout())).toMatchObject({ ok: true, authMode: 'apiKey' })
+  })
+
+  test('missing selected OAuth never issues an API-key discovery request', async () => {
+    mocks.read.mockReturnValue({ apiKey: 'stored-paid-key', authMode: 'apiKey' })
+    const fetchImpl = vi.fn()
+    const { io, stdout } = captureIo(fetchImpl)
+    expect(await runOpenAiModelsCli({ kind: 'list', json: true }, { home, environment: { OPENAI_AUTH_MODE: 'oauth', OPENAI_API_KEY: 'paid-key' } }, io)).toBe(1)
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(lastHeadlessJson(stdout())).toMatchObject({ ok: false })
+  })
+
   beforeEach(() => {
     mocks.read.mockReset()
   })

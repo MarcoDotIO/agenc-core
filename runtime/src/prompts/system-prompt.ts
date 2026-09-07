@@ -68,6 +68,8 @@ import { BRIEF_TOOL_NAME } from "../tools/BriefTool/prompt.js";
 import { loadMemoryPrompt } from "../memory/memdir.js";
 import { UNTRUSTED_TOOL_RESULT_BOUNDARY } from "../tools/untrusted-tool-result-framing.js";
 import { logForDebugging } from "../utils/debug.js";
+import type { ProviderEnvironment } from "../llm/provider-options.js";
+import { getClientRenderingSection } from "./client-rendering.js";
 export type { McpServerInstructionsInput } from "./mcp-instructions-framing.js";
 export { SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from "./system-prompt-boundary.js";
 
@@ -651,6 +653,7 @@ export interface SystemPromptSessionSnapshot {
   readonly services?: {
     readonly runtimeOptions?: { readonly simpleMode?: boolean };
     readonly sandboxExecutionBroker?: SandboxExecutionBrokerLike;
+    readonly providerEnvironment?: ProviderEnvironment;
   };
 }
 
@@ -769,13 +772,34 @@ function compactSystemPromptSnapshot(ctx: TurnContext): AssembledSystemPrompt {
 export async function assembleSystemPromptSnapshot(
   opts: AssembleSystemPromptSnapshotOpts,
 ): Promise<AssembledSystemPrompt> {
+  const clientRendering = getClientRenderingSection(
+    opts.session.services?.providerEnvironment,
+  );
+  const withClientRendering = (
+    snapshot: AssembledSystemPrompt,
+  ): AssembledSystemPrompt => {
+    if (clientRendering === null) return snapshot;
+    const sections = [
+      ...snapshot.sections,
+      SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+      clientRendering,
+    ];
+    return {
+      text: sections.join("\n\n"),
+      sections,
+      staticPrefix: snapshot.staticPrefix,
+      dynamicSuffix: clientRendering,
+    };
+  };
   switch (opts.profile ?? "standard") {
     case "compact":
-      return compactSystemPromptSnapshot(opts.ctx);
+      return withClientRendering(compactSystemPromptSnapshot(opts.ctx));
     case "coordinator": {
       const { getLiveCoordinatorSystemPrompt } =
         await import("../coordinator/coordinatorMode.js");
-      return fixedSystemPromptSnapshot(getLiveCoordinatorSystemPrompt());
+      return withClientRendering(
+        fixedSystemPromptSnapshot(getLiveCoordinatorSystemPrompt()),
+      );
     }
     case "standard":
       return assembleSystemPrompt(opts);
@@ -929,9 +953,9 @@ export async function assembleSystemPrompt(
   const enabledTools = opts.enabledToolNames ?? new Set<string>();
   const agentsEnabled = opts.agentsEnabled ?? false;
 
-  // Reference session so lints can't mark it unused — future wires
-  // (skills manager, MCP manager, features) will read from it.
-  void session;
+  const clientRendering = getClientRenderingSection(
+    session.services?.providerEnvironment,
+  );
 
   const model = ctx.config.model;
   const cwd = ctx.cwd;
@@ -951,7 +975,11 @@ export async function assembleSystemPrompt(
   if (simpleMode) {
     const intro = getSimpleIntroSection(opts.outputStyle != null);
     const env = buildEnvInfoSection(envInfoInputs);
-    const sections = [intro, SYSTEM_PROMPT_DYNAMIC_BOUNDARY, env];
+    const dynamicParts = [
+      env,
+      ...(clientRendering === null ? [] : [clientRendering]),
+    ];
+    const sections = [intro, SYSTEM_PROMPT_DYNAMIC_BOUNDARY, ...dynamicParts];
     // gaphunt3 #5/#33: expose the cacheable static head separately from the
     // volatile tail (env timestamp) so the wire layer can breakpoint between
     // them; the boundary marker itself never appears in either side.
@@ -959,7 +987,7 @@ export async function assembleSystemPrompt(
       text: sections.join("\n\n"),
       sections,
       staticPrefix: intro,
-      dynamicSuffix: env,
+      dynamicSuffix: dynamicParts.join("\n\n"),
     };
   }
 
@@ -985,6 +1013,11 @@ export async function assembleSystemPrompt(
 
   // Dynamic (post-boundary) tail. Sections returning null are dropped.
   const dynamicDecls: SystemPromptSection[] = [
+    DANGEROUS_uncachedSystemPromptSection(
+      "client_rendering",
+      () => clientRendering,
+      "rendering capabilities belong to the captured client, not the daemon process",
+    ),
     DANGEROUS_uncachedSystemPromptSection(
       "session_guidance",
       () => getSessionGuidanceSection(enabledTools, agentsEnabled),

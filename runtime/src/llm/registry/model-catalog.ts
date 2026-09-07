@@ -15,6 +15,7 @@ import {
 } from "../../context/personality-spec-instructions.js";
 import type { ReasoningEffort, ReasoningSummary } from "../../session/turn-context.js";
 import { normalizeProviderIdentity } from "../../provider-identity.js";
+import { OPENAI_REASONING_MODELS } from "./openai-reasoning-models.js";
 
 export type ModelInputModality = "text" | "image" | "audio";
 export type ModelWebSearchToolType = "none" | "text" | "text_and_image";
@@ -88,6 +89,11 @@ const META_REASONING_LEVELS = Object.freeze([
   "medium",
   "high",
   "xhigh",
+] as const satisfies readonly ReasoningEffort[]);
+// Muse Spark 1.3 adds a distinct tier above xhigh. Do not extend older models.
+const META_SPARK_13_REASONING_LEVELS = Object.freeze([
+  ...META_REASONING_LEVELS,
+  "max",
 ] as const satisfies readonly ReasoningEffort[]);
 const QWEN_38_REASONING_LEVELS = Object.freeze([
   "low",
@@ -448,6 +454,28 @@ const OPENAI_PERSONALITY_MESSAGES: ModelMessages = Object.freeze({
 
 export const REGISTERED_MODEL_CATALOG: readonly RegisteredModelCatalogEntry[] =
   Object.freeze([
+    ...OPENAI_REASONING_MODELS.map((entry, index): RegisteredModelCatalogEntry => ({
+      provider: "openai",
+      model: entry.model,
+      displayName: entry.label,
+      contextWindow: entry.contextWindow,
+      maxContextWindow: entry.contextWindow,
+      maxOutputTokens: entry.maxOutputTokens,
+      inputModalities: TEXT_IMAGE_MODALITIES,
+      supportsToolUse: true,
+      supportsParallelToolCalls: true,
+      supportsStructuredOutput: true,
+      supportsSearchTool: true,
+      supportsVerbosity: true,
+      modelMessages: OPENAI_PERSONALITY_MESSAGES,
+      webSearchToolType: "text_and_image",
+      supportsReasoningSummaries: true,
+      defaultReasoningSummary: "none",
+      supportedReasoningLevels: entry.efforts,
+      additionalSpeedTiers: NO_ADDITIONAL_SPEED_TIERS,
+      priority: index,
+      visibility: "list",
+    })),
     ...qwenCloudCatalogEntries(),
     {
       provider: "cerebras",
@@ -541,7 +569,7 @@ export const REGISTERED_MODEL_CATALOG: readonly RegisteredModelCatalogEntry[] =
       webSearchToolType: "none",
       supportsReasoningSummaries: false,
       defaultReasoningSummary: "none",
-      supportedReasoningLevels: META_REASONING_LEVELS,
+      supportedReasoningLevels: META_SPARK_13_REASONING_LEVELS,
       defaultReasoningLevel: "medium",
       additionalSpeedTiers: NO_ADDITIONAL_SPEED_TIERS,
       priority: 0,
@@ -999,11 +1027,21 @@ export function resolveRegisteredModelCatalogEntry(input: {
   const candidates = REGISTERED_MODEL_CATALOG.filter(
     (entry) => modelCatalogProviderIdentity(entry.provider) === provider,
   );
-  return (
-    findExactModel(model, candidates) ??
-    findNamespacedSuffix(model, candidates) ??
-    findLongestPrefix(model, candidates)
-  );
+  const exact = findExactModel(model, candidates) ??
+    findNamespacedSuffix(model, candidates, true);
+  if (exact !== undefined) return exact;
+  const fallback = findNamespacedSuffix(model, candidates) ??
+    findLongestPrefix(model, candidates);
+  // Newly documented models do not grant their highest tier to unknown variants.
+  if (provider === "openai" && OPENAI_REASONING_MODELS.some((entry) => entry.model === fallback?.model)) {
+    return undefined;
+  }
+  // Keep historical metadata/prefix fallback without granting an unverified
+  // Muse variant a newly introduced reasoning tier. All capability consumers
+  // (pickers, session seeding, subagents and wire) see the same conservative enum.
+  return provider === "meta" && fallback?.supportedReasoningLevels.includes("max")
+    ? Object.freeze({ ...fallback, supportedReasoningLevels: META_REASONING_LEVELS })
+    : fallback;
 }
 
 export function resolveModelCatalogMetadata(input: {
@@ -1103,12 +1141,13 @@ function findExactModel(
 function findNamespacedSuffix(
   model: string,
   candidates: readonly RegisteredModelCatalogEntry[],
+  exactOnly = false,
 ): RegisteredModelCatalogEntry | undefined {
   const [namespace, suffix, extra] = model.split("/");
   if (extra !== undefined || suffix === undefined) return undefined;
   if (!/^\w+$/.test(namespace)) return undefined;
   return findExactModel(suffix, candidates) ??
-    findLongestPrefix(suffix, candidates);
+    (exactOnly ? undefined : findLongestPrefix(suffix, candidates));
 }
 
 function findLongestPrefix(

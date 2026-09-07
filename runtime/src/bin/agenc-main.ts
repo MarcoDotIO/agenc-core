@@ -128,6 +128,7 @@ import {
   parseAgenCRemoteCliArgs,
   runAgenCRemoteCli,
 } from "./remote-cli.js";
+import { parseAgenCDaemonProxyCliArgs, runAgenCDaemonProxyCli } from "./daemon-proxy-cli.js";
 import {
   AgenCDaemonResponseError,
   collectDaemonClientEnvOverrides,
@@ -5523,6 +5524,8 @@ export async function main(): Promise<number> {
   if (initCommand !== null) {
     return runAgenCInitCli(initCommand);
   }
+  const proxyCommand = parseAgenCDaemonProxyCliArgs(argv);
+  if (proxyCommand !== null) return runAgenCDaemonProxyCli(proxyCommand);
   const daemonCommand = parseAgenCDaemonCliArgs(argv);
   if (daemonCommand !== null) {
     if (
@@ -5609,7 +5612,10 @@ export async function main(): Promise<number> {
   const grokAuthCommand = parseGrokAuthCliArgs(argv);
   if (grokAuthCommand !== null) {
     const ingress = captureSecureStorageIngress(process.env);
-    return runGrokAuthCli(grokAuthCommand, { home: ingress.home });
+    return runGrokAuthCli(grokAuthCommand, {
+      home: ingress.home,
+      environment: snapshotProviderEnvironment(ingress.environment),
+    });
   }
   const openAiModelsCommand = parseOpenAiModelsCliArgs(argv);
   if (openAiModelsCommand !== null) {

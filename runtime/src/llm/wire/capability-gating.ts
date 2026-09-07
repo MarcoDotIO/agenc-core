@@ -24,9 +24,13 @@
 
 import { normalizeProviderIdentity } from "../../provider-identity.js";
 import { BRIEF_TOOL_NAME } from "../../tools/BriefTool/prompt.js";
-import { resolveModelCapabilityHints } from "../registry/model-catalog.js";
+import {
+  resolveModelCapabilityHints,
+  resolveRegisteredModelCatalogEntry,
+} from "../registry/model-catalog.js";
 import type { ProviderReasoningProvenance } from "../types.js";
 import { supportsXaiReasoningEffortParam } from "../structured-output.js";
+import { isVerifiedOpenAiReasoningModel } from "../registry/openai-reasoning-models.js";
 
 export interface ChatCompletionsCapabilityHints {
   /**
@@ -178,9 +182,8 @@ const SERVICE_TIER_PROVIDERS = new Set([
   "cerebras",
 ]);
 
-// Meta Model API rejects `none` and `max`, but accepts the five levels below
-// for every Muse Spark chat model. Keep this allowlist fail-closed because the
-// shared ReasoningEffort type also contains both rejected values.
+// Conservative Muse Spark fallback. Exact registered models use their catalog
+// enum below; newly documented tiers must not leak into unknown model variants.
 const META_REASONING_EFFORT_VALUES = new Set([
   "minimal",
   "low",
@@ -252,6 +255,7 @@ const GRAMMAR_CONSTRAINED_TOOL_PROVIDERS = new Set([
  */
 function isUpstreamReasoningModel(model: string | undefined): boolean {
   if (model === undefined) return false;
+  if (isVerifiedOpenAiReasoningModel(model)) return true;
   // branding-scan: allow real model-family identifiers in regex
   return /(?:^|[/:])(?:gpt-5|o1|o3|o4|codex|chatgpt-5)(?:$|[-_.:])/i.test(
     model.trim(),
@@ -412,7 +416,10 @@ export function chatCompletionsCapabilityHintsForProvider(
   } else if (slug === "grok") {
     acceptsReasoningEffort = supportsXaiReasoningEffortParam(model);
   } else if (slug === "meta" && /(?:^|[/:])muse-spark-/i.test(model ?? "")) {
-    reasoningEffortAllowedValues = META_REASONING_EFFORT_VALUES;
+    const entry = resolveRegisteredModelCatalogEntry({ provider: slug, model });
+    reasoningEffortAllowedValues = entry !== undefined
+      ? new Set(entry.supportedReasoningLevels)
+      : META_REASONING_EFFORT_VALUES;
     acceptsReasoningEffort = true;
   } else if (
     (slug === "qwen" || slug === "qwen-token-plan") &&

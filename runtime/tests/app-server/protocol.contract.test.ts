@@ -46,6 +46,32 @@ interface ProtocolSchema {
 }
 
 const expectedMethods = [
+  "remote.capabilities",
+  "remote.status",
+  "remote.start",
+  "remote.stop",
+  "remote.pair.begin",
+  "remote.pair.refresh",
+  "remote.pair.cancel",
+  "remote.devices",
+  "remote.pending",
+  "remote.approve",
+  "remote.revoke",
+  "telegram.capabilities",
+  "telegram.status",
+  "telegram.configure",
+  "telegram.start",
+  "telegram.stop",
+  "telegram.revoke",
+  "telegram.agents.list",
+  "telegram.agents.create",
+  "telegram.agents.update",
+  "telegram.agents.start",
+  "telegram.agents.stop",
+  "telegram.agents.remove",
+  "telegram.agents.pair.begin",
+  "telegram.agents.pair.confirm",
+  "telegram.agents.pair.cancel",
   "initialize",
   "request.cancel",
   "agent.create",
@@ -59,6 +85,15 @@ const expectedMethods = [
   "run.evidence",
   "run.cancel",
   "run.start",
+  "routine.capabilities",
+  "routine.list",
+  "routine.get",
+  "routine.create",
+  "routine.update",
+  "routine.delete",
+  "routine.run",
+  "routine.runs",
+  "routine.cancel",
   "csvJob.review.list",
   "csvJob.review.show",
   "csvJob.review.resolve",
@@ -103,6 +138,7 @@ const expectedMethods = [
 ] as const;
 
 const expectedNotifications = [
+  "routine.updated",
   "commandExec.outputDelta",
   "event.message_chunk",
   "event.tool_request",
@@ -198,7 +234,7 @@ function compileDefinitionValidator(
 
 describe("AgenC daemon protocol surface", () => {
   it("defines the current live attach-settings contract", () => {
-    expect(AGENC_DAEMON_PROTOCOL_VERSION).toBe("1.9.0");
+    expect(AGENC_DAEMON_PROTOCOL_VERSION).toBe("1.10.0");
 
     const status: AgenCDaemonInternalResultByMethod["session.hooks.status"] = {
       sessionId: "session-bare",
@@ -559,6 +595,17 @@ describe("AgenC daemon protocol surface", () => {
       }),
       "untrusted MCP descriptions must not enter the passive DTO",
     ).toBe(false);
+  });
+
+  it("exposes a distinct const-method request envelope for every Connections method", () => {
+    const schema = readProtocolSchema();
+    const request = schema.definitions.AgenCDaemonRequest as { oneOf: { $ref: string }[] };
+    const definitions = request.oneOf.map(({ $ref }) => schema.definitions[$ref.split("/").at(-1)!] as { properties: { method: { const?: string } } });
+    const validate = compileRequestValidator(schema);
+    for (const method of expectedMethods.filter((name) => name.startsWith("remote.") || name.startsWith("telegram."))) {
+      expect(definitions.filter((definition) => definition.properties.method.const === method)).toHaveLength(1);
+      expect(validate({ jsonrpc: "2.0", id: method, method, params: {} })).toBe(true);
+    }
   });
 
   it("validates all request-bearing methods through the published schema", () => {

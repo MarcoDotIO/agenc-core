@@ -682,6 +682,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       // the exact same event id + positive sequence.
       active.unsubscribePhaseEvents = bootstrap.session.subscribeToEvents(
         (phase) => {
+          if (phase.type === "turn_complete" && active.messageSubmission !== undefined) active.messageSubmission.terminalStopReason = phase.stopReason;
           const progress = phaseEventToProgressEvent(phase);
           if (progress === null) return;
           void this.#recordPhaseProgressEvent(managedThread.threadId, progress);
@@ -1397,6 +1398,33 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       voidedHolds: summary.voidedReservations,
       heldUnknownHolds: summary.heldUnknownReservations,
     };
+  }
+
+  async finishAgentRun(agentId: string, messageId: string): Promise<"completed" | "failed" | "cancelled" | undefined> {
+    const active = this.#active.get(agentId);
+    if (active === undefined) return;
+    const submission = active.messageSubmissionsById.get(messageId);
+    if (submission === undefined) throw new Error("Cannot finish an unknown routine message.");
+    const result = await submission.promise;
+    await active.messageSubmissionQueue;
+    if (this.#active.get(agentId) !== active) return;
+    if (!submission.settled || active.pendingMessageSubmissionCount !== 0 || active.pendingShellExecutionCount !== 0 || hasRuntimeActiveTurn(active.bootstrap.session) || active.pendingTerminal !== undefined) {
+      throw new Error("Cannot finish a routine while its Core session is busy or stopping.");
+    }
+    const stopReason = submission.terminalStopReason;
+    const code = stopReason === "cancelled" ? 130 : stopReason !== undefined && stopReason !== "completed" ? 1 : result.terminal?.code;
+    if (code === undefined) throw new Error("Cannot finish a routine without a terminal message outcome.");
+    // Close ingress before selecting the canonical terminal. No caller-supplied
+    // success flag can override the result recorded by the owning turn.
+    active.ingressClosed = true;
+    active.pendingTerminal = {
+      runId: agentId, status: code === 0 ? "completed" : code === 130 ? "cancelled" : "failed",
+      exitCode: code, stopReason: code === 0 ? "routine_completed" : code === 130 ? "routine_cancelled" : "routine_failed",
+      finalMessage: this.#assistantTextByAgent.get(agentId) ?? null,
+      usage: terminalUsageForActiveAgent(active), lastSequence: null, finishedAt: this.#now(),
+    };
+    await this.stopAgent(agentId, "Routine invocation finished");
+    return code === 0 ? "completed" : code === 130 ? "cancelled" : "failed";
   }
 
   async stopAgent(
@@ -4305,6 +4333,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         // `agent.list` resolves.
         if (
           active.terminal === undefined &&
+          active.pendingTerminal === undefined &&
           active.suspension === undefined &&
           active.pendingSuspension === undefined
         ) {

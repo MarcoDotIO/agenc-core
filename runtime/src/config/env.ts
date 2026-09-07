@@ -369,13 +369,14 @@ export function applyEnvOverrides(
     const effort = readNonEmpty(e.AGENC_EFFORT_LEVEL)?.toLowerCase();
     if (
       effort === "minimal" || effort === "low" || effort === "medium" ||
-      effort === "high" || effort === "xhigh" || effort === "none"
+      effort === "high" || effort === "xhigh" || effort === "max" ||
+      effort === "none"
     ) {
       override.reasoning_effort = effort;
     } else {
       throw new Error(
         `invalid AGENC_EFFORT_LEVEL="${e.AGENC_EFFORT_LEVEL}"; ` +
-          "expected one of minimal, low, medium, high, xhigh, or none",
+          "expected one of minimal, low, medium, high, xhigh, max, or none",
       );
     }
   }

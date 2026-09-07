@@ -1,6 +1,6 @@
 import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
-import { isValidPermissionDefaultMode, validateHooksConfig } from "../config/schema.js";
+import { isValidPermissionDefaultMode, validateHooksConfig, validateMcpServersConfig } from "../config/schema.js";
 import type {
   AgenCConfig,
   HooksMap,
@@ -164,6 +164,8 @@ export interface PluginLoadResult {
 }
 
 export interface PluginLoaderOptions {
+  /** Inventory must not migrate installed package state. */
+  readonly readOnly?: boolean;
   readonly pluginStorageRoot: string;
   readonly workspaceRoot: string;
   readonly config?: Pick<AgenCConfig, "plugins"> | undefined;
@@ -605,7 +607,7 @@ export async function loadPlugins(
       ]);
     }
   }
-  const dataMigrationIssues = await migrateLegacyPluginDataDirectories(
+  const dataMigrationIssues = options.readOnly ? [] : await migrateLegacyPluginDataDirectories(
     plugins.map((plugin) => plugin.id),
     { pluginStorageRoot: options.pluginStorageRoot },
   );
@@ -1502,8 +1504,14 @@ function normalizeMcpServer(
       : {}),
     ...(typeof value.enabled === "boolean" ? { enabled: value.enabled } : {}),
     ...(typeof value.timeout === "number" ? { timeout: value.timeout } : {}),
+    ...(value.oauth !== undefined ? { oauth: value.oauth as McpServerConfig["oauth"] } : {}),
+    ...(value.enabled_tools !== undefined ? { enabled_tools: value.enabled_tools as string[] } : {}),
+    ...(value.disabled_tools !== undefined ? { disabled_tools: value.disabled_tools as string[] } : {}),
+    ...(value.default_tools_approval_mode !== undefined ? { default_tools_approval_mode: value.default_tools_approval_mode as McpServerConfig["default_tools_approval_mode"] } : {}),
+    ...(value.env_vars !== undefined ? { env_vars: value.env_vars as string[] } : {}),
   };
-  return server.command !== undefined || server.endpoint !== undefined ? server : null;
+  return server.command !== undefined || server.endpoint !== undefined
+    ? validateMcpServersConfig({ server })!.server! : null;
 }
 
 function normalizeMcpTransport(
