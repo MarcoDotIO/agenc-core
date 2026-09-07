@@ -10,6 +10,10 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { join as joinPath } from "node:path";
+import {
+  CompletedAgentEventCache,
+  completedEventReplayRequired,
+} from "./background-agent-runner/completed-event-cache.js";
 import { roughTokenCountEstimation } from "../llm/token-estimation.js";
 import {
   bootstrapLocalRuntimeSession,
@@ -395,8 +399,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
   readonly #active = new Map<string, ActiveBackgroundAgent>();
   readonly #quiescing = new WeakMap<ActiveBackgroundAgent, Promise<void>>();
   readonly #pendingExplicitRestores = new Set<string>();
-  readonly #pendingEvents = new Map<string, BackgroundAgentDaemonEvent[]>();
-  readonly #pendingActiveToolCallIds = new Map<string, Set<string>>();
+  readonly #pendingEvents = new CompletedAgentEventCache();
   readonly #assistantTextByAgent = new Map<string, string>();
   readonly #pendingToolDecisions = new Map<
     string,
@@ -625,13 +628,8 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         durableTerminalFinalizerInstalled: false,
         lastActiveAt: startedAt,
         uninstallApprovalBridge,
-        bufferedEvents: boundBufferedAgentEvents(
-          this.#pendingEvents.get(managedThread.threadId) ?? [],
-          managedThread.threadId,
-        ),
-        activeToolCallIds:
-          this.#pendingActiveToolCallIds.get(managedThread.threadId) ??
-          new Set(),
+        bufferedEvents: [],
+        activeToolCallIds: new Set(),
         historyEpoch: historyEpochFromRollout(
           bootstrap.rolloutStore.readAll(),
           managedThread.threadId,
@@ -689,7 +687,6 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         uninstallPermissionAuthorityCoordinator();
       };
       this.#pendingEvents.delete(managedThread.threadId);
-      this.#pendingActiveToolCallIds.delete(managedThread.threadId);
       params.signal?.throwIfAborted();
       this.#active.set(managedThread.threadId, active);
       active.unsubscribeMcpSurfaceInvalidations =
@@ -704,7 +701,11 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           if (phase.type === "turn_complete" && active.messageSubmission !== undefined) active.messageSubmission.terminalStopReason = phase.stopReason;
           const progress = phaseEventToProgressEvent(phase);
           if (progress === null) return;
-          void this.#recordPhaseProgressEvent(managedThread.threadId, progress);
+          void this.#recordPhaseProgressEvent(
+            managedThread.threadId,
+            progress,
+            active,
+          );
         },
       );
       active.cleanupComplete = this.#cleanupWhenComplete(
@@ -1176,12 +1177,8 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
             : {}),
           lastActiveAt: restoredAt,
           uninstallApprovalBridge,
-          bufferedEvents: boundBufferedAgentEvents(
-            this.#pendingEvents.get(params.agentId) ?? [],
-            params.agentId,
-          ),
-          activeToolCallIds:
-            this.#pendingActiveToolCallIds.get(params.agentId) ?? new Set(),
+          bufferedEvents: [],
+          activeToolCallIds: new Set(),
           historyEpoch: historyEpochFromRollout(
             bootstrap.rolloutStore.readAll(),
             params.agentId,
@@ -1274,7 +1271,6 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           uninstallPermissionAuthorityCoordinator();
         };
         this.#pendingEvents.delete(params.agentId);
-        this.#pendingActiveToolCallIds.delete(params.agentId);
         params.signal?.throwIfAborted();
         this.#active.set(params.agentId, active);
         active.unsubscribeMcpSurfaceInvalidations =
@@ -1300,7 +1296,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           (phase) => {
             const progress = phaseEventToProgressEvent(phase);
             if (progress === null) return;
-            void this.#recordPhaseProgressEvent(params.agentId, progress);
+            void this.#recordPhaseProgressEvent(params.agentId, progress, active);
           },
         );
         active.cleanupComplete = this.#cleanupWhenComplete(
@@ -1402,7 +1398,6 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       this.#active.delete(agentId);
       this.#pendingEvents.delete(agentId);
       this.#assistantTextByAgent.delete(agentId);
-      this.#pendingActiveToolCallIds.delete(agentId);
     }
     this.#authBackend?.clearVendedKeysForSession(agentId);
 
@@ -1561,7 +1556,6 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       this.#active.delete(agentId);
       this.#pendingEvents.delete(agentId);
       this.#assistantTextByAgent.delete(agentId);
-      this.#pendingActiveToolCallIds.delete(agentId);
     }
     active.unsubscribeStatus?.();
     if (active.terminal !== undefined) {
@@ -1696,7 +1690,6 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       this.#active.delete(agentId);
       this.#pendingEvents.delete(agentId);
       this.#assistantTextByAgent.delete(agentId);
-      this.#pendingActiveToolCallIds.delete(agentId);
     }
     active.unsubscribeStatus?.();
     active.unsubscribeDurableTerminalFinalizer?.();
@@ -1802,9 +1795,9 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
   ): Promise<void> {
     const active = this.#active.get(agentId);
     if (active === undefined) {
-      const replay = this.#pendingEvents.get(agentId)?.splice(0) ?? [];
-      if (replay.length === 0) return;
-      this.#pendingEvents.delete(agentId);
+      const replay = this.#pendingEvents.take(agentId) ?? [
+        completedEventReplayRequired(agentId),
+      ];
       for (const event of replay) {
         await binding.emit(
           notificationFromDaemonEvent(binding.sessionId, agentId, event),
@@ -4523,18 +4516,8 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         if (this.#active.get(agentId) !== generation) return;
         const bufferedEvents = active.bufferedEvents.splice(0);
         this.#active.delete(agentId);
-        if (bufferedEvents.length > 0) {
-          const pending = this.#pendingEvents.get(agentId) ?? [];
-          pending.push(...bufferedEvents);
-          this.#pendingEvents.set(
-            agentId,
-            boundBufferedAgentEvents(pending, agentId),
-          );
-        } else {
-          this.#pendingEvents.delete(agentId);
-        }
+        this.#pendingEvents.put(agentId, bufferedEvents);
         this.#assistantTextByAgent.delete(agentId);
-        this.#pendingActiveToolCallIds.delete(agentId);
         active.unsubscribeStatus?.();
         if (active.terminal !== undefined || active.suspension !== undefined) {
           active.unsubscribeDurableTerminalFinalizer?.();
@@ -4596,23 +4579,15 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     agentId: string,
     progress: RunAgentProgressEvent,
   ): Promise<void> {
-    this.#trackActiveToolCall(agentId, progress);
     const active = this.#active.get(agentId);
+    if (active === undefined) return;
+    this.#trackActiveToolCall(agentId, progress);
     const event = this.#eventFromProgress(agentId, progress);
     const events = [
       ...this.#takeInterruptedToolCompletionEvents(agentId, progress),
       ...(event !== null ? [event] : []),
     ];
     if (events.length === 0) return;
-    if (active === undefined) {
-      const pending = this.#pendingEvents.get(agentId) ?? [];
-      pending.push(...events);
-      this.#pendingEvents.set(
-        agentId,
-        boundBufferedAgentEvents(pending, agentId),
-      );
-      return;
-    }
     this.#applyProgressStatus(active, progress);
     for (const nextEvent of events) {
       await this.#emitOrBufferEvent(active, nextEvent);
@@ -4622,9 +4597,11 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
   async #recordPhaseProgressEvent(
     agentId: string,
     progress: RunAgentProgressEvent,
+    generation: ActiveBackgroundAgent,
   ): Promise<void> {
     const active = this.#active.get(agentId);
-    if (active === undefined || !active.canonicalEventBridgeInstalled) {
+    if (active !== generation) return;
+    if (!active.canonicalEventBridgeInstalled) {
       await this.#recordProgressEvent(agentId, progress);
       return;
     }
@@ -4650,7 +4627,8 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     progress: RunAgentProgressEvent,
   ): Promise<void> {
     const active = this.#active.get(agentId);
-    if (active?.canonicalEventBridgeInstalled !== true) {
+    if (active === undefined || active.bootstrap.session !== session) return;
+    if (!active.canonicalEventBridgeInstalled) {
       await this.#recordProgressEvent(agentId, progress);
       return;
     }
@@ -4659,7 +4637,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       session.emit(event);
       return;
     }
-    await this.#recordPhaseProgressEvent(agentId, progress);
+    await this.#recordPhaseProgressEvent(agentId, progress, active);
   }
 
   #applyProgressStatus(
@@ -4701,21 +4679,12 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       return;
     }
     const active = this.#active.get(agentId);
-    const activeToolCallIds =
-      active?.activeToolCallIds ??
-      this.#pendingActiveToolCallIds.get(agentId) ??
-      new Set<string>();
+    if (active === undefined) return;
+    const activeToolCallIds = active.activeToolCallIds;
     if (progress.kind === "tool_call") {
       activeToolCallIds.add(progress.callId);
     } else {
       activeToolCallIds.delete(progress.callId);
-    }
-    if (active === undefined) {
-      if (activeToolCallIds.size === 0) {
-        this.#pendingActiveToolCallIds.delete(agentId);
-      } else {
-        this.#pendingActiveToolCallIds.set(agentId, activeToolCallIds);
-      }
     }
   }
 
@@ -4730,8 +4699,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       return [];
     }
     const active = this.#active.get(agentId);
-    const activeToolCallIds =
-      active?.activeToolCallIds ?? this.#pendingActiveToolCallIds.get(agentId);
+    const activeToolCallIds = active?.activeToolCallIds;
     if (activeToolCallIds === undefined || activeToolCallIds.size === 0) {
       return [];
     }
@@ -4748,9 +4716,6 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       },
     }));
     activeToolCallIds.clear();
-    if (active === undefined) {
-      this.#pendingActiveToolCallIds.delete(agentId);
-    }
     return events;
   }
 
