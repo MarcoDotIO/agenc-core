@@ -61,6 +61,19 @@ async function loadCredentialModules() {
   return { providerOptions, openAiCredentials, xaiCredentials };
 }
 
+function managedAuthBackend() {
+  return {
+    kind: "local" as const,
+    login: vi.fn(),
+    logout: vi.fn(),
+    whoami: vi.fn(),
+    vendKey: vi.fn(),
+    inferAgencModel: vi.fn(),
+    getLlmUsage: vi.fn(),
+    getSubscriptionTier: vi.fn(),
+  };
+}
+
 beforeEach(async () => {
   testRoot = await mkdtemp(
     join(tmpdir(), "agenc-provider-credential-authority-"),
@@ -109,12 +122,32 @@ describe("provider credential authority", () => {
     const home = await createHome(`absent-${provider}`);
     const { providerOptions } = await loadCredentialModules();
     const readSavedApiKey = vi.fn(async () => "saved-paid-key");
+    const authBackend = managedAuthBackend();
     const result = await providerOptions.resolveProviderRuntimeAuthority(provider, { credentialHome: home, apiKey: "factory-paid-key" },
-      { OPENAI_AUTH_MODE: "oauth", GROK_AUTH_MODE: "oauth", OPENAI_API_KEY: "env-paid-key", XAI_API_KEY: "env-paid-key" }, { readSavedApiKey, managedKeysEnabled: true });
+      { OPENAI_AUTH_MODE: "oauth", GROK_AUTH_MODE: "oauth", OPENAI_API_KEY: "env-paid-key", XAI_API_KEY: "env-paid-key" }, { readSavedApiKey, managedKeysEnabled: true, authBackend, sessionId: "oauth-selection", subscriptionTier: "pro" });
     expect(result.credential).toMatchObject({ status: "missing", reason: "mode-required" });
     expect(result.factoryOptions.apiKey).toBeUndefined();
     expect(result.managedCredential).toBe(false);
     expect(readSavedApiKey).not.toHaveBeenCalled();
+    expect(authBackend.vendKey).not.toHaveBeenCalled();
+  });
+
+  test.each(["openai", "grok"] as const)("%s never substitutes managed credentials for explicit API-key mode", async (provider) => {
+    const home = await createHome(`managed-blocked-${provider}`);
+    const { providerOptions } = await loadCredentialModules();
+    const authBackend = managedAuthBackend();
+    const readSavedApiKey = vi.fn(async () => undefined);
+    const result = await providerOptions.resolveProviderRuntimeAuthority(
+      provider,
+      { credentialHome: home },
+      { OPENAI_AUTH_MODE: "api-key", GROK_AUTH_MODE: "api-key" },
+      { readSavedApiKey, managedKeysEnabled: true, authBackend, sessionId: "api-selection", subscriptionTier: "pro" },
+    );
+
+    expect(result.credential.status).toBe("missing");
+    expect(result.managedCredential).toBe(false);
+    expect(readSavedApiKey).toHaveBeenCalledExactlyOnceWith(provider);
+    expect(authBackend.vendKey).not.toHaveBeenCalled();
   });
 
   test.each(["openai", "grok"] as const)("%s never substitutes OAuth when explicit API mode has no key", async (provider) => {
@@ -605,6 +638,61 @@ describe("provider credential authority", () => {
           source: "saved-byok",
         },
       },
+    });
+  });
+
+  test("resolves saved Gemini BYOK in explicit API-key mode without losing provenance", async () => {
+    const { providerOptions } = await loadCredentialModules();
+    const readSavedApiKey = vi.fn(async () => "saved-gemini-key");
+
+    const resolved = await providerOptions.resolveProviderRuntimeAuthority(
+      "gemini",
+      { model: "gemini-2.5-pro" },
+      { GEMINI_AUTH_MODE: "api-key" },
+      { readSavedApiKey },
+    );
+
+    expect(readSavedApiKey).toHaveBeenCalledExactlyOnceWith("gemini");
+    expect(resolved.credential).toMatchObject({
+      status: "ready",
+      mode: "api-key",
+      source: "saved-byok",
+    });
+    expect(resolved.managedCredential).toBe(false);
+    expect(resolved.factoryOptions.apiKey).toBeUndefined();
+    expect(resolved.factoryOptions.extra).toMatchObject({
+      gemini: {
+        credentialPlan: {
+          kind: "api-key",
+          credential: "saved-gemini-key",
+          source: "saved-byok",
+        },
+      },
+    });
+  });
+
+  test.each(["access-token", "adc"] as const)("does not replace Gemini %s mode with saved BYOK", async (mode) => {
+    const { providerOptions } = await loadCredentialModules();
+    const readSavedApiKey = vi.fn(async () => "wrong-mode-saved-key");
+    const resolved = await providerOptions.resolveProviderRuntimeAuthority(
+      "gemini",
+      { model: "gemini-2.5-pro" },
+      {
+        GEMINI_AUTH_MODE: mode,
+        GOOGLE_CLOUD_PROJECT: "gemini-project",
+        GOOGLE_CLOUD_LOCATION: "us-central1",
+      },
+      { readSavedApiKey },
+    );
+
+    expect(resolved.credential).toMatchObject({
+      status: "missing",
+      reason: "mode-required",
+    });
+    expect(resolved.managedCredential).toBe(false);
+    expect(resolved.factoryOptions.apiKey).toBeUndefined();
+    expect(resolved.factoryOptions.extra).toMatchObject({
+      gemini: { credentialPlan: { kind: "none", mode } },
     });
   });
 

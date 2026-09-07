@@ -868,11 +868,16 @@ export async function resolveProviderRuntimeAuthority(
   env: ProviderEnvironment,
   runtime: ProviderRuntimeCredentialOptions = {},
 ): Promise<ResolvedProviderRuntimeAuthority> {
+  // Only OpenAI/Grok use this selectable OAuth/API preference. Other providers
+  // have their own mode-required states, including Gemini's saved BYOK path.
+  const authPreference = provider === "openai" || provider === "grok"
+    ? providerAuthPreference(provider, env)
+    : "auto";
   let resolved = resolveProviderCredentialAuthority(provider, requested, env);
   const info = resolveBuiltInProviderInfo(provider);
   if (
     resolved.credential.status === "missing" &&
-    resolved.credential.reason !== "mode-required" &&
+    authPreference !== "oauth" &&
     info?.onboarding.access === "api-key" &&
     runtime.readSavedApiKey !== undefined
   ) {
@@ -886,9 +891,7 @@ export async function resolveProviderRuntimeAuthority(
   const sessionId = nonEmpty(runtime.sessionId);
   const managedCredential =
     resolved.credential.status === "missing" &&
-    resolved.credential.reason !== "mode-required" &&
-    (!(provider === "openai" || provider === "grok") ||
-      providerAuthPreference(provider, env) === "auto") &&
+    authPreference === "auto" &&
     runtime.managedKeysEnabled === true &&
     info?.onboarding.supportsManagedKeyAccess === true &&
     runtime.authBackend !== undefined &&
