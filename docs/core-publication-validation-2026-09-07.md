@@ -170,3 +170,19 @@ The broad local related-test run is diagnostic only: it has macOS/native/PTY
 failures and spanned working-tree edits while investigating blockers. It is not
 passing exact-head evidence. Hosted pinned Linux checks remain required before
 merge. No live runtime, credentials, sessions, or configuration were changed.
+
+## Subsequent main integration
+
+Exact head `7ee586d` passed hosted PR CI: **1,597 tests in 54 files**, then
+**17,667 tests in 1,677 files**, with both Sonar checks passing. The pre-merge
+ancestry guard nevertheless stopped the merge because main had advanced to
+`ba495de` through completed-event retention (#2266) and dynamic TUI command
+snapshot invalidation (#2267). These changes were integrated without conflicts.
+
+The incoming cache, background-runner ordering, SDK event mapping, and TUI render
+regressions passed **153 tests in four files**. All three no-emit TypeScript
+checks and generated SDK consistency passed again. The protocol and SDK event
+contract now add optional `retiredCountKnown` for a cache-miss replay gap whose
+loss count is unknown; downstream source pins and protocol mirrors must account
+for this addition. No workflow, dependency lock, or build-script input changed.
+Hosted CI and review must pass again on the refreshed integrated head.
