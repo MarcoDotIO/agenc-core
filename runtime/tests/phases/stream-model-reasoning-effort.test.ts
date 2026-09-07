@@ -5,7 +5,7 @@ import { sessionConfigurationFromAgenCConfig } from "../../src/session/configura
 import { defaultConfig } from "../../src/config/schema.js";
 
 const settingsEffort = vi.hoisted(() => ({
-  current: undefined as "low" | "medium" | "high" | "max" | undefined,
+  current: undefined as "low" | "medium" | "high" | "xhigh" | "max" | undefined,
 }));
 
 vi.mock("../../src/utils/effort.js", async (importOriginal) => {
@@ -19,6 +19,7 @@ vi.mock("../../src/utils/effort.js", async (importOriginal) => {
 const GROK_4_6_LEVELS = ["low", "medium", "high", "xhigh"] as const;
 const GROK_4_5_LEVELS = ["low", "medium", "high"] as const;
 const ZAI_GLM_53_LEVELS = ["low", "high", "max"] as const;
+const META_SPARK_13_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 describe("resolveSessionReasoningEffort", () => {
   beforeEach(() => {
@@ -85,9 +86,45 @@ describe("resolveSessionReasoningEffort", () => {
       "max",
     );
   });
+
+  test.each(["max", "xhigh"] as const)("preserves Spark 1.3 %s from session or settings", (effort) => {
+    settingsEffort.current = effort;
+    expect(resolveSessionReasoningEffort(undefined, META_SPARK_13_LEVELS)).toBe(effort);
+    expect(resolveSessionReasoningEffort(effort, META_SPARK_13_LEVELS)).toBe(effort);
+  });
 });
 
 describe("sessionConfigurationFromAgenCConfig reasoning effort seeding", () => {
+  test.each(["max", "xhigh"] as const)("retains configured Spark 1.3 %s", (effort) => {
+    const configured = sessionConfigurationFromAgenCConfig({
+      config: { ...defaultConfig(), model_provider: "meta", reasoning_effort: effort },
+      workspaceRoot: "/tmp/ws",
+      model: "muse-spark-1.3",
+    });
+    expect(configured.collaborationMode.reasoningEffort).toBe(effort);
+  });
+
+  test("retains native max for other catalog providers", () => {
+    for (const [provider, model] of [["zai", "glm-5.3"], ["kimi", "kimi-k3"]] as const) {
+      const configured = sessionConfigurationFromAgenCConfig({
+        config: { ...defaultConfig(), reasoning_effort: "max" },
+        provider,
+        workspaceRoot: "/tmp/ws",
+        model,
+      });
+      expect(configured.collaborationMode.reasoningEffort).toBe("max");
+    }
+  });
+
+  test.each(["muse-spark-1.2", "muse-spark-1.3-contributor", "muse-spark-1.3-unverified", "meta/muse-spark-1.3-unverified"])("keeps the legacy max alias for %s", (model) => {
+    const configured = sessionConfigurationFromAgenCConfig({
+      config: { ...defaultConfig(), reasoning_effort: "max" },
+      provider: "meta",
+      workspaceRoot: "/tmp/ws",
+      model,
+    });
+    expect(configured.collaborationMode.reasoningEffort).toBe("xhigh");
+  });
   test("seeds collaborationMode.reasoningEffort from config.reasoning_effort", () => {
     const configured = sessionConfigurationFromAgenCConfig({
       config: { ...defaultConfig(), reasoning_effort: "xhigh" },

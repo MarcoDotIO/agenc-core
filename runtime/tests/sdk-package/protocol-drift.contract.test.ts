@@ -8,7 +8,7 @@
  * here until `packages/agenc-sdk/src/protocol.ts` is updated.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -97,25 +97,30 @@ describe("agenc-sdk protocol mirror", () => {
   });
 
   it("mirrors the runtime local endpoint on Unix and Windows", () => {
-    for (const [home, platform] of [
-      ["/tmp/agenc-sdk-home", "linux"],
-      ["/tmp/agenc-sdk-windows-home", "win32"],
-    ] as const) {
-      const env = { AGENC_HOME: home };
-      expect(resolveDaemonSocketPath(env, home, platform)).toBe(
-        agenCDaemonLocalEndpoint(home, platform),
-      );
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "agenc-sdk-endpoint-")));
+    try {
+      for (const [home, platform] of [
+        [join(root, "unix-home"), "linux"],
+        [join(root, "windows-home"), "win32"],
+      ] as const) {
+        const env = { AGENC_HOME: home };
+        expect(resolveDaemonSocketPath(env, home, platform)).toBe(
+          agenCDaemonLocalEndpoint(home, platform),
+        );
+      }
+      const hostHome = join(root, "host-home");
+      expect(resolveDaemonSocketPath(
+        { AGENC_HOME: hostHome },
+        hostHome,
+        process.platform,
+      )).toBe(resolveAgenCDaemonSocketPath(
+        { AGENC_HOME: hostHome },
+        hostHome,
+        process.platform,
+      ));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
-    const hostHome = "/tmp/agenc-sdk-host-home";
-    expect(resolveDaemonSocketPath(
-      { AGENC_HOME: hostHome },
-      hostHome,
-      process.platform,
-    )).toBe(resolveAgenCDaemonSocketPath(
-      { AGENC_HOME: hostHome },
-      hostHome,
-      process.platform,
-    ));
   });
 
   it("matches runtime and launcher home validation and canonicalization", () => {

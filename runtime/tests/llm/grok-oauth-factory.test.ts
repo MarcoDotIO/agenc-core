@@ -32,6 +32,7 @@ async function importProviderModule() {
   ])
   return {
     ...providerModule,
+    resolveProviderFactoryOptions: optionsModule.resolveProviderFactoryOptions,
     /** The factory itself, without the option resolver's OAuth substitution. */
     createProviderRaw: providerModule.createProvider,
     createProvider: (
@@ -286,4 +287,29 @@ test('a provider re-created from recorded factory options after a refresh carrie
   expect(
     (second as unknown as { oauthCallbacksInstalled: boolean }).oauthCallbacksInstalled,
   ).toBe(true)
+})
+
+test('explicit API-key selection survives the raw factory and recorded-option recreation', async () => {
+  storedAccessToken = 'oauth-bearer-1'
+  const { createProviderRaw, readProviderFactoryOptions, resolveProviderFactoryOptions } = await importProviderModule()
+  const options = resolveProviderFactoryOptions('grok', {
+    model: 'grok-4.5', credentialHome: CREDENTIAL_HOME,
+    baseURL: 'https://api-gateway.example/v1',
+  }, { GROK_AUTH_MODE: 'api-key', XAI_API_KEY: 'explicit-api-key' })
+  const first = createProviderRaw('grok', options)
+  storedAccessToken = 'oauth-bearer-2'
+  const second = createProviderRaw('grok', readProviderFactoryOptions(first)!)
+  for (const provider of [first, second]) {
+    expect((provider as unknown as { config: { apiKey: string } }).config.apiKey).toBe('explicit-api-key')
+    expect((provider as unknown as { oauthCallbacksInstalled: boolean }).oauthCallbacksInstalled).toBe(false)
+  }
+})
+
+test('explicit API-key selection without a key cannot fall back to a saved OAuth grant', async () => {
+  storedAccessToken = 'oauth-bearer-1'
+  const { createProviderRaw, resolveProviderFactoryOptions } = await importProviderModule()
+  const options = resolveProviderFactoryOptions('grok', {
+    model: 'grok-4.5', credentialHome: CREDENTIAL_HOME,
+  }, { GROK_AUTH_MODE: 'api-key' })
+  expect(() => createProviderRaw('grok', options)).toThrow(/requires apiKey/)
 })

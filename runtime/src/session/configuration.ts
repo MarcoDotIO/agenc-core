@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 
 import type { AgenCConfig } from "../config/schema.js";
+import { resolveRegisteredModelCatalogEntry } from "../llm/registry/model-catalog.js";
 import { resolveApprovalPolicy } from "../permissions/approval-policy.js";
 import type { ToolPermissionContext } from "../permissions/types.js";
 import type { SandboxExecutionBrokerAuthority } from "../sandbox/execution-broker.js";
@@ -198,6 +199,10 @@ export function sessionConfigurationFromAgenCConfig(params: {
   readonly provider?: string;
   readonly projectTrust?: "trusted" | "untrusted";
 }): SessionConfiguration {
+  const supportsLiteralMax = resolveRegisteredModelCatalogEntry({
+    provider: params.provider ?? params.config.model_provider,
+    model: params.model,
+  })?.supportedReasoningLevels.includes("max") === true;
   const configPolicy = approvalPolicyValueFromAgenCConfig(
     params.config.approval_policy,
   );
@@ -250,11 +255,12 @@ export function sessionConfigurationFromAgenCConfig(params: {
       // Seed the session's effort from canonical config so the turn context,
       // the provider request, and `run_runtime_settings_changed` all report
       // the configured tier instead of `null` while the wire silently falls
-      // back to a settings read. `max` is the persisted alias of `xhigh`.
+      // back to a settings read. Keep legacy max -> xhigh compatibility only
+      // for models that do not advertise a distinct literal max tier.
       ...(params.config.reasoning_effort !== undefined
         ? {
             reasoningEffort:
-              params.config.reasoning_effort === "max"
+              params.config.reasoning_effort === "max" && !supportsLiteralMax
                 ? "xhigh"
                 : params.config.reasoning_effort,
           }

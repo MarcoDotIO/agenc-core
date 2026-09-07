@@ -13,6 +13,7 @@ import {
 } from './model/antModels.js'
 import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { resolveRegisteredModelCatalogEntry } from '../llm/registry/model-catalog.js'
+import { isVerifiedOpenAiReasoningModel } from '../llm/registry/openai-reasoning-models.js'
 import type { EffortLevel } from 'src/entrypoints/sdk/runtimeTypes.js'
 import { resolveSecureStorageHome } from './secureStorage/home.js'
 
@@ -42,6 +43,7 @@ export type AvailableEffortLevel = EffortLevel | OpenAIEffortLevel
 export type EffortValue = AvailableEffortLevel | number
 
 function supportsOpenAiReasoningEffort(model: string): boolean {
+  if (isVerifiedOpenAiReasoningModel(model)) return true
   const normalized = model.trim().toLowerCase()
   const base = normalized.split('?', 1)[0] ?? normalized
   if (base === 'gpt-5.3-providercode-spark' || base === 'providercodespark') {
@@ -61,6 +63,7 @@ function inferCatalogProvider(
   const normalizedModel = model.trim().toLowerCase()
   if (normalizedModel.startsWith('grok-')) return 'grok'
   if (normalizedModel.startsWith('muse-spark-')) return 'meta'
+  if (isVerifiedOpenAiReasoningModel(normalizedModel)) return 'openai'
   return undefined
 }
 
@@ -319,20 +322,25 @@ export function toPersistableEffort(
 
 export function reasoningEffortToEffortLevel(
   value: string | undefined,
-): EffortLevel | undefined {
+): AvailableEffortLevel | undefined {
   if (value === "none") return undefined
-  if (value === "xhigh") return "max"
+  // Canonical config distinguishes xhigh from max; only legacy settings
+  // migration may collapse the historical spelling.
+  if (value === "xhigh") return "xhigh"
   return toPersistableEffort(value as EffortValue | undefined)
 }
 
 export function effortValueToReasoningEffort(
   value: EffortValue | undefined,
-): "minimal" | "low" | "medium" | "high" | "xhigh" | undefined {
+  supportedLevels?: readonly AvailableEffortLevel[],
+): AvailableEffortLevel | undefined {
+  if (value === "xhigh") return "xhigh"
+  if (value === "max" && supportedLevels?.includes("max")) return "max"
   const persistable = toPersistableEffort(value)
   return persistable === "max" ? "xhigh" : persistable
 }
 
-export function getInitialEffortSetting(): EffortLevel | undefined {
+export function getInitialEffortSetting(): AvailableEffortLevel | undefined {
   return reasoningEffortToEffortLevel(
     getExecutionAuthoritySettings().reasoning_effort,
   )
@@ -354,9 +362,11 @@ function resolveAppliedEffortForOptionalContext(
     appStateEffortValue ??
     getDefaultEffortForModelForOptionalContext(model, context)
   if (resolved === 'max') {
+    const registeredLevels = getRegisteredEffortLevels(model, context)
+    if (registeredLevels?.includes('max')) return 'max'
     // The persisted cross-provider vocabulary calls its top tier `max`, while
     // xAI calls Grok 4.6's catalogued top tier `xhigh`.
-    if (getRegisteredEffortLevels(model, context)?.includes('xhigh')) {
+    if (registeredLevels?.includes('xhigh')) {
       return 'xhigh'
     }
     // API rejects 'max' on non-Opus-4.6 models — downgrade to 'high'.
@@ -571,7 +581,8 @@ function getDefaultEffortForModelForOptionalContext(
   const registeredEntry =
     registeredProvider === 'meta' ||
       registeredProvider === 'zai' ||
-      registeredProvider === 'zai-coding-plan'
+      registeredProvider === 'zai-coding-plan' ||
+      registeredProvider === 'kimi'
     ? resolveRegisteredModelCatalogEntry({
         provider: registeredProvider,
         model,

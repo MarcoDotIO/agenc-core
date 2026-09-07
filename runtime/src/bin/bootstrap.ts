@@ -1487,6 +1487,7 @@ async function bootstrapLocalRuntimeSessionScoped(
       services: {
         runtimeOptions,
         sandboxExecutionBroker,
+        providerEnvironment,
       },
     },
     ctx: promptContext,

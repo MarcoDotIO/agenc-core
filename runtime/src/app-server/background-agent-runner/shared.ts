@@ -486,6 +486,8 @@ export interface AgenCBackgroundAgentRunner {
     reason: string,
   ): Promise<AgenCBackgroundAgentCancellationPreparation>;
   stopAgent?(agentId: string, reason?: string): Promise<void>;
+  /** Daemon-owned one-shot invocation: derive its final outcome from a settled message. */
+  finishAgentRun?(agentId: string, messageId: string): Promise<"completed" | "failed" | "cancelled" | undefined>;
   /** Daemon-only shutdown disposition; caller prose cannot select suspension. */
   suspendIdleAgentForDaemonShutdown?(
     agentId: string,
@@ -747,6 +749,8 @@ interface ActiveMessageSubmission {
   assistantMessageOrdinal: number;
   activeAssistantMessageId?: string;
   terminal?: AgenCBackgroundAgentMessageTerminal;
+  /** Owning phase outcome; conversational turn_complete alone also includes bounded failures. */
+  terminalStopReason?: string;
   readonly promise: Promise<AgenCBackgroundAgentMessageResult>;
   settled: boolean;
 }
@@ -782,6 +786,8 @@ interface AgentTerminalUsage {
   readonly outputTokens: number;
   readonly totalTokens: number;
   readonly costUsd: number;
+  /** False when historical coverage or a per-model price is incomplete. */
+  readonly costKnown: boolean;
 }
 
 function positiveSequence(value: unknown): number | undefined {

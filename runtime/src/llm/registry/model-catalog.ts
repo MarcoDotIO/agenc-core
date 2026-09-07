@@ -15,6 +15,7 @@ import {
 } from "../../context/personality-spec-instructions.js";
 import type { ReasoningEffort, ReasoningSummary } from "../../session/turn-context.js";
 import { normalizeProviderIdentity } from "../../provider-identity.js";
+import { OPENAI_REASONING_MODELS } from "./openai-reasoning-models.js";
 
 export type ModelInputModality = "text" | "image" | "audio";
 export type ModelWebSearchToolType = "none" | "text" | "text_and_image";
@@ -89,6 +90,11 @@ const META_REASONING_LEVELS = Object.freeze([
   "high",
   "xhigh",
 ] as const satisfies readonly ReasoningEffort[]);
+// Muse Spark 1.3 adds a distinct tier above xhigh. Do not extend older models.
+const META_SPARK_13_REASONING_LEVELS = Object.freeze([
+  ...META_REASONING_LEVELS,
+  "max",
+] as const satisfies readonly ReasoningEffort[]);
 const QWEN_38_REASONING_LEVELS = Object.freeze([
   "low",
   "medium",
@@ -113,6 +119,59 @@ const ZAI_GLM_53_REASONING_LEVELS = Object.freeze([
 const ZAI_PROVIDER_IDS = Object.freeze([
   "zai",
   "zai-coding-plan",
+] as const);
+const KIMI_K3_REASONING_LEVELS = Object.freeze([
+  "low",
+  "high",
+  "max",
+] as const satisfies readonly ReasoningEffort[]);
+
+interface KimiChatModelSpec {
+  readonly model: string;
+  readonly displayName: string;
+  readonly contextWindow: number;
+  readonly maxOutputTokens?: number;
+  readonly maxOutputTokensUpperLimit?: number;
+  readonly supportsReasoningEffort: boolean;
+  readonly supportsStructuredOutputWithTools: boolean;
+  readonly priority: number;
+}
+
+const KIMI_CHAT_MODELS: readonly KimiChatModelSpec[] = Object.freeze([
+  {
+    model: "kimi-k3",
+    displayName: "Kimi K3",
+    contextWindow: 1_048_576,
+    maxOutputTokens: 131_072,
+    maxOutputTokensUpperLimit: 1_048_576,
+    supportsReasoningEffort: true,
+    supportsStructuredOutputWithTools: false,
+    priority: 0,
+  },
+  {
+    model: "kimi-k2.7-code",
+    displayName: "Kimi K2.7 Code",
+    contextWindow: 262_144,
+    supportsReasoningEffort: false,
+    supportsStructuredOutputWithTools: true,
+    priority: 1,
+  },
+  {
+    model: "kimi-k2.7-code-highspeed",
+    displayName: "Kimi K2.7 Code Highspeed",
+    contextWindow: 262_144,
+    supportsReasoningEffort: false,
+    supportsStructuredOutputWithTools: false,
+    priority: 2,
+  },
+  {
+    model: "kimi-k2.6",
+    displayName: "Kimi K2.6",
+    contextWindow: 262_144,
+    supportsReasoningEffort: false,
+    supportsStructuredOutputWithTools: false,
+    priority: 3,
+  },
 ] as const);
 
 interface ZaiChatModelSpec {
@@ -314,6 +373,48 @@ function zaiCatalogEntries(): readonly RegisteredModelCatalogEntry[] {
     })),
   );
 }
+
+function kimiCatalogEntries(): readonly RegisteredModelCatalogEntry[] {
+  return KIMI_CHAT_MODELS.map((model) => Object.freeze({
+    provider: "kimi",
+    model: model.model,
+    displayName: model.displayName,
+    contextWindow: model.contextWindow,
+    maxContextWindow: model.contextWindow,
+    ...(model.maxOutputTokens !== undefined
+      ? { maxOutputTokens: model.maxOutputTokens }
+      : {}),
+    ...(model.maxOutputTokensUpperLimit !== undefined
+      ? {
+          maxOutputTokensUpperLimit: model.maxOutputTokensUpperLimit,
+          maxOutputTokensCappedDefault:
+            model.maxOutputTokens !== model.maxOutputTokensUpperLimit,
+        }
+      : {}),
+    inputModalities: TEXT_IMAGE_MODALITIES,
+    supportsToolUse: true,
+    supportsParallelToolCalls: false,
+    supportsStructuredOutput: true,
+    // Keep combined mode model-scoped: the complete K2.7 Code tool -> result
+    // -> JSON Schema loop is verified; unverified models remain fail-closed.
+    supportsStructuredOutputWithTools:
+      model.supportsStructuredOutputWithTools,
+    supportsSearchTool: false,
+    supportsVerbosity: false,
+    webSearchToolType: "none" as const,
+    supportsReasoningSummaries: false,
+    defaultReasoningSummary: "none" as const,
+    supportedReasoningLevels: model.supportsReasoningEffort
+      ? KIMI_K3_REASONING_LEVELS
+      : NO_REASONING_LEVELS,
+    ...(model.supportsReasoningEffort
+      ? { defaultReasoningLevel: "max" as const }
+      : {}),
+    additionalSpeedTiers: NO_ADDITIONAL_SPEED_TIERS,
+    priority: model.priority,
+    visibility: "list" as const,
+  }));
+}
 // Grok 4.3 and 4.5 accept these depth controls. The multi-agent family uses
 // the same values to control agent count rather than thinking depth.
 const GROK_REASONING_LEVELS = Object.freeze([
@@ -353,6 +454,28 @@ const OPENAI_PERSONALITY_MESSAGES: ModelMessages = Object.freeze({
 
 export const REGISTERED_MODEL_CATALOG: readonly RegisteredModelCatalogEntry[] =
   Object.freeze([
+    ...OPENAI_REASONING_MODELS.map((entry, index): RegisteredModelCatalogEntry => ({
+      provider: "openai",
+      model: entry.model,
+      displayName: entry.label,
+      contextWindow: entry.contextWindow,
+      maxContextWindow: entry.contextWindow,
+      maxOutputTokens: entry.maxOutputTokens,
+      inputModalities: TEXT_IMAGE_MODALITIES,
+      supportsToolUse: true,
+      supportsParallelToolCalls: true,
+      supportsStructuredOutput: true,
+      supportsSearchTool: true,
+      supportsVerbosity: true,
+      modelMessages: OPENAI_PERSONALITY_MESSAGES,
+      webSearchToolType: "text_and_image",
+      supportsReasoningSummaries: true,
+      defaultReasoningSummary: "none",
+      supportedReasoningLevels: entry.efforts,
+      additionalSpeedTiers: NO_ADDITIONAL_SPEED_TIERS,
+      priority: index,
+      visibility: "list",
+    })),
     ...qwenCloudCatalogEntries(),
     {
       provider: "cerebras",
@@ -378,6 +501,7 @@ export const REGISTERED_MODEL_CATALOG: readonly RegisteredModelCatalogEntry[] =
       visibility: "list",
     },
     ...zaiCatalogEntries(),
+    ...kimiCatalogEntries(),
     {
       provider: "cerebras",
       model: "qwen-3.8-27b",
@@ -445,7 +569,7 @@ export const REGISTERED_MODEL_CATALOG: readonly RegisteredModelCatalogEntry[] =
       webSearchToolType: "none",
       supportsReasoningSummaries: false,
       defaultReasoningSummary: "none",
-      supportedReasoningLevels: META_REASONING_LEVELS,
+      supportedReasoningLevels: META_SPARK_13_REASONING_LEVELS,
       defaultReasoningLevel: "medium",
       additionalSpeedTiers: NO_ADDITIONAL_SPEED_TIERS,
       priority: 0,
@@ -903,11 +1027,21 @@ export function resolveRegisteredModelCatalogEntry(input: {
   const candidates = REGISTERED_MODEL_CATALOG.filter(
     (entry) => modelCatalogProviderIdentity(entry.provider) === provider,
   );
-  return (
-    findExactModel(model, candidates) ??
-    findNamespacedSuffix(model, candidates) ??
-    findLongestPrefix(model, candidates)
-  );
+  const exact = findExactModel(model, candidates) ??
+    findNamespacedSuffix(model, candidates, true);
+  if (exact !== undefined) return exact;
+  const fallback = findNamespacedSuffix(model, candidates) ??
+    findLongestPrefix(model, candidates);
+  // Newly documented models do not grant their highest tier to unknown variants.
+  if (provider === "openai" && OPENAI_REASONING_MODELS.some((entry) => entry.model === fallback?.model)) {
+    return undefined;
+  }
+  // Keep historical metadata/prefix fallback without granting an unverified
+  // Muse variant a newly introduced reasoning tier. All capability consumers
+  // (pickers, session seeding, subagents and wire) see the same conservative enum.
+  return provider === "meta" && fallback?.supportedReasoningLevels.includes("max")
+    ? Object.freeze({ ...fallback, supportedReasoningLevels: META_REASONING_LEVELS })
+    : fallback;
 }
 
 export function resolveModelCatalogMetadata(input: {
@@ -1007,12 +1141,13 @@ function findExactModel(
 function findNamespacedSuffix(
   model: string,
   candidates: readonly RegisteredModelCatalogEntry[],
+  exactOnly = false,
 ): RegisteredModelCatalogEntry | undefined {
   const [namespace, suffix, extra] = model.split("/");
   if (extra !== undefined || suffix === undefined) return undefined;
   if (!/^\w+$/.test(namespace)) return undefined;
   return findExactModel(suffix, candidates) ??
-    findLongestPrefix(suffix, candidates);
+    (exactOnly ? undefined : findLongestPrefix(suffix, candidates));
 }
 
 function findLongestPrefix(

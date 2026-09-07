@@ -81,6 +81,7 @@ export async function createMCPConnection(
     const remoteConfig = {
       name: config.name,
       endpoint: config.endpoint,
+      ...(config.oauth !== undefined ? { oauth: config.oauth } : {}),
       ...(config.headers !== undefined ? { headers: config.headers } : {}),
       ...(config.timeout !== undefined ? { timeout: config.timeout } : {}),
     };

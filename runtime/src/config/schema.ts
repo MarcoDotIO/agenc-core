@@ -12,6 +12,7 @@
 // unknown top-level keys before normalization.
 
 import { isAbsolute } from "node:path";
+import { assertMcpOAuthHttpsUrl, validateMcpOAuthConfig, type McpOAuthConfig } from "./mcp-oauth.js";
 import {
   MarketplaceSourceSchema,
   type MarketplaceSource,
@@ -282,6 +283,7 @@ export type HookEventName = (typeof HOOK_EVENT_NAMES)[number];
 export type McpTransport = "stdio" | "sse" | "http" | "websocket";
 
 export interface McpServerConfig {
+  readonly oauth?: McpOAuthConfig;
   readonly command?: string;
   readonly args?: readonly string[];
   readonly env?: Readonly<Record<string, string>>;
@@ -2408,6 +2410,7 @@ export function validateProtocolConfig(
 }
 
 const EXTERNAL_MCP_SERVER_KEYS: ReadonlySet<string> = new Set([
+  "oauth",
   "command",
   "args",
   "env",
@@ -2517,6 +2520,12 @@ function validateExternalMcpServerConfig(
       );
     }
     out.transport = record.transport;
+  }
+  if (record.oauth !== undefined) {
+    out.oauth = validateMcpOAuthConfig(record.oauth);
+    if (out.transport !== "http" && out.transport !== "sse") throw makeError(`${serverName}.oauth`, "OAuth requires HTTP or SSE transport");
+    assertMcpOAuthHttpsUrl(out.endpoint ?? "");
+    if (Object.keys(out.headers ?? {}).some((key) => key.toLowerCase() === "authorization")) throw makeError(`${serverName}.oauth`, "OAuth cannot be combined with an Authorization header");
   }
   for (const key of ["enabled", "required"] as const) {
     const value = optionalBoolean(record[key], `${serverName}.${key}`, makeError);

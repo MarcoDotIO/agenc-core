@@ -275,9 +275,10 @@ export class BackgroundTaskLifecycle {
     listeners.add(listener);
     this.snapshotListeners.set(record.id, listeners);
     return () => {
-      const current = this.snapshotListeners.get(record.id);
-      current?.delete(listener);
-      if (current?.size === 0) this.snapshotListeners.delete(record.id);
+      listeners.delete(listener);
+      if (listeners.size === 0 && this.snapshotListeners.get(record.id) === listeners) {
+        this.snapshotListeners.delete(record.id);
+      }
     };
   }
 
@@ -400,19 +401,27 @@ export class BackgroundTaskLifecycle {
       stopError = error;
     }
 
-    // Always transition the task to a terminal state, even when onStop throws.
+    const stopMessage = stopError !== undefined ? toErrorMessage(stopError) : reason;
+    // Always transition the original retained task, even when onStop throws.
     // Otherwise the task would stay `running` forever and a blocking
-    // TaskOutput would hang (zombie task).
-    const snapshot = this.finish(taskId, "killed", {
-      error: stopError !== undefined ? toErrorMessage(stopError) : reason,
-      summaryStatus: "was stopped",
-    });
+    // TaskOutput would hang (zombie task). Async cleanup may outlive completion
+    // and ID reuse; it must never stop or read output from a replacement task.
+    const snapshot = this.tasks.get(record.id) === record
+      ? this.finish(record.id, "killed", {
+          error: stopMessage,
+          summaryStatus: "was stopped",
+        })
+      : undefined;
 
     if (stopError !== undefined) {
       throw new BackgroundTaskError(
-        `task ${taskId} stop failed: ${toErrorMessage(stopError)}`,
+        `task ${taskId} stop failed: ${stopMessage}`,
         "stop_failed",
       );
+    }
+
+    if (snapshot === undefined) {
+      throw new BackgroundTaskError(`task ${taskId} is no longer registered`, "not_found");
     }
 
     return snapshot;

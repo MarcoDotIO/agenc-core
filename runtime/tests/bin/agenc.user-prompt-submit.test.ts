@@ -56,6 +56,14 @@ function fakeSession(cwd: string) {
     permissionModeRegistry: {
       current: () => ({ mode: "default" }),
     },
+    pendingProviderSwitch: null as {
+      provider: string;
+      model: string;
+    } | null,
+    consumePendingProviderSwitch: async () => ({
+      applied: false as const,
+      reason: "no pending provider switch",
+    }),
     services: {
       hooks: {
         userPromptSubmitHooks: [] as Array<(input: unknown) => unknown>,
@@ -657,6 +665,89 @@ describe("UserPromptSubmit prompt ingress", () => {
     expect(String(modelInputs[0])).toContain("daemon prompt");
     expect(String(modelInputs[0])).toContain("# Hook Additional Context");
     expect(String(modelInputs[0])).toContain("daemon-owned hook context");
+  });
+
+  it("applies a staged daemon model switch before freezing the next turn context", async () => {
+    const { session } = fakeSession("/workspace");
+    let activeModel = "kimi-k2.6";
+    session.pendingProviderSwitch = {
+      provider: "kimi",
+      model: "kimi-k3",
+    };
+    const consumePendingProviderSwitch = vi.fn(async () => {
+      activeModel = "kimi-k3";
+      session.pendingProviderSwitch = null;
+      return { applied: true as const, provider: "kimi", model: activeModel };
+    });
+    session.consumePendingProviderSwitch = consumePendingProviderSwitch;
+    session.newDefaultTurn = () => ({
+      subId: "turn-after-switch",
+      config: {},
+      modelInfo: {},
+      collaborationMode: { model: activeModel },
+    });
+    const observedContexts: unknown[] = [];
+    const runTurnFn = vi.fn(async function* (
+      _session: unknown,
+      ctx: unknown,
+    ) {
+      observedContexts.push(ctx);
+      yield {
+        type: "turn_complete",
+        content: "switched",
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        stopReason: "completed",
+      } satisfies PhaseEvent;
+      return { reason: "completed" };
+    });
+    __installDaemonTurnDriverHooksForTest(
+      session as never,
+      { current: () => defaultConfig } as never,
+      runTurnFn as never,
+    );
+
+    await session.submit("continue on K3");
+
+    expect(consumePendingProviderSwitch).toHaveBeenCalledTimes(1);
+    expect(runTurnFn).toHaveBeenCalledTimes(1);
+    expect(observedContexts).toEqual([
+      expect.objectContaining({
+        collaborationMode: { model: "kimi-k3" },
+      }),
+    ]);
+  });
+
+  it("rejects a daemon submit when its staged model switch cannot be applied", async () => {
+    const { session } = fakeSession("/workspace");
+    session.pendingProviderSwitch = {
+      provider: "kimi",
+      model: "kimi-k3",
+    };
+    const consumePendingProviderSwitch = vi.fn(async () => {
+      session.pendingProviderSwitch = null;
+      return { applied: false as const, reason: "injected rejection" };
+    });
+    session.consumePendingProviderSwitch = consumePendingProviderSwitch;
+    const runTurnFn = vi.fn(async function* () {
+      yield {
+        type: "turn_complete",
+        content: "must not run",
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        stopReason: "completed",
+      } satisfies PhaseEvent;
+      return { reason: "completed" };
+    });
+    __installDaemonTurnDriverHooksForTest(
+      session as never,
+      { current: () => defaultConfig } as never,
+      runTurnFn as never,
+    );
+
+    await expect(session.submit("must fail closed")).rejects.toThrow(
+      "provider switch to kimi/kimi-k3 could not be applied before turn: injected rejection",
+    );
+    expect(consumePendingProviderSwitch).toHaveBeenCalledTimes(1);
+    expect(runTurnFn).not.toHaveBeenCalled();
   });
 
   it("blocks daemon turn execution when the owning session hook rejects the prompt", async () => {

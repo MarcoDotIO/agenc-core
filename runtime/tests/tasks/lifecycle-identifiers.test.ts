@@ -22,6 +22,56 @@ function replacementInput(requested: "primary" | "alias", name: string): Registe
 }
 
 describe("background task identifier ownership", () => {
+  describe.each(["owner", "nickname"])("stop through %s", (taskId) => {
+    it.each([false, true])("does not stop a replacement after old cleanup settles (reject: %s)", async (rejectCleanup) => {
+      const lifecycle = new BackgroundTaskLifecycle();
+      const cleanup = Promise.withResolvers<void>();
+      lifecycle.register({
+        id: "owner", aliases: ["nickname"], type: "generic", description: "original task",
+        onStop: () => cleanup.promise,
+      });
+      const stopping = lifecycle.stop(taskId);
+      const rejected = expect(stopping).rejects.toMatchObject({
+        code: rejectCleanup ? "stop_failed" : "not_found",
+      });
+      lifecycle.complete("owner", "old output");
+      lifecycle.register({
+        id: "owner", aliases: ["nickname"], type: "generic", description: "replacement task",
+      });
+      lifecycle.appendOutput("owner", "replacement output");
+      const replacement = lifecycle.get("owner");
+      lifecycle.drainNotifications();
+
+      if (rejectCleanup) cleanup.reject(new Error("old cleanup failed"));
+      else cleanup.resolve();
+      await rejected;
+
+      expect(lifecycle.get("owner")).toEqual(replacement);
+      expect(lifecycle.get("nickname")).toEqual(replacement);
+      expect(lifecycle.readOutput("owner")).toBe("replacement output");
+      expect(lifecycle.drainNotifications()).toEqual([]);
+    });
+  });
+
+  it("does not let an old unsubscribe remove the replacement's identical listener", () => {
+    const lifecycle = new BackgroundTaskLifecycle();
+    lifecycle.register({ id: "owner", type: "generic", description: "original task" });
+    const observed = vi.fn();
+    const unsubscribeOld = lifecycle.subscribe("owner", observed);
+    lifecycle.complete("owner");
+    lifecycle.register({ id: "owner", type: "generic", description: "replacement task", status: "pending" });
+    const unsubscribeNew = lifecycle.subscribe("owner", observed);
+    observed.mockClear();
+
+    unsubscribeOld();
+    const running = lifecycle.markRunning("owner");
+
+    expect(observed).toHaveBeenCalledExactlyOnceWith(running);
+    unsubscribeNew();
+    lifecycle.appendOutput("owner", "unobserved");
+    expect(observed).toHaveBeenCalledOnce();
+  });
+
   describe.each(["pending", "running"] as const)("%s task names", (status) => {
     it.each(claims)("rejects a new $requested that collides with a live $held", ({ requested, name }) => {
       const lifecycle = new BackgroundTaskLifecycle();

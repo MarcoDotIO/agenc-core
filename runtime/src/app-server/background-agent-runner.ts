@@ -698,6 +698,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       // the exact same event id + positive sequence.
       active.unsubscribePhaseEvents = bootstrap.session.subscribeToEvents(
         (phase) => {
+          if (phase.type === "turn_complete" && active.messageSubmission !== undefined) active.messageSubmission.terminalStopReason = phase.stopReason;
           const progress = phaseEventToProgressEvent(phase);
           if (progress === null) return;
           void this.#recordPhaseProgressEvent(
@@ -1474,6 +1475,33 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       voidedHolds: summary.voidedReservations,
       heldUnknownHolds: summary.heldUnknownReservations,
     };
+  }
+
+  async finishAgentRun(agentId: string, messageId: string): Promise<"completed" | "failed" | "cancelled" | undefined> {
+    const active = this.#active.get(agentId);
+    if (active === undefined) return;
+    const submission = active.messageSubmissionsById.get(messageId);
+    if (submission === undefined) throw new Error("Cannot finish an unknown routine message.");
+    const result = await submission.promise;
+    await active.messageSubmissionQueue;
+    if (this.#active.get(agentId) !== active) return;
+    if (!submission.settled || active.pendingMessageSubmissionCount !== 0 || active.pendingShellExecutionCount !== 0 || hasRuntimeActiveTurn(active.bootstrap.session) || active.pendingTerminal !== undefined) {
+      throw new Error("Cannot finish a routine while its Core session is busy or stopping.");
+    }
+    const stopReason = submission.terminalStopReason;
+    const code = stopReason === "cancelled" ? 130 : stopReason !== undefined && stopReason !== "completed" ? 1 : result.terminal?.code;
+    if (code === undefined) throw new Error("Cannot finish a routine without a terminal message outcome.");
+    // Close ingress before selecting the canonical terminal. No caller-supplied
+    // success flag can override the result recorded by the owning turn.
+    active.ingressClosed = true;
+    active.pendingTerminal = {
+      runId: agentId, status: code === 0 ? "completed" : code === 130 ? "cancelled" : "failed",
+      exitCode: code, stopReason: code === 0 ? "routine_completed" : code === 130 ? "routine_cancelled" : "routine_failed",
+      finalMessage: this.#assistantTextByAgent.get(agentId) ?? null,
+      usage: terminalUsageForActiveAgent(active), lastSequence: null, finishedAt: this.#now(),
+    };
+    await this.stopAgent(agentId, "Routine invocation finished");
+    return code === 0 ? "completed" : code === 130 ? "cancelled" : "failed";
   }
 
   async stopAgent(
@@ -2578,6 +2606,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         outputTokens: finiteNumber(usage.outputTokens),
         totalTokens: finiteNumber(usage.totalTokens),
         costUsd: finiteNumber(usage.costUsd),
+        costKnown: usage.costKnown,
       },
       cacheStats: cache,
       ...(breakdown !== undefined ? { contextBreakdown: breakdown } : {}),
@@ -2650,6 +2679,17 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       }
 
       const state = bootstrap.session.state?.unsafePeek?.();
+      const sessionConfiguration = (
+        state as
+          | {
+              sessionConfiguration?: {
+                baseInstructions?: unknown;
+                collaborationMode?: { model?: unknown };
+                provider?: { slug?: unknown };
+              };
+            }
+          | undefined
+      )?.sessionConfiguration;
       const history = Array.isArray(
         (state as { history?: unknown[] } | undefined)?.history,
       )
@@ -2665,18 +2705,38 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       }
 
       const instructions =
-        (
-          bootstrap.session as unknown as {
-            baseInstructions?: string;
-            instructions?: string;
-          }
-        ).baseInstructions ??
-        (bootstrap.session as unknown as { instructions?: string })
-          .instructions ??
-        "";
+        typeof sessionConfiguration?.baseInstructions === "string"
+          ? sessionConfiguration.baseInstructions
+          : "";
+      const liveModelInfo = (
+        bootstrap.session as unknown as {
+          readonly modelInfo?: {
+            readonly slug?: unknown;
+            readonly contextWindow?: unknown;
+          };
+        }
+      ).modelInfo;
+      const liveBinding = bootstrap.session.services.providerService?.current();
+      const model =
+        typeof liveBinding?.model === "string"
+          ? liveBinding.model
+          : typeof liveModelInfo?.slug === "string"
+            ? liveModelInfo.slug
+            : typeof sessionConfiguration?.collaborationMode?.model === "string"
+              ? sessionConfiguration.collaborationMode.model
+              : undefined;
+      const provider =
+        typeof liveBinding?.provider === "string"
+          ? liveBinding.provider
+          : typeof sessionConfiguration?.provider?.slug === "string"
+            ? sessionConfiguration.provider.slug
+            : undefined;
 
       return {
-        windowTokens: finiteNumber(bootstrap.modelInfo.contextWindow ?? 0),
+        ...(provider !== undefined ? { provider } : {}),
+        ...(model !== undefined ? { model } : {}),
+        estimated: true,
+        windowTokens: finiteNumber(liveModelInfo?.contextWindow ?? 0),
         messageTokens: finiteNumber(messageTokens),
         systemPromptTokens: finiteNumber(estimate(instructions)),
         systemToolTokens: finiteNumber(systemToolTokens),
@@ -4424,6 +4484,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         // `agent.list` resolves.
         if (
           active.terminal === undefined &&
+          active.pendingTerminal === undefined &&
           active.suspension === undefined &&
           active.pendingSuspension === undefined
         ) {
@@ -4955,6 +5016,35 @@ function prepareDaemonUserPrompt(params: {
   );
 }
 
+async function consumeDaemonPendingProviderSwitches(
+  session: LocalRuntimeBootstrap["session"],
+  configStore: LocalRuntimeBootstrap["configStore"],
+): Promise<void> {
+  while (session.pendingProviderSwitch !== null) {
+    const pending = session.pendingProviderSwitch;
+    const outcome = await runWithCurrentRuntimeSession(session, () =>
+      runWithCanonicalSettingsAuthority(configStore, () =>
+        session.consumePendingProviderSwitch(),
+      ),
+    );
+    if (outcome.applied) continue;
+
+    // A concurrent replacement may supersede the switch while it is being
+    // prepared. Let the loop consume that successor. If the owned switch was
+    // rejected or left unchanged, fail the submit instead of silently running
+    // the user's prompt on the previous provider/model.
+    if (
+      session.pendingProviderSwitch !== null &&
+      session.pendingProviderSwitch !== pending
+    ) {
+      continue;
+    }
+    throw new Error(
+      `provider switch to ${pending.provider}/${pending.model} could not be applied before turn: ${outcome.reason}`,
+    );
+  }
+}
+
 // Install the daemon turn driver. Prompt ingress normally runs before durable
 // message publication, while this driver retains the same authority for direct
 // Session.submit callers that do not cross the daemon message boundary.
@@ -4998,6 +5088,12 @@ function installDaemonTurnDriverHooks(
         turnInput = prepared.input;
         promptDisplayText = prepared.displayInput ?? promptDisplayText;
       }
+      // `setAgentModel` stages a prepared provider binding for the next turn.
+      // Consume it before freezing the immutable TurnContext. Passing an
+      // already-built context to Session.runTurn deliberately preserves newer
+      // mid-turn switches, so omitting this boundary would make the kernel see
+      // the staged switch and close this user turn without sampling.
+      await consumeDaemonPendingProviderSwitches(session, configStore);
       const baseCtx = (
         session as unknown as { newDefaultTurn: () => unknown }
       ).newDefaultTurn();

@@ -8,6 +8,8 @@
 
 import type { RunRuntimeSettingsSnapshot } from "../../contracts/run-contracts.js";
 import type { ProviderModelSelectionOutcome } from "../../contracts/provider-model-selection.js";
+import type { RoutineCapabilities, RoutineListResult, RoutineResult, RoutineDeleteResult, RoutineRunResult, RoutineRunsResult, RoutineIdParams, RoutineCreateParams, RoutineUpdateParams, RoutineDeleteParams, RoutineRunsParams, RoutineCancelParams, RoutineUpdatedEvent } from "../../routines/types.js";
+export type * from "../../routines/types.js";
 
 /** JSON-RPC version required on daemon requests, responses, and notifications. */
 export const JSON_RPC_VERSION = "2.0" as const;
@@ -25,10 +27,11 @@ export const JSON_RPC_VERSION = "2.0" as const;
  * canonical runtime-settings event that clients must apply.
  * 1.9 adds admitted shell execution on the daemon-owned live session for
  * internal clients.
+ * 1.10 adds daemon-owned local routines and opt-in routine invalidations.
  * Clients that need any of these additive surfaces must not negotiate an older
  * daemon.
  */
-export const AGENC_DAEMON_PROTOCOL_VERSION = "1.9.0" as const;
+export const AGENC_DAEMON_PROTOCOL_VERSION = "1.10.0" as const;
 export const AGENC_DAEMON_PROTOCOL_SCHEMA_ID =
   "urn:agenc:app-server:protocol" as const;
 export const AGENC_DAEMON_PROTOCOL_PACKAGE_NAME =
@@ -60,6 +63,32 @@ export interface JsonObject {
 export type RequestId = string | number;
 
 export const AGENC_DAEMON_METHODS = [
+  "remote.capabilities",
+  "remote.status",
+  "remote.start",
+  "remote.stop",
+  "remote.pair.begin",
+  "remote.pair.refresh",
+  "remote.pair.cancel",
+  "remote.devices",
+  "remote.pending",
+  "remote.approve",
+  "remote.revoke",
+  "telegram.capabilities",
+  "telegram.status",
+  "telegram.configure",
+  "telegram.start",
+  "telegram.stop",
+  "telegram.revoke",
+  "telegram.agents.list",
+  "telegram.agents.create",
+  "telegram.agents.update",
+  "telegram.agents.start",
+  "telegram.agents.stop",
+  "telegram.agents.remove",
+  "telegram.agents.pair.begin",
+  "telegram.agents.pair.confirm",
+  "telegram.agents.pair.cancel",
   "initialize",
   "request.cancel",
   "agent.create",
@@ -73,6 +102,15 @@ export const AGENC_DAEMON_METHODS = [
   "run.evidence",
   "run.cancel",
   "run.start",
+  "routine.capabilities",
+  "routine.list",
+  "routine.get",
+  "routine.create",
+  "routine.update",
+  "routine.delete",
+  "routine.run",
+  "routine.runs",
+  "routine.cancel",
   "csvJob.review.list",
   "csvJob.review.show",
   "csvJob.review.resolve",
@@ -170,6 +208,7 @@ export type AgenCDaemonServerCapabilities = JsonObject & {
 };
 
 export const AGENC_DAEMON_NOTIFICATION_METHODS = [
+  "routine.updated",
   "commandExec.outputDelta",
   "event.message_chunk",
   "event.tool_request",
@@ -251,6 +290,32 @@ function defineNotificationSpecs<
 }
 
 export const AGENC_DAEMON_METHOD_SPECS = defineMethodSpecs({
+  "remote.capabilities": { method: "remote.capabilities", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local browser remote management (contract v1)." },
+  "remote.status": { method: "remote.status", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local browser remote management (contract v1)." },
+  "remote.start": { method: "remote.start", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local browser remote management (contract v1)." },
+  "remote.stop": { method: "remote.stop", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local browser remote management (contract v1)." },
+  "remote.pair.begin": { method: "remote.pair.begin", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local browser remote management (contract v1)." },
+  "remote.pair.refresh": { method: "remote.pair.refresh", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local browser remote management (contract v1)." },
+  "remote.pair.cancel": { method: "remote.pair.cancel", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local browser remote management (contract v1)." },
+  "remote.devices": { method: "remote.devices", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local browser remote management (contract v1)." },
+  "remote.pending": { method: "remote.pending", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local browser remote management (contract v1)." },
+  "remote.approve": { method: "remote.approve", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local browser remote management (contract v1)." },
+  "remote.revoke": { method: "remote.revoke", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local browser remote management (contract v1)." },
+  "telegram.capabilities": { method: "telegram.capabilities", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local private-owner Telegram management (contract v1)." },
+  "telegram.status": { method: "telegram.status", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local private-owner Telegram management (contract v1)." },
+  "telegram.configure": { method: "telegram.configure", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local private-owner Telegram management (contract v1)." },
+  "telegram.start": { method: "telegram.start", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local private-owner Telegram management (contract v1)." },
+  "telegram.stop": { method: "telegram.stop", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local private-owner Telegram management (contract v1)." },
+  "telegram.revoke": { method: "telegram.revoke", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local private-owner Telegram management (contract v1)." },
+  "telegram.agents.list": { method: "telegram.agents.list", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local Telegram agent management (contract v2)." },
+  "telegram.agents.create": { method: "telegram.agents.create", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local Telegram agent management (contract v2)." },
+  "telegram.agents.update": { method: "telegram.agents.update", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local Telegram agent management (contract v2)." },
+  "telegram.agents.start": { method: "telegram.agents.start", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local Telegram agent management (contract v2)." },
+  "telegram.agents.stop": { method: "telegram.agents.stop", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local Telegram agent management (contract v2)." },
+  "telegram.agents.remove": { method: "telegram.agents.remove", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local Telegram agent management (contract v2)." },
+  "telegram.agents.pair.begin": { method: "telegram.agents.pair.begin", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local Telegram agent management (contract v2)." },
+  "telegram.agents.pair.confirm": { method: "telegram.agents.pair.confirm", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local Telegram agent management (contract v2)." },
+  "telegram.agents.pair.cancel": { method: "telegram.agents.pair.cancel", direction: "client-to-server", params: "optional", result: "object", description: "Authenticated local Telegram agent management (contract v2)." },
   initialize: {
     method: "initialize",
     direction: "client-to-server",
@@ -351,6 +416,15 @@ export const AGENC_DAEMON_METHOD_SPECS = defineMethodSpecs({
       "(intake commits before the result returns; the pipeline continues " +
       "asynchronously under the returned run id).",
   },
+  "routine.capabilities": { method: "routine.capabilities", direction: "client-to-server", params: "optional", result: "object", description: "Local daemon routine capabilities (routine contract v1)." },
+  "routine.list": { method: "routine.list", direction: "client-to-server", params: "optional", result: "object", description: "Local daemon routine list (routine contract v1)." },
+  "routine.get": { method: "routine.get", direction: "client-to-server", params: "required", result: "object", description: "Local daemon routine get (routine contract v1)." },
+  "routine.create": { method: "routine.create", direction: "client-to-server", params: "required", result: "object", description: "Local daemon routine create (routine contract v1)." },
+  "routine.update": { method: "routine.update", direction: "client-to-server", params: "required", result: "object", description: "Local daemon routine update (routine contract v1)." },
+  "routine.delete": { method: "routine.delete", direction: "client-to-server", params: "required", result: "object", description: "Local daemon routine delete (routine contract v1)." },
+  "routine.run": { method: "routine.run", direction: "client-to-server", params: "required", result: "object", description: "Local daemon routine run (routine contract v1)." },
+  "routine.runs": { method: "routine.runs", direction: "client-to-server", params: "required", result: "object", description: "Local daemon routine runs (routine contract v1)." },
+  "routine.cancel": { method: "routine.cancel", direction: "client-to-server", params: "required", result: "object", description: "Local daemon routine cancel (routine contract v1)." },
   "csvJob.review.list": {
     method: "csvJob.review.list",
     direction: "client-to-server",
@@ -925,6 +999,7 @@ export const AGENC_DAEMON_INTERNAL_METHOD_SPECS = defineInternalMethodSpecs({
 });
 
 export const AGENC_DAEMON_NOTIFICATION_SPECS = defineNotificationSpecs({
+  "routine.updated": { method: "routine.updated", direction: "server-to-client", params: "required", description: "Invalidate local routine state for clients opting into routine.updated.v1." },
   "commandExec.outputDelta": {
     method: "commandExec.outputDelta",
     direction: "server-to-client",
@@ -2142,6 +2217,7 @@ export interface AgenCDaemonNotificationWithParams<
 }
 
 export interface AgenCDaemonNotificationParamsByMethod {
+  readonly "routine.updated": RoutineUpdatedEvent;
   readonly "commandExec.outputDelta": CommandExecOutputDeltaParams;
   readonly "event.message_chunk": EventMessageChunkParams;
   readonly "event.tool_request": EventToolRequestParams;
@@ -2263,6 +2339,18 @@ export interface AgenCDaemonRequestWithoutParams<
 }
 
 export type AgenCDaemonRequest =
+  | AgenCDaemonRequestWithParams<"telegram.capabilities" | "telegram.status" | "telegram.configure" | "telegram.start" | "telegram.stop" | "telegram.revoke", JsonObject>
+  | AgenCDaemonRequestWithParams<"telegram.agents.list" | "telegram.agents.create" | "telegram.agents.update" | "telegram.agents.start" | "telegram.agents.stop" | "telegram.agents.remove" | "telegram.agents.pair.begin" | "telegram.agents.pair.confirm" | "telegram.agents.pair.cancel", JsonObject>
+  | AgenCDaemonRequestWithParams<"remote.capabilities" | "remote.status" | "remote.start" | "remote.stop" | "remote.pair.begin" | "remote.pair.refresh" | "remote.pair.cancel" | "remote.devices" | "remote.pending" | "remote.approve" | "remote.revoke", JsonObject>
+  | AgenCDaemonRequestWithoutParams<"routine.capabilities">
+  | AgenCDaemonRequestWithoutParams<"routine.list">
+  | AgenCDaemonRequestWithParams<"routine.get", RoutineIdParams>
+  | AgenCDaemonRequestWithParams<"routine.create", RoutineCreateParams>
+  | AgenCDaemonRequestWithParams<"routine.update", RoutineUpdateParams>
+  | AgenCDaemonRequestWithParams<"routine.delete", RoutineDeleteParams>
+  | AgenCDaemonRequestWithParams<"routine.run", RoutineIdParams>
+  | AgenCDaemonRequestWithParams<"routine.runs", RoutineRunsParams>
+  | AgenCDaemonRequestWithParams<"routine.cancel", RoutineCancelParams>
   | AgenCDaemonRequestWithParams<"initialize", InitializeParams>
   | AgenCDaemonRequestWithParams<"request.cancel", RequestCancelParams>
   | AgenCDaemonRequestWithParams<"agent.create", AgentCreateParams>
@@ -2709,6 +2797,8 @@ export interface RunUsageTotals extends JsonObject {
   readonly outputTokens: number;
   readonly totalTokens: number;
   readonly costUsd: number;
+  /** False when historical coverage or model pricing is incomplete. */
+  readonly costKnown?: boolean;
 }
 
 /** Terminal output committed by M4 and readable after disconnect/restart. */
@@ -3000,6 +3090,8 @@ export interface SessionSnapshotResult extends JsonObject {
     readonly outputTokens: number;
     readonly totalTokens: number;
     readonly costUsd: number;
+    /** False when historical coverage or model pricing is incomplete. */
+    readonly costKnown?: boolean;
   };
   /** Cumulative cache metrics across API calls this session. */
   readonly cacheStats: {
@@ -3016,6 +3108,11 @@ export interface SessionSnapshotResult extends JsonObject {
    * which is why a UI showing them had to make numbers up.
    */
   readonly contextBreakdown?: {
+    /** Active provider/model whose context window this estimate describes. */
+    readonly provider?: string;
+    readonly model?: string;
+    /** Counts use the runtime's rough estimator rather than provider tokens. */
+    readonly estimated?: boolean;
     /** The model's real window, so shares are against the truth. */
     readonly windowTokens: number;
     readonly messageTokens: number;
@@ -3703,6 +3800,41 @@ export interface AgenCDaemonResultByMethod {
   readonly "run.evidence": RunEvidenceResult;
   readonly "run.cancel": RunCancelResult;
   readonly "run.start": RunStartResult;
+  readonly "routine.capabilities": RoutineCapabilities;
+  readonly "remote.capabilities": JsonObject;
+  readonly "remote.status": JsonObject;
+  readonly "remote.start": JsonObject;
+  readonly "remote.stop": JsonObject;
+  readonly "remote.pair.begin": JsonObject;
+  readonly "remote.pair.refresh": JsonObject;
+  readonly "remote.pair.cancel": JsonObject;
+  readonly "remote.devices": JsonObject;
+  readonly "remote.pending": JsonObject;
+  readonly "remote.approve": JsonObject;
+  readonly "remote.revoke": JsonObject;
+  readonly "telegram.capabilities": JsonObject;
+  readonly "telegram.status": JsonObject;
+  readonly "telegram.configure": JsonObject;
+  readonly "telegram.start": JsonObject;
+  readonly "telegram.stop": JsonObject;
+  readonly "telegram.revoke": JsonObject;
+  readonly "telegram.agents.list": JsonObject;
+  readonly "telegram.agents.create": JsonObject;
+  readonly "telegram.agents.update": JsonObject;
+  readonly "telegram.agents.start": JsonObject;
+  readonly "telegram.agents.stop": JsonObject;
+  readonly "telegram.agents.remove": JsonObject;
+  readonly "telegram.agents.pair.begin": JsonObject;
+  readonly "telegram.agents.pair.confirm": JsonObject;
+  readonly "telegram.agents.pair.cancel": JsonObject;
+  readonly "routine.list": RoutineListResult;
+  readonly "routine.get": RoutineResult;
+  readonly "routine.create": RoutineResult;
+  readonly "routine.update": RoutineResult;
+  readonly "routine.delete": RoutineDeleteResult;
+  readonly "routine.run": RoutineRunResult;
+  readonly "routine.runs": RoutineRunsResult;
+  readonly "routine.cancel": RoutineRunResult;
   readonly "csvJob.review.list": CsvJobReviewListResult;
   readonly "csvJob.review.show": CsvJobReviewShowResult;
   readonly "csvJob.review.resolve": CsvJobReviewResolveResult;

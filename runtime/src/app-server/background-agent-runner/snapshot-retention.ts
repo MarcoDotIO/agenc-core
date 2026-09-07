@@ -5,18 +5,12 @@
  */
 
 import type { ManagedThread } from "../../agents/thread-manager.js";
-import {
-  computeUsdCost,
-  DEFAULT_MODEL_COSTS,
-  type ModelUsage,
-} from "../../session/cost.js";
 import { EVENT_GAP_EVENT } from "../../contracts/run-contracts.js";
 
 import {
   positiveSequence,
   nonNegativeSequence,
   positiveInteger,
-  stringRecordField,
   finiteNumber,
 } from "./shared.js";
 import type {
@@ -141,49 +135,51 @@ function terminalUsageForActiveAgent(
   active: ActiveBackgroundAgent,
 ): AgentTerminalUsage {
   const live = managedTokenUsage(active.thread);
+  const cost = agentCostSnapshot(active, live);
   return {
     inputTokens: finiteNumber(live.inputTokens),
     outputTokens: finiteNumber(live.outputTokens),
     totalTokens: finiteNumber(live.totalTokens),
-    costUsd: agentCostUsd(active),
+    ...cost,
   };
 }
 
-function agentCostUsd(active: ActiveBackgroundAgent): number {
-  const tokenUsage = managedTokenUsage(active.thread);
-  const model = activeAgentModel(active);
-  const provider = activeAgentProvider(active);
-  // LiveAgent currently exposes aggregate input/output token counters.
-  // Preserve that limited basis in the terminal usage snapshot without
-  // pretending cached/reasoning/search dimensions were observed.
-  const usage: ModelUsage = {
-    model,
-    ...(provider !== undefined ? { provider } : {}),
-    inputTokens: finiteNumber(tokenUsage.inputTokens),
-    outputTokens: finiteNumber(tokenUsage.outputTokens),
-    cachedInputTokens: 0,
-    cacheCreationInputTokens: 0,
-    reasoningOutputTokens: 0,
-    webSearchRequests: 0,
-    totalTokens: finiteNumber(tokenUsage.totalTokens),
-    turns: 0,
-  };
-  return computeUsdCost(usage, DEFAULT_MODEL_COSTS);
-}
-
-function activeAgentModel(active: ActiveBackgroundAgent): string {
-  return (
-    stringRecordField(active.thread.configSnapshot?.(), "model") ?? "agenc"
-  );
-}
-
-function activeAgentProvider(
+function agentCostSnapshot(
   active: ActiveBackgroundAgent,
-): string | undefined {
-  return (
-    stringRecordField(active.thread.configSnapshot?.(), "provider") ??
-    stringRecordField(active.thread.configSnapshot?.(), "model_provider")
-  );
+  live: ManagedTokenUsageShape,
+): Pick<AgentTerminalUsage, "costUsd" | "costKnown"> {
+  const sidecar = active.bootstrap.session.services.costSidecar;
+  if (sidecar === undefined) {
+    return { costUsd: 0, costKnown: false };
+  }
+  try {
+    const costUsd = sidecar.getTotalCostUsd();
+    if (!Number.isFinite(costUsd) || costUsd < 0) {
+      return { costUsd: 0, costKnown: false };
+    }
+    const sidecarUsage = sidecar.getSessionTotals();
+    const state = active.bootstrap.session.state?.unsafePeek?.();
+    const resumedWithHistoricalUsage =
+      (state as { initialTokenUsage?: unknown } | undefined)
+        ?.initialTokenUsage !== undefined;
+    const coversLiveUsage =
+      sidecarUsage.inputTokens === live.inputTokens &&
+      sidecarUsage.outputTokens === live.outputTokens &&
+      sidecarUsage.totalTokens === live.totalTokens;
+    return {
+      costUsd,
+      costKnown:
+        !resumedWithHistoricalUsage &&
+        coversLiveUsage &&
+        !sidecar.hasUnknownModelCost(),
+    };
+  } catch {
+    // A snapshot must remain available if optional accounting degrades. Do
+    // not reprice cumulative mixed-model usage as though it all belonged to
+    // the currently selected model; zero plus an explicit unknown marker is
+    // safer than a fabricated historical amount.
+    return { costUsd: 0, costKnown: false };
+  }
 }
 
 const MAX_RETAINED_SHELL_EXECUTIONS = 256;

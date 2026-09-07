@@ -98,6 +98,19 @@ describe("/effort Grok catalog levels", () => {
     expect(settings.update).not.toHaveBeenCalled();
   });
 
+  test.each(["max", "xhigh"])("persists Spark 1.3 %s without aliasing it", async (effort) => {
+    const { context, getAppState } = commandContext("muse-spark-1.3", effort, { provider: "meta" });
+    expect(await effortCommand.execute(context)).toMatchObject({ kind: "text" });
+    expect(settings.update).toHaveBeenCalledWith("userSettings", { reasoning_effort: effort });
+    expect(getAppState()).toMatchObject({ effortValue: effort });
+  });
+
+  test.each(["muse-spark-1.2", "muse-spark-1.3-contributor", "muse-spark-1.3-unverified", "meta/muse-spark-1.3-unverified"])("does not offer literal max to %s", async (model) => {
+    const { context } = commandContext(model, "max", { provider: "meta" });
+    expect(await effortCommand.execute(context)).toMatchObject({ kind: "error" });
+    expect(settings.update).not.toHaveBeenCalled();
+  });
+
   test("ignores a provider-only service result instead of mixing authorities", async () => {
     const { context } = commandContext("private-model", "", {
       provider: "grok",

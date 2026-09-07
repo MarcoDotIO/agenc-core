@@ -25,6 +25,13 @@ import { createConnection, isIP } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { resolveHomeContext } from "../config/home.js";
+import { RemoteService } from "../remote/service.js";
+import { createRemoteBackend } from "../remote/backend.js";
+import { remoteAuthSessionTokenSync } from "../auth/session-state.js";
+import { OwnerTelegramService } from "../gateway/owner-telegram.js";
+import { createOwnerTelegramStorage } from "../gateway/owner-telegram-storage.js";
+import { RemoteError } from "../remote/types.js";
+import { assertSafeRemoteSessionPolicy } from "../remote/session-policy.js";
 import {
   AgenCDaemonAgentManager,
   type AgenCDaemonAgentRunSnapshot,
@@ -145,10 +152,13 @@ import { createPermissionAuditFileLogger } from "../permissions/permission-audit
 import { loadCanonicalDaemonConfig } from "../config/repository.js";
 import { resolveProviderBaseURL } from "../config/env.js";
 import {
+  resolveAgentRuntimeOptions,
   resolveSessionTempRootAtIngress,
   validateAgentRuntimeOptions,
   type AgentRuntimeOptions,
 } from "../session/runtime-options.js";
+import { RoutineService } from "../routines/service.js";
+import { createDaemonRoutineExecutor } from "../routines/daemon-executor.js";
 import type { AgenCConfig, AgentRunRetentionConfig } from "../config/schema.js";
 import { CodePredictionService } from "../services/code-prediction/service.js";
 import { BUILT_IN_PROVIDER_BASE_URLS } from "../llm/registry/provider-info.js";
@@ -3390,6 +3400,9 @@ async function runAgenCDaemonForegroundLocked(
     cleanup.register("daemon-snapshot-policy", async () => {
       snapshotPolicies.close();
     });
+    let routines: RoutineService | undefined;
+    let remote: RemoteService | undefined;
+    let ownerTelegram: OwnerTelegramService | undefined;
     const agentManager = new AgenCDaemonAgentManager({
       agencHome: authStartup.daemonHome,
       runner,
@@ -3400,6 +3413,9 @@ async function runAgenCDaemonForegroundLocked(
       snapshotFlush: (snapshot) =>
         writeAgenCDaemonSnapshot(snapshotPath, snapshot),
       broadcastSessionEvent: async (sessionId, event) => {
+        routines?.observeSessionEvent(sessionId, event);
+        remote?.observeSessionEvent(sessionId, event);
+        ownerTelegram?.observeSessionEvent(sessionId, event);
         try {
           snapshotPolicies.recordSessionEvent(sessionId, event);
         } catch (error) {
@@ -3696,8 +3712,75 @@ async function runAgenCDaemonForegroundLocked(
       shuttingDown = true;
       resolveRpcShutdown();
     });
-    const dispatcher = new AgenCDaemonJsonRpcDispatcher({
+    try {
+      routines = new RoutineService({
+        home: authStartup.daemonHome,
+        executor: createDaemonRoutineExecutor({
+          agentManager,
+          runtimeOptions: resolveAgentRuntimeOptions(
+            { ...host.env, AGENC_HOME: authStartup.daemonHome },
+            { dangerouslyBypassApprovalsAndSandbox: false, allowUntrustedHooks: false, remoteMode: false, stdinDataMode: false },
+          ),
+        }),
+      });
+      routines.start();
+      cleanup.register("daemon-routines", () => routines?.close());
+    } catch {
+      await routines?.close();
+      routines = undefined;
+      io.stderr.write("agenc: local routines are unavailable; routine storage was preserved\n");
+    }
+    const remoteContext = { home: resolveHomeContext({ ...host.env, AGENC_HOME: authStartup.daemonHome }), environment: Object.freeze({ ...host.env }) };
+    const assertRemoteControlSession = async (sessionId: string): Promise<void> => {
+      const session = await sessionManager.getSession(sessionId);
+      if (!session) throw new RemoteError("REMOTE_SESSION_UNAVAILABLE");
+      const snapshot = await runner.getAgentSnapshot?.(session.agentId);
+      assertSafeRemoteSessionPolicy(snapshot?.runtimeSettings, session.metadata?.runtimeOptions);
+    };
+    const createRemoteSession = async (workspacePath: string, title: string, signal: AbortSignal) => {
+        signal.throwIfAborted();
+        const agent = await agentManager.createAgent({
+          cwd: workspacePath, objective: title, deferInitialTurn: true, permissionMode: "default",
+          runtimeOptions: resolveAgentRuntimeOptions(
+            { ...host.env, AGENC_HOME: authStartup.daemonHome },
+            { dangerouslyBypassApprovalsAndSandbox: false, allowUntrustedHooks: false, remoteMode: true, stdinDataMode: false },
+          ),
+        });
+        if (signal.aborted || !agent.sessionId) {
+          await agentManager.stopAgent({ agentId: agent.agentId, reason: "Remote session creation cancelled" });
+          throw new Error("Remote session creation cancelled");
+        }
+        return { sessionId: agent.sessionId, agentId: agent.agentId };
+      };
+    remote = new RemoteService({
+      home: authStartup.daemonHome,
+      backend: createRemoteBackend({ backendUrl: host.env.AGENC_BACKEND_URL || "https://id.agenc.ag", token: () => remoteAuthSessionTokenSync(remoteContext) }),
+      lookupSession: (sessionId) => sessionManager.getSession(sessionId),
+      createConnection: (remoteAccess) => dispatcher.createConnection({ remoteAccess }),
+      createSession: createRemoteSession,
+      assertControlSession: assertRemoteControlSession,
+    });
+    cleanup.register("daemon-browser-remote", () => remote?.close());
+    try {
+      ownerTelegram = new OwnerTelegramService({
+        home: authStartup.daemonHome,
+        storage: createOwnerTelegramStorage(remoteContext.home),
+        lookupSession: (sessionId) => sessionManager.getSession(sessionId),
+        createConnection: (remoteAccess) => dispatcher.createConnection({ remoteAccess }),
+        createSession: createRemoteSession,
+        assertControlSession: assertRemoteControlSession,
+      });
+    } catch {
+      // Preserve malformed/unreadable metadata and keep unrelated local sessions usable.
+      ownerTelegram = undefined;
+      io.stderr.write("agenc: Telegram agents are unavailable; existing configuration was preserved\n");
+    }
+    cleanup.register("daemon-owner-telegram", () => ownerTelegram?.close());
+    const dispatcher: AgenCDaemonJsonRpcDispatcher = new AgenCDaemonJsonRpcDispatcher({
+      remote,
+      ownerTelegram,
       agentManager,
+      routines,
       clientMultiplexer,
       sessionManager,
       fuzzyAllowedRoots: [primaryCwd],
@@ -5183,6 +5266,8 @@ function recoveryMetadataForRun(
   const canonicalSource = run.resumeSource;
   const runtimeOptions = runtimeOptionsForRecoveredRun(run);
   return {
+    ...(typeof run.metadata?.routineId === "string" ? { routineId: run.metadata.routineId } : {}),
+    ...(typeof run.metadata?.routineRunId === "string" ? { routineRunId: run.metadata.routineRunId } : {}),
     ...(canonicalSource !== undefined
       ? {
           agentPath: canonicalSource.agentPath,
@@ -5209,7 +5294,8 @@ function recoveryMetadataForRun(
   };
 }
 
-async function restoreRecoveredAgentRuntime(
+/** @internal Shared startup recovery seam, exported for hermetic regression coverage. */
+export async function restoreRecoveredAgentRuntime(
   runner: AgenCBackgroundAgentRunner,
   run: RecoveredAgentRun,
   options: {
@@ -5222,6 +5308,12 @@ async function restoreRecoveredAgentRuntime(
   readonly restoreAttemptId?: string;
 }> {
   const resumeSource = run.resumeSource;
+  // Routine invocations are one-shot. Rehydrating their ordinary runtime here
+  // would replay tools/startup hooks before the routine owner records interruption.
+  if (typeof run.metadata?.routineId === "string" || typeof run.metadata?.routineRunId === "string") {
+    resumeSource?.close();
+    return { available: false };
+  }
   const runtimeOptions = runtimeOptionsForRecoveredRun(run);
   if (!isRecoveredRunRuntimeRestorable(run) || resumeSource === undefined) {
     resumeSource?.close();

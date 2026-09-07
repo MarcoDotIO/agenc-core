@@ -127,6 +127,7 @@ export interface EnvSnapshot {
   readonly ZAI_BASE_URL?: string;
   readonly ZAI_CODING_PLAN_API_KEY?: string;
   readonly ZAI_CODING_PLAN_BASE_URL?: string;
+  readonly MOONSHOT_API_KEY?: string;
   readonly GEMINI_API_KEY?: string;
   readonly GEMINI_BASE_URL?: string;
   readonly GOOGLE_API_KEY?: string;
@@ -372,13 +373,14 @@ export function applyEnvOverrides(
     const effort = readNonEmpty(e.AGENC_EFFORT_LEVEL)?.toLowerCase();
     if (
       effort === "minimal" || effort === "low" || effort === "medium" ||
-      effort === "high" || effort === "xhigh" || effort === "none"
+      effort === "high" || effort === "xhigh" || effort === "max" ||
+      effort === "none"
     ) {
       override.reasoning_effort = effort;
     } else {
       throw new Error(
         `invalid AGENC_EFFORT_LEVEL="${e.AGENC_EFFORT_LEVEL}"; ` +
-          "expected one of minimal, low, medium, high, xhigh, or none",
+          "expected one of minimal, low, medium, high, xhigh, max, or none",
       );
     }
   }

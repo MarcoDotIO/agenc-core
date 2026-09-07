@@ -135,6 +135,7 @@ describe("MetaProvider", () => {
           "medium",
           "high",
           "xhigh",
+          ...(model === "muse-spark-1.3" ? ["max"] : []),
         ],
         defaultReasoningLevel: "medium",
         inputModalities: ["text", "image"],
@@ -177,7 +178,37 @@ describe("MetaProvider", () => {
       "medium",
       "high",
       "xhigh",
+      "max",
     ]);
+  });
+
+  test.each([
+    ["muse-spark-1.3", "max", "max"],
+    ["muse-spark-1.3", "xhigh", "xhigh"],
+    ["muse-spark-1.3", "none", undefined],
+    ["muse-spark-1.3-contributor", "max", undefined],
+    ["muse-spark-1.2", "max", undefined],
+    ["muse-spark-1.2-contributor", "max", undefined],
+    ["muse-spark-1.1", "max", undefined],
+    ["muse-spark-1.3-unverified", "max", undefined],
+    ["meta/muse-spark-1.3-unverified", "max", undefined],
+    ["meta/muse-spark-1.3", "max", "max"],
+    ["muse-spark-2.0", "max", undefined],
+  ] as const)("keeps %s effort %s identical in chat and streaming", async (model, effort, expected) => {
+    const streamResponse = () => new Response(
+      `data: ${JSON.stringify({ model, choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
+      { headers: { "content-type": "text/event-stream" } },
+    );
+    const fetchImpl = vi.fn<typeof fetch>()
+      .mockImplementationOnce(async () => successfulChat(model))
+      .mockImplementationOnce(async () => streamResponse());
+    const provider = new MetaProvider({ apiKey: "meta-test", model, fetchImpl });
+    await provider.chat([{ role: "user", content: "hello" }], { reasoningEffort: effort });
+    await provider.chatStream([{ role: "user", content: "hello" }], () => {}, { reasoningEffort: effort });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    for (const [, init] of fetchImpl.mock.calls) {
+      expect(JSON.parse(String(init?.body)).reasoning_effort).toBe(expected);
+    }
   });
 
   test.each([

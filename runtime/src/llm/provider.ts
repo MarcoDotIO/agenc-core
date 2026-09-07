@@ -54,6 +54,7 @@ import {
   ZaiCodingPlanProvider,
   ZaiProvider,
 } from "./providers/zai/index.js";
+import { KimiProvider } from "./providers/kimi/index.js";
 import {
   QwenProvider,
   QwenTokenPlanProvider,
@@ -1326,6 +1327,7 @@ function buildOpenAICompatibleProvider(
     | "cerebras"
     | "zai"
     | "zai-coding-plan"
+    | "kimi"
     | "qwen"
     | "qwen-token-plan"
     | "mistral"
@@ -1610,8 +1612,8 @@ export function createProvider(
           },
         });
       }
-      // /grok-login OAuth ALWAYS wins over env/factory BYOK. Signing in with
-      // X means subscription access; leftover XAI_API_KEY must not shadow it.
+      // Unless the captured selection explicitly requests API-key billing,
+      // signing in with X wins over leftover environment/factory API keys.
       // Bearer refreshes via the adapter's I-14 401-recovery hook.
       const factoryApiKey = resolveFactoryApiKey(opts);
       // The stored grant wins whenever it exists, here and not only in the
@@ -1621,7 +1623,7 @@ export function createProvider(
       // snapshot no longer matches, and treating it as an API key sends a
       // dead token with no refresh path (xAI answers 403).
       const storedOauthBearer =
-        opts.credentialHome !== undefined
+        extra.authMode !== "api_key" && opts.credentialHome !== undefined
           ? readXaiOauthAccessToken(opts.credentialHome)
           : undefined;
       const usesXaiOauth = storedOauthBearer !== undefined;
@@ -1712,6 +1714,10 @@ export function createProvider(
           },
         });
       }
+      const storedExtra = readProviderRuntimeExtra({
+        ...(cfg as unknown as Record<string, unknown>),
+        ...(extra.authMode !== undefined ? { authMode: extra.authMode } : {}),
+      });
       return markFactoryProvider(grokProvider, {
         provider: "grok",
         options: {
@@ -1722,15 +1728,7 @@ export function createProvider(
           ...(cfg.baseURL !== undefined ? { baseURL: cfg.baseURL } : {}),
           model,
           ...(cfg.timeoutMs !== undefined ? { timeoutMs: cfg.timeoutMs } : {}),
-          ...(readProviderRuntimeExtra(
-            cfg as unknown as Record<string, unknown>,
-          )
-            ? {
-                extra: readProviderRuntimeExtra(
-                  cfg as unknown as Record<string, unknown>,
-                ),
-              }
-            : {}),
+          ...(storedExtra !== undefined ? { extra: storedExtra } : {}),
         },
       });
     }
@@ -1948,6 +1946,12 @@ export function createProvider(
         apiKeyMode: "required",
         useResponsesApi: false,
         providerCtor: ZaiCodingPlanProvider,
+      });
+    case "kimi":
+      return buildOpenAICompatibleProvider("kimi", opts, {
+        apiKeyMode: "required",
+        useResponsesApi: false,
+        providerCtor: KimiProvider,
       });
     case "qwen":
       return buildOpenAICompatibleProvider("qwen", opts, {

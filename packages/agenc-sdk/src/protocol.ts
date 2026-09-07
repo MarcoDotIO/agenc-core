@@ -22,6 +22,8 @@ import type {
   CsvJobReviewShowResult,
 } from "./csv-jobs.js";
 import type { SessionTranscriptV2Result } from "./transcript-v2.generated.js";
+import type { RoutineCapabilities, RoutineListResult, RoutineResult, RoutineDeleteResult, RoutineRunResult, RoutineRunsResult, RoutineIdParams, RoutineCreateParams, RoutineUpdateParams, RoutineDeleteParams, RoutineRunsParams, RoutineCancelParams } from "./routines.js";
+export type * from "./routines.js";
 
 export type {
   SessionTranscriptV2ActiveTurn,
@@ -33,7 +35,7 @@ export type {
 /** JSON-RPC 2.0 envelope version sent on every request. */
 export const AGENC_SDK_JSON_RPC_VERSION = "2.0" as const;
 /** Protocol the SDK advertises on `initialize`. Handshake rules are in docs/sdk.md. */
-export const AGENC_SDK_DAEMON_PROTOCOL_VERSION = "1.9.0" as const;
+export const AGENC_SDK_DAEMON_PROTOCOL_VERSION = "1.10.0" as const;
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | readonly JsonValue[] | JsonObject;
@@ -49,6 +51,32 @@ export type RequestId = string | number;
  * guard.
  */
 export const AGENC_SDK_DAEMON_METHODS = [
+  "remote.capabilities",
+  "remote.status",
+  "remote.start",
+  "remote.stop",
+  "remote.pair.begin",
+  "remote.pair.refresh",
+  "remote.pair.cancel",
+  "remote.devices",
+  "remote.pending",
+  "remote.approve",
+  "remote.revoke",
+  "telegram.capabilities",
+  "telegram.status",
+  "telegram.configure",
+  "telegram.start",
+  "telegram.stop",
+  "telegram.revoke",
+  "telegram.agents.list",
+  "telegram.agents.create",
+  "telegram.agents.update",
+  "telegram.agents.start",
+  "telegram.agents.stop",
+  "telegram.agents.remove",
+  "telegram.agents.pair.begin",
+  "telegram.agents.pair.confirm",
+  "telegram.agents.pair.cancel",
   "initialize",
   "request.cancel",
   "agent.create",
@@ -62,6 +90,15 @@ export const AGENC_SDK_DAEMON_METHODS = [
   "run.evidence",
   "run.cancel",
   "run.start",
+  "routine.capabilities",
+  "routine.list",
+  "routine.get",
+  "routine.create",
+  "routine.update",
+  "routine.delete",
+  "routine.run",
+  "routine.runs",
+  "routine.cancel",
   "csvJob.review.list",
   "csvJob.review.show",
   "csvJob.review.resolve",
@@ -112,6 +149,7 @@ export type AgencDaemonMethod = (typeof AGENC_SDK_DAEMON_METHODS)[number];
  * order. Mirror of `AGENC_DAEMON_NOTIFICATION_METHODS`.
  */
 export const AGENC_SDK_DAEMON_NOTIFICATION_METHODS = [
+  "routine.updated",
   "commandExec.outputDelta",
   "event.message_chunk",
   "event.tool_request",
@@ -558,6 +596,32 @@ export type CsvJobReviewResolveWireParams = CsvJobReviewResolveParams & {
 };
 
 export interface AgencParamsByMethod {
+  readonly "remote.capabilities": JsonObject;
+  readonly "remote.status": JsonObject;
+  readonly "remote.start": JsonObject;
+  readonly "remote.stop": JsonObject;
+  readonly "remote.pair.begin": JsonObject;
+  readonly "remote.pair.refresh": JsonObject;
+  readonly "remote.pair.cancel": JsonObject;
+  readonly "remote.devices": JsonObject;
+  readonly "remote.pending": JsonObject;
+  readonly "remote.approve": JsonObject;
+  readonly "remote.revoke": JsonObject;
+  readonly "telegram.capabilities": JsonObject;
+  readonly "telegram.status": JsonObject;
+  readonly "telegram.configure": JsonObject;
+  readonly "telegram.start": JsonObject;
+  readonly "telegram.stop": JsonObject;
+  readonly "telegram.revoke": JsonObject;
+  readonly "telegram.agents.list": JsonObject;
+  readonly "telegram.agents.create": JsonObject;
+  readonly "telegram.agents.update": JsonObject;
+  readonly "telegram.agents.start": JsonObject;
+  readonly "telegram.agents.stop": JsonObject;
+  readonly "telegram.agents.remove": JsonObject;
+  readonly "telegram.agents.pair.begin": JsonObject;
+  readonly "telegram.agents.pair.confirm": JsonObject;
+  readonly "telegram.agents.pair.cancel": JsonObject;
   readonly initialize: InitializeParams;
   readonly "request.cancel": RequestCancelParams;
   readonly "agent.create": AgentCreateParams;
@@ -571,6 +635,15 @@ export interface AgencParamsByMethod {
   readonly "run.evidence": RunEvidenceParams;
   readonly "run.cancel": RunCancelParams;
   readonly "run.start": RunStartParams;
+  readonly "routine.capabilities": EmptyParams;
+  readonly "routine.list": EmptyParams;
+  readonly "routine.get": RoutineIdParams;
+  readonly "routine.create": RoutineCreateParams;
+  readonly "routine.update": RoutineUpdateParams;
+  readonly "routine.delete": RoutineDeleteParams;
+  readonly "routine.run": RoutineIdParams;
+  readonly "routine.runs": RoutineRunsParams;
+  readonly "routine.cancel": RoutineCancelParams;
   readonly "csvJob.review.list": CsvJobReviewListWireParams;
   readonly "csvJob.review.show": CsvJobReviewShowWireParams;
   readonly "csvJob.review.resolve": CsvJobReviewResolveWireParams;
@@ -1411,6 +1484,32 @@ export interface AuthLogoutResult extends JsonObject {
 }
 
 export interface AgencResultByMethod {
+  readonly "remote.capabilities": JsonObject;
+  readonly "remote.status": JsonObject;
+  readonly "remote.start": JsonObject;
+  readonly "remote.stop": JsonObject;
+  readonly "remote.pair.begin": JsonObject;
+  readonly "remote.pair.refresh": JsonObject;
+  readonly "remote.pair.cancel": JsonObject;
+  readonly "remote.devices": JsonObject;
+  readonly "remote.pending": JsonObject;
+  readonly "remote.approve": JsonObject;
+  readonly "remote.revoke": JsonObject;
+  readonly "telegram.capabilities": JsonObject;
+  readonly "telegram.status": JsonObject;
+  readonly "telegram.configure": JsonObject;
+  readonly "telegram.start": JsonObject;
+  readonly "telegram.stop": JsonObject;
+  readonly "telegram.revoke": JsonObject;
+  readonly "telegram.agents.list": JsonObject;
+  readonly "telegram.agents.create": JsonObject;
+  readonly "telegram.agents.update": JsonObject;
+  readonly "telegram.agents.start": JsonObject;
+  readonly "telegram.agents.stop": JsonObject;
+  readonly "telegram.agents.remove": JsonObject;
+  readonly "telegram.agents.pair.begin": JsonObject;
+  readonly "telegram.agents.pair.confirm": JsonObject;
+  readonly "telegram.agents.pair.cancel": JsonObject;
   readonly initialize: InitializeResult;
   readonly "request.cancel": RequestCancelResult;
   readonly "agent.create": AgentCreateResult;
@@ -1424,6 +1523,15 @@ export interface AgencResultByMethod {
   readonly "run.evidence": RunEvidenceResult;
   readonly "run.cancel": RunCancelResult;
   readonly "run.start": RunStartResult;
+  readonly "routine.capabilities": RoutineCapabilities;
+  readonly "routine.list": RoutineListResult;
+  readonly "routine.get": RoutineResult;
+  readonly "routine.create": RoutineResult;
+  readonly "routine.update": RoutineResult;
+  readonly "routine.delete": RoutineDeleteResult;
+  readonly "routine.run": RoutineRunResult;
+  readonly "routine.runs": RoutineRunsResult;
+  readonly "routine.cancel": RoutineRunResult;
   readonly "csvJob.review.list": CsvJobReviewListResult;
   readonly "csvJob.review.show": CsvJobReviewShowResult;
   readonly "csvJob.review.resolve": CsvJobReviewResolveResult;
