@@ -175,6 +175,29 @@ describe("MCP OAuth foundation", () => {
     await expect(mcpOAuthFetch({}, undefined, fetchSpy)("file:///tmp/secret")).rejects.toThrow("HTTPS");
     expect(fetchSpy).not.toHaveBeenCalled();
   });
+  test.each([undefined, "", " \t "])("rejects an unbound or blank captured home (%s)", (configuredHome) => {
+    const options = fixture();
+    expect(() => runtimeMcpOAuthProvider(
+      options.name,
+      options.config.url,
+      "http",
+      options.config.oauth,
+      { HOME: root, ...(configuredHome === undefined ? {} : { AGENC_HOME: configuredHome }) },
+    )).toThrow("bound AgenC home");
+    expect(records.size).toBe(0);
+  });
+  test("accepts an explicitly configured canonical default home", () => {
+    const options = fixture();
+    const environment = { HOME: root, AGENC_HOME: join(root, ".agenc") };
+    expect(resolveHomeContext(environment, { platformHome: root })).toMatchObject({
+      source: "agenc-home",
+      isDefault: true,
+    });
+    expect(() => runtimeMcpOAuthProvider(
+      options.name, options.config.url, "http", options.config.oauth, environment,
+    )).not.toThrow();
+    expect(records.size).toBe(0);
+  });
   test("canonicalizes OAuth identity independently of object key order", () => {
     const config = fixture().config;
     expect(getServerKey("fixture", { ...config, headers: { A: "a", B: "b" }, oauth: { scopes: ["read"], clientId: "public", callbackPort } })).toBe(getServerKey("fixture", { ...config, headers: { B: "b", A: "a" }, oauth: { callbackPort, clientId: "public", scopes: ["read"] } }));

@@ -104,6 +104,15 @@ subscription access token also wins over `PROVIDER_CODE_API_KEY` on ChatGPT
 subscription requests; that variable is an explicit fallback, not a second
 stored credential path.
 
+`OPENAI_AUTH_MODE` and `GROK_AUTH_MODE` capture a non-secret authentication
+preference for the selected provider: `auto` (also the unset/empty default),
+`oauth`, or `api-key`. Other values are rejected. Automatic selection preserves
+the provider's existing credential precedence. Explicit OAuth cannot fall back
+to paid API keys if sign-in is absent; explicit API-key selection cannot use an
+OAuth sign-in. Neither explicit selection silently obtains managed credentials.
+These values are captured with the session environment and do not delete saved
+credentials or change another session's selection.
+
 Gemini project identity has one ordered surface: `GEMINI_PROJECT_ID` wins over
 `GOOGLE_CLOUD_PROJECT`. Other Google project-name aliases are not consumed.
 `GEMINI_AUTH_MODE` restricts resolution to exactly the named method and rejects

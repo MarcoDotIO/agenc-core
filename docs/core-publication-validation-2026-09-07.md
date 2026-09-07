@@ -142,3 +142,31 @@ claims). It was merged without conflicts. Its identifier tests and the preceding
 task-settlement/signal-cleanup regressions passed **45 tests in three files**.
 The original publication remains ancestry and protocol/SDK mirror bytes remain
 unchanged. Hosted checks must pass again on the final integrated head.
+
+## Canonical-home and task-generation follow-up
+
+Hosted CI on `27ec5ef` reached the canonical-home architecture guard. The MCP
+OAuth provider now checks the captured `HomeContext.source`, not a direct
+environment read. Missing, empty, and whitespace-only bindings are rejected;
+an explicitly configured canonical default home remains valid. The whitespace
+case failed before the correction. The focused home/auth, architecture,
+environment-documentation, model-catalog, and MCP-migration checks passed
+**41 tests in five files**. Catalog fixtures now retain exact order and the
+distinct reasoning levels of legacy versus newly registered models. MCP
+migration fixtures preserve valid OAuth options and continue rejecting unknown
+nested authority; their rejection and rollback assertions were not removed.
+
+Independent review also reproduced two races in main's newly reusable task
+IDs: an old asynchronous stop could kill a replacement, and an old unsubscribe
+could remove a replacement's identical listener. Five new primary/alias,
+cleanup-success/failure, and subscription cases failed before the fix. Stop
+settlement is now fenced by the original record identity, and listener cleanup
+is bound to its original set. A stale successful stop reports `not_found` rather
+than claiming it stopped the replacement; cleanup errors retain `stop_failed`.
+The three focused lifecycle files passed **52 tests**. Runtime, test-support,
+and SDK no-emit checks and generated SDK consistency passed again.
+
+The broad local related-test run is diagnostic only: it has macOS/native/PTY
+failures and spanned working-tree edits while investigating blockers. It is not
+passing exact-head evidence. Hosted pinned Linux checks remain required before
+merge. No live runtime, credentials, sessions, or configuration were changed.

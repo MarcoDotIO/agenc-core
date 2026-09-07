@@ -64,8 +64,8 @@ export function runtimeMcpOAuthProvider(
 ): OAuthClientProvider {
   assertMcpOAuthHttpsUrl(endpoint);
   if (Object.keys(headers ?? {}).some((key) => key.toLowerCase() === "authorization")) throw new McpAuthenticationError("OAuth cannot be combined with an Authorization header.");
-  if (!environment.AGENC_HOME) throw new McpAuthenticationError("MCP OAuth requires a bound AgenC home.");
   const { home } = captureSecureStorageIngress(environment);
+  if (home.source !== "agenc-home") throw new McpAuthenticationError("MCP OAuth requires a bound AgenC home.");
   const { scopes, ...publicOptions } = oauth;
   const config: RemoteConfig = { type, url: endpoint, ...(headers ? { headers: { ...headers } } : {}), oauth: { ...publicOptions, ...(scopes ? { scopes: [...scopes] } : {}) } };
   return new RuntimeOAuthProvider(home, name, config, environment, mcpOAuthFetch(environment), true);
