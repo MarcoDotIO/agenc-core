@@ -11,6 +11,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, test } from "vitest";
 
+import { hardenedContainerRuntimeSmokeProgram } from "../../../scripts/check-clean-build.mjs";
+
 const REPO_ROOT = resolve(process.cwd(), "..");
 const BROAD_HOSTED_GATE_COMMANDS = [
   "npm test",
@@ -363,7 +365,7 @@ describe("reproducible install and release contract", () => {
     expect(powershellJob).toContain('["powershellTestRuntime"]["linux-x64"]');
     expect(powershellJob).toContain("--require-zero-skips");
     expect(powershellJob).toContain("--config vitest.powershell.config.ts");
-    expect(powershellJob).toContain("const expectedTests = 40");
+    expect(powershellJob).toContain("const expectedTests = 51");
     expect(powershellJob).toContain("numTotalTestSuites: 5");
     expect(powershellJob).toContain("numPassedTestSuites: 5");
     for (const testFile of [
@@ -2235,11 +2237,7 @@ describe("reproducible install and release contract", () => {
     );
     expect(cleanBuild).toContain("checkedJavaScriptProgram(");
     expect(cleanBuild).toContain('"hardened container runtime smoke"');
-    const hardenedSmoke = cleanBuild.match(
-      /checkedJavaScriptProgram\(\s*String\.raw`([\s\S]*?)`,\s*"hardened container runtime smoke"/,
-    );
-    expect(hardenedSmoke).not.toBeNull();
-    const hardenedSmokeSource = hardenedSmoke?.[1] ?? "";
+    const hardenedSmokeSource = hardenedContainerRuntimeSmokeProgram();
     expect(() => new Function(hardenedSmokeSource)).not.toThrow();
     expect(hardenedSmokeSource).toContain('.split("\\n")');
     expect(hardenedSmokeSource).not.toContain('.split("\\\\n")');
