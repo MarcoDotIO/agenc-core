@@ -512,6 +512,11 @@ function resolveProviderCredentialAuthorityCore(
 
   const resolvedExtra: Record<string, unknown> = {};
   const forcedExtra: Record<string, unknown> = {};
+  if (provider === "grok" && authPreference !== "auto") {
+    // Preserve the captured selection when providers are recreated from their
+    // recorded options; the raw factory must not reinterpret API-key intent.
+    forcedExtra.authMode = authPreference === "api-key" ? "api_key" : "oauth";
+  }
   let chatGptSubscription = false;
   let openAiNativeAuthMode: "api-key" | "oauth" | undefined;
   if (provider === "openai") {

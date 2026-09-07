@@ -81,7 +81,7 @@ import {
 export { resolveBuiltInProviderSlug } from "./registry/provider-info.js";
 import {
   forceRefreshXaiOauthCredentials,
-  isXaiOauthBearer,
+  readXaiOauthAccessToken,
   xaiOauthRequiresRelogin,
 } from "../utils/xaiOauthCredentials.js";
 import { isTrustedXaiOauthInferenceBaseUrl } from "../services/xai/oauth.js";
@@ -1612,14 +1612,23 @@ export function createProvider(
           },
         });
       }
-      // /grok-login OAuth ALWAYS wins over env/factory BYOK. Signing in with
-      // X means subscription access; leftover XAI_API_KEY must not shadow it.
+      // Unless the captured selection explicitly requests API-key billing,
+      // signing in with X wins over leftover environment/factory API keys.
       // Bearer refreshes via the adapter's I-14 401-recovery hook.
       const factoryApiKey = resolveFactoryApiKey(opts);
-      const usesXaiOauth =
-        opts.credentialHome !== undefined &&
-        isXaiOauthBearer(opts.credentialHome, factoryApiKey);
-      const apiKey = factoryApiKey ?? requireFactoryApiKey("grok", opts);
+      // The stored grant wins whenever it exists, here and not only in the
+      // option resolver upstream. Soak F76: a provider re-created from
+      // another instance's recorded factory options carries that instance's
+      // bearer snapshot; once the stored grant has been refreshed the
+      // snapshot no longer matches, and treating it as an API key sends a
+      // dead token with no refresh path (xAI answers 403).
+      const storedOauthBearer =
+        extra.authMode !== "api_key" && opts.credentialHome !== undefined
+          ? readXaiOauthAccessToken(opts.credentialHome)
+          : undefined;
+      const usesXaiOauth = storedOauthBearer !== undefined;
+      const apiKey =
+        storedOauthBearer ?? factoryApiKey ?? requireFactoryApiKey("grok", opts);
       const model = requireModel("grok", opts.model, defaultModelFor("grok"));
       const cfg: GrokProviderConfig = {
         ...buildCommonConfig(extra),
@@ -1705,6 +1714,10 @@ export function createProvider(
           },
         });
       }
+      const storedExtra = readProviderRuntimeExtra({
+        ...(cfg as unknown as Record<string, unknown>),
+        ...(extra.authMode !== undefined ? { authMode: extra.authMode } : {}),
+      });
       return markFactoryProvider(grokProvider, {
         provider: "grok",
         options: {
@@ -1715,15 +1728,7 @@ export function createProvider(
           ...(cfg.baseURL !== undefined ? { baseURL: cfg.baseURL } : {}),
           model,
           ...(cfg.timeoutMs !== undefined ? { timeoutMs: cfg.timeoutMs } : {}),
-          ...(readProviderRuntimeExtra(
-            cfg as unknown as Record<string, unknown>,
-          )
-            ? {
-                extra: readProviderRuntimeExtra(
-                  cfg as unknown as Record<string, unknown>,
-                ),
-              }
-            : {}),
+          ...(storedExtra !== undefined ? { extra: storedExtra } : {}),
         },
       });
     }

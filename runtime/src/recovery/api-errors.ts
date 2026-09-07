@@ -339,6 +339,14 @@ const TRANSIENT_PROVIDER_MESSAGE_PARTS = [
   "connection reset",
   "socket connection was closed unexpectedly",
   "socket closed",
+  // The OpenAI-compatible SDK raises APIConnectionError with the fixed text
+  // "Connection error." and no status or code of its own; mapLLMError keeps
+  // that text in the provider error it returns.
+  "connection error",
+  // undici ends a response body whose connection dropped mid-stream with a
+  // bare TypeError("terminated"); a goal's plan child died on exactly that
+  // right after its "Connection error." retry had succeeded.
+  "terminated",
 ];
 
 function isExplicitNonTransientProviderError(err: unknown): boolean {

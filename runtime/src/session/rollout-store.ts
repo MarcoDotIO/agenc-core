@@ -166,6 +166,7 @@ import {
   type CanonicalCompactionAttemptScan,
   type CanonicalRolloutScan,
 } from "./canonical-rollout-scanner.js";
+import { redactSecretsInValue } from "../secrets/sanitizer.js";
 
 export interface RolloutStoreOpts extends SessionStoreOpts {
   /** Session-owned temporary root captured at request ingress. */
@@ -465,9 +466,11 @@ function requireCompactionPayloadBundle(
       { cause: error },
     );
   }
+  // The bundle holds the redacted payload; expect the redacted value too.
   if (
     params.expectedValue !== undefined &&
-    canonicalizeJson(value) !== canonicalizeJson(params.expectedValue)
+    canonicalizeJson(value) !==
+      canonicalizeJson(redactSecretsInValue(params.expectedValue))
   ) {
     throw new CompactionTransactionError(
       params.failureStage,
@@ -771,6 +774,7 @@ export class RolloutStore {
     CompactionSourcePayloadBundlesV1
   >();
   private liveToolPairProjection: ToolPairProjection | undefined;
+  private liveToolPairProjectionId: string | undefined;
   private liveToolPairValidator: StreamingToolPairValidator | undefined;
   private openedAt: string | undefined;
   private openedEpoch: number | undefined;
@@ -2971,13 +2975,18 @@ export class RolloutStore {
         projection === undefined
           ? this.requireRunEpoch(payload.runId)
           : { epoch: projection.epoch };
+      // The journaled child run id wins: a workflow session journals its
+      // plan/implement steps on behalf of a subordinate run, and a replay
+      // that derived the child from the session id alone rebuilt those
+      // intents without it and conflicted with the live projection.
+      const childRunId =
+        payload.childRunId ??
+        (this.sessionId !== payload.runId ? this.sessionId : undefined);
       this.runDurabilityRepo.beginEffect({
         runId: payload.runId,
         epoch: epoch.epoch,
         stepId: payload.stepId,
-        ...(this.sessionId !== payload.runId
-          ? { childRunId: this.sessionId }
-          : {}),
+        ...(childRunId !== undefined ? { childRunId } : {}),
         sessionId: this.sessionId,
         callId: payload.callId,
         toolName: payload.toolName,
@@ -3442,7 +3451,35 @@ export class RolloutStore {
       throw new Error("live tool-pair projection did not initialize");
     }
     this.liveToolPairProjection = context.projection;
+    this.liveToolPairProjectionId = context.projectionId;
     this.liveToolPairValidator = validator;
+  }
+
+  /**
+   * Why this session's live history can no longer take a response item, once
+   * the live tool-pair validator has closed on a failure; `undefined` while
+   * appends are still accepted. Callers that start turns check this before
+   * opening one, so a client hears the reason instead of watching an empty
+   * turn end.
+   */
+  liveHistoryBlockedReason(): string | undefined {
+    const failure = this.liveToolPairValidator?.terminalFailureOutcome;
+    if (failure === undefined) return undefined;
+    return new ToolPairHistoryBlockedError("live append", failure).message;
+  }
+
+  /**
+   * Whether the live history already holds a result for this tool call. A
+   * durable resume asks before it persists a synthetic result for a dangling
+   * call: the bootstrap replay may already have closed the call, and a second
+   * result for one call id is a duplicate the live validator rejects, which
+   * blocks the session's history for good.
+   */
+  liveToolCallResolved(callId: string): boolean {
+    const projection = this.liveToolPairProjection;
+    const projectionId = this.liveToolPairProjectionId;
+    if (projection === undefined || projectionId === undefined) return false;
+    return projection.find(projectionId, callId)?.resultIndex !== undefined;
   }
 
   private validateLiveResponseItem(message: ToolPairMessage): void {
@@ -3666,6 +3703,16 @@ export class RolloutStore {
   /** @internal Test seam for write-success/fsync-failure recovery. */
   setFsyncImplForTest(impl: (fd: number) => void): void {
     this.store.setFsyncImplForTest(impl);
+  }
+
+  /**
+   * Register (or clear) a listener for successful rollout appends.
+   * `FileThreadStore` uses this to keep `thread_rollout_items` current.
+   */
+  setOnRolloutCommitted(
+    listener: ((rolloutPath: string) => void) | undefined,
+  ): void {
+    this.store.setOnRolloutCommitted(listener);
   }
 
   close(): void {

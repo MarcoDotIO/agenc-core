@@ -51,3 +51,31 @@ audit. Provider-key trust entries in source are public verification keys.
 The checked-in workflows run ordinary push tests only on `main`, PR checks on
 pull requests, and release/npm/installer jobs only on explicit dispatch. This
 feature-branch push creates no PR, tag, merge, package publication, or deployment.
+
+## Pull-request integration
+
+PR #2261 integrates current main `6b6e78e` in a separate worktree while retaining
+publication commit `719f2c527f219b0c31d9522faf751558dc03ce69` as ancestry.
+The dispatcher conflict retains both the remote/routine typed errors and main's
+operation-timeout mapping. Memory extraction retains main's canonical home
+resolver and its injected-no-home regression.
+
+Review found a semantic integration issue: main's refreshed-Grok-OAuth factory
+could override the publication's explicit API-key selection. The integrated
+resolver records that choice in factory options; the factory honors it across
+provider recreation without changing automatic OAuth refresh. Two added tests
+failed before the fix and pass afterward.
+
+- The integration regression run passed **382 tests in 16 files**, covering the
+  dispatcher, agent-create deadlines, background runner, memory extraction,
+  provider credentials/OAuth, remote access, and routines.
+- All three no-emit TypeScript checks and generated SDK consistency passed.
+- Protocol index/schema, routine types, and SDK protocol/routine source bytes
+  remain identical to `719f2c5`.
+- An initial multi-file run encountered a missing native-helper error in one
+  credential fixture. Its isolated rerun and the complete integration rerun
+  passed; no native helper was built or installed. Hosted Linux CI remains the
+  independent gate, not a claimed result of these local checks.
+
+Only the isolated worktree and feature branch are updated. The original worktree
+and running Core remain unchanged; this is not release or deployment evidence.

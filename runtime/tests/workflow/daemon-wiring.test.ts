@@ -14,7 +14,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { createDaemonWorkflowController } from "../../src/app-server/workflow/daemon-wiring.js";
+import {
+  createDaemonWorkflowController,
+  resolveDaemonDefaultReviewerModel,
+} from "../../src/app-server/workflow/daemon-wiring.js";
 import type {
   WorkflowAgentSpawner,
   WorkflowChildOutcome,
@@ -40,6 +43,7 @@ import {
 } from "../../src/state/sqlite-driver.js";
 import type { WorkflowCommandRunner } from "../../src/workflow/verification.js";
 import type { ReviewerInvoker } from "../../src/workflow/independent-review.js";
+import { runWithStartupProviderSelection } from "../../src/utils/model/providers.js";
 import type { WorktreeHandle } from "../../src/agents/worktree.js";
 
 const BASE_COMMIT = "c".repeat(40);
@@ -238,8 +242,12 @@ const commands: WorkflowCommandRunner = {
   }),
 };
 
+const reviewerInvocations: { readonly reviewerModel: string }[] = [];
 const reviewer: ReviewerInvoker = {
-  invoke: async () => APPROVING_REVIEW,
+  invoke: async (input) => {
+    reviewerInvocations.push({ reviewerModel: input.reviewerModel });
+    return APPROVING_REVIEW;
+  },
 };
 
 interface ProjectFixture {
@@ -311,7 +319,7 @@ function makeSeams(): WorkflowSessionSeams & {
   };
 }
 
-function makeWiring() {
+function makeWiring(options: { readonly config?: () => { readonly model?: string } } = {}) {
   const admission = new FakeAdmission();
   const kernel = {
     bindClient: ({ scope }: { scope: { runId: string } }) => {
@@ -327,6 +335,7 @@ function makeWiring() {
     warn: () => {},
     env: {},
     argv: ["node", "agenc"],
+    ...(options.config !== undefined ? { config: options.config } : {}),
     stateDatabasePaths: () => [
       resolveStateDatabasePaths({ cwd: projectA.cwd, agencHome: home }),
       resolveStateDatabasePaths({ cwd: projectB.cwd, agencHome: home }),
@@ -348,6 +357,49 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
   rmSync(projectA.cwd, { recursive: true, force: true });
   rmSync(projectB.cwd, { recursive: true, force: true });
+});
+
+describe("createDaemonWorkflowController — reviewer model", () => {
+  it("pins the daemon's selected model as the reviewer model when the caller names none", async () => {
+    const { wiring } = makeWiring();
+    const before = reviewerInvocations.length;
+    const started = await runWithStartupProviderSelection(
+      { provider: "grok", model: "grok-4.6", environment: { ...process.env } },
+      () =>
+        wiring.controller.start({
+          goal: "fix a bug with the daemon's default model",
+          repoPath: projectB.cwd,
+          requiredVerification: [{ label: "unit", script: "run-tests" }],
+          runId: "wf-default-reviewer",
+        }),
+    );
+    await wiring.controller.awaitRun(started.runId);
+    expect(reviewerInvocations.slice(before).map((entry) => entry.reviewerModel)).toEqual([
+      "grok-4.6",
+    ]);
+    expect(projectB.repo.getCurrentTerminalResult("wf-default-reviewer")).toMatchObject({
+      status: "completed",
+    });
+  });
+
+  it("resolves the reviewer model from the scope first and the configured model second", () => {
+    // The daemon's RPC handlers run outside any session startup scope, which is
+    // where an SDK or script client that names no model arrives (soak F62).
+    const unbound = () => {
+      throw new Error("No provider authority is bound");
+    };
+    expect(resolveDaemonDefaultReviewerModel(() => "grok-4.6", () => "grok-4.6-fast")).toBe(
+      "grok-4.6",
+    );
+    expect(resolveDaemonDefaultReviewerModel(unbound, () => "grok-4.6-fast")).toBe(
+      "grok-4.6-fast",
+    );
+    expect(resolveDaemonDefaultReviewerModel(() => "  ", () => " grok-4.6-fast ")).toBe(
+      "grok-4.6-fast",
+    );
+    expect(resolveDaemonDefaultReviewerModel(unbound, () => undefined)).toBeUndefined();
+    expect(resolveDaemonDefaultReviewerModel(unbound, () => "")).toBeUndefined();
+  });
 });
 
 describe("createDaemonWorkflowController — per-run durability resolution", () => {

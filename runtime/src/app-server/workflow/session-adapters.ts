@@ -62,7 +62,10 @@ import { runSupervisedProcess } from "../../utils/supervisedProcess.js";
 import { applyUnattendedPermissionPolicyToContext } from "../../permissions/unattended-policy.js";
 import type { PermissionModeRegistry } from "../../permissions/permission-mode.js";
 import type { StateRunDurabilityRepository } from "../../state/run-durability.js";
-import type { ReviewerInvoker } from "../../workflow/independent-review.js";
+import {
+  ReviewInvocationError,
+  type ReviewerInvoker,
+} from "../../workflow/independent-review.js";
 import type {
   WorkflowCommandResult,
   WorkflowCommandRunner,
@@ -430,6 +433,9 @@ class SessionWorkflowJournal implements WorkflowRunJournal {
       intentDigest: input.intentDigest,
       attempt: parseWorkflowStepId(input.stepId)?.attempt ?? 1,
       recordedAt: input.intentAt,
+      ...(input.childRunId !== undefined
+        ? { childRunId: input.childRunId }
+        : {}),
     };
     const event = this.#emitDurable(
       { type: "effect_intent", payload },
@@ -974,11 +980,13 @@ export function createWorkflowSessionSeams(
         },
       );
       if (outcome.rawText === null) {
-        throw (
-          outcome.error ??
-          new WorkflowSessionSeamError(
-            `independent review produced no output (${outcome.verdict})`,
-          )
+        // The one-shot settled without a response. Typed so the controller
+        // treats it as a known, retryable failure (soak F76).
+        throw new ReviewInvocationError(
+          outcome.error !== undefined
+            ? errorMessage(outcome.error)
+            : `verdict ${outcome.verdict}`,
+          outcome.error !== undefined ? { cause: outcome.error } : undefined,
         );
       }
       return outcome.rawText;

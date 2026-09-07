@@ -88,6 +88,49 @@ function isMcpShellPlaceholderCommand(command: string): boolean {
   );
 }
 
+/**
+ * The sandbox permission fields a tool takes when it may need a wider sandbox
+ * than the turn's default: exec_command for the command it starts, write_stdin
+ * for a session exec_command started that way. The orchestrator reads them
+ * from any tool's arguments.
+ */
+export const SANDBOX_PERMISSION_INPUT_PROPERTIES = {
+  sandbox_permissions: {
+    // Only the three documented modes. The former `{type:"object"}`
+    // alternative invited a shape no parser accepted, so a model could
+    // send an escalation request that was discarded without a word.
+    type: "string",
+    enum: ["default", "require_escalated", "with_additional_permissions"],
+    description:
+      "Sandbox escalation mode. Scoped permissions go in additional_permissions.",
+  },
+  additional_permissions: {
+    type: "object",
+    properties: {
+      network: {
+        type: "object",
+        properties: { enabled: { type: "boolean" } },
+        additionalProperties: false,
+      },
+      file_system: {
+        type: "object",
+        properties: {
+          read: { type: "array", items: { type: "string" } },
+          write: { type: "array", items: { type: "string" } },
+        },
+        additionalProperties: false,
+      },
+    },
+    additionalProperties: false,
+    description:
+      'Scoped permissions to request alongside sandbox_permissions "with_additional_permissions".',
+  },
+  justification: {
+    type: "string",
+    description: "Why elevated execution is needed, when applicable.",
+  },
+} as const;
+
 export function runtimeSandboxForExec(
   args: Record<string, unknown>,
   fallbackCwd: string,
@@ -283,7 +326,7 @@ function errorResult(error: unknown): ToolResult {
   };
 }
 
-function confirmedNoEffectDisposition(
+export function confirmedNoEffectDisposition(
   evidenceRef: string,
   evidenceMaterial: string,
 ) {
@@ -320,6 +363,11 @@ function processObservationDisposition(
     }),
   });
 }
+
+const REMOVED_ALIAS_HINTS = {
+  command: "the command line goes in `cmd`",
+  cwd: "the working directory goes in `workdir`",
+} as const;
 
 export function createExecCommandTool(config?: ExecCommandToolConfig): Tool {
   const manager =
@@ -403,44 +451,7 @@ export function createExecCommandTool(config?: ExecCommandToolConfig): Tool {
           description:
             "Shell executable to run the command through. Defaults to the user's shell.",
         },
-        sandbox_permissions: {
-          // Only the three documented modes. The former `{type:"object"}`
-          // alternative invited a shape no parser accepted, so a model could
-          // send an escalation request that was discarded without a word.
-          type: "string",
-          enum: [
-            "default",
-            "require_escalated",
-            "with_additional_permissions",
-          ],
-          description:
-            "Sandbox escalation mode. Scoped permissions go in additional_permissions.",
-        },
-        additional_permissions: {
-          type: "object",
-          properties: {
-            network: {
-              type: "object",
-              properties: { enabled: { type: "boolean" } },
-              additionalProperties: false,
-            },
-            file_system: {
-              type: "object",
-              properties: {
-                read: { type: "array", items: { type: "string" } },
-                write: { type: "array", items: { type: "string" } },
-              },
-              additionalProperties: false,
-            },
-          },
-          additionalProperties: false,
-          description:
-            "Scoped permissions to request alongside sandbox_permissions \"with_additional_permissions\".",
-        },
-        justification: {
-          type: "string",
-          description: "Why elevated execution is needed, when applicable.",
-        },
+        ...SANDBOX_PERMISSION_INPUT_PROPERTIES,
         prefix_rule: {
           type: "array",
           items: { type: "string" },
@@ -454,7 +465,12 @@ export function createExecCommandTool(config?: ExecCommandToolConfig): Tool {
       const args = rawArgs as Record<string, unknown> & ToolExecutionInjectedArgs;
       for (const removedAlias of ["command", "cwd"] as const) {
         if (Object.prototype.hasOwnProperty.call(args, removedAlias)) {
-          const message = `unknown field \`${removedAlias}\``;
+          // Name the field that replaced the alias: a bare "unknown field"
+          // gave the model nothing to correct, and a goal run's implement
+          // child repeated the same `cwd` call 44 times until the backstop
+          // ended the turn.
+          const message =
+            `unknown field \`${removedAlias}\`; ${REMOVED_ALIAS_HINTS[removedAlias]}`;
           return {
             content: safeStringify({ error: message }),
             isError: true,

@@ -4993,6 +4993,68 @@ describe("runTurn — D1 isRetryableStreamError type-based discrimination", () =
     vi.restoreAllMocks();
   });
 
+  test("spaced transient drops do not exhaust the recovery cap once samples complete in between", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+
+    // Six drops, each followed by a sample that completes with a tool call,
+    // then a final answer. The cap is MAX_RECOVERY_REENTRIES = 5 consecutive
+    // re-entries; progress in between must bring the count back down.
+    let attempts = 0;
+    const provider: LLMProvider = {
+      ...mkProvider({}),
+      chatStream: async (): Promise<LLMResponse> => {
+        attempts += 1;
+        if (attempts % 2 === 1 && attempts <= 11) {
+          throw Object.assign(new Error("socket hang up"), {
+            code: "ECONNRESET",
+            statusCode: 502,
+          });
+        }
+        if (attempts < 12) {
+          return {
+            content: "",
+            toolCalls: [{ id: `tool_${attempts}`, name: "queue_tool", arguments: "{}" }],
+            usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+            model: "test-model",
+            finishReason: "tool_calls",
+          };
+        }
+        return {
+          content: "final",
+          toolCalls: [],
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+          model: "test-model",
+          finishReason: "stop",
+        };
+      },
+    };
+    const { session, events } = mkSession({
+      provider,
+      registry: mkStaticToolRegistry(),
+    });
+
+    await drain(session.runTurn("hello", { ctx: mkCtx() }));
+
+    expect(attempts).toBe(12);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        msg: {
+          type: "turn_complete",
+          payload: expect.objectContaining({ lastAgentMessage: "final" }),
+        },
+      }),
+    );
+    expect(
+      events.some(
+        (event) =>
+          event.msg.type === "error" &&
+          String((event.msg.payload as { message?: string }).message ?? "").includes(
+            "recovery ladder exceeded",
+          ),
+      ),
+    ).toBe(false);
+  });
+
   test("LP-07 retries a mid-stream network drop and emits a stream_error notice", async () => {
     vi.spyOn(Math, "random").mockReturnValue(0.5);
 
@@ -5707,6 +5769,8 @@ describe("runTurn — D1 isRetryableStreamError type-based discrimination", () =
       const { session, events, getState } = mkSession({
         provider,
         registry,
+        // Terminal exhaustion is this test's subject; no provider-outage wait.
+        configStoreBase: { provider_outage_wait_ms: 0 },
         permissionModeRegistry: new PermissionModeRegistry(
           createEmptyToolPermissionContext({
             mode: "bypassPermissions",
@@ -7824,7 +7888,16 @@ describe("runTurn — runAutoCompact dispatcher", () => {
 });
 
 describe("runTurn — GOAL #4b Stage 1 durable resume continuation", () => {
-  test("THE HEADLINE SAFETY TEST: a side-effecting dangling tool_use is NOT re-dispatched on resume (no double side effect)", async () => {
+  /**
+   * A resumed turn whose checkpoint prefix ends in one dangling side-effecting
+   * `settle` call. The provider answers without new tool calls, so the resume
+   * completes once the dangling call is paired. `resolvedCallIds` is what the
+   * rollout store reports as already holding a result.
+   */
+  async function resumeWithDanglingSettle(opts: {
+    readonly turnId: string;
+    readonly resolvedCallIds?: ReadonlyArray<string>;
+  }) {
     const executeSpy = vi.fn(async () => ({
       content: "SIDE EFFECT FIRED",
       isError: false,
@@ -7846,8 +7919,6 @@ describe("runTurn — GOAL #4b Stage 1 durable resume continuation", () => {
       toLLMTools: () => [],
       dispatch: dispatchSpy,
     } as unknown as ToolRegistry;
-    // Provider returns a terminal answer so the resumed turn completes
-    // without issuing any new tool calls.
     const { session, events } = mkSession({
       provider: mkProvider({
         content: "acknowledged, not retrying",
@@ -7855,15 +7926,15 @@ describe("runTurn — GOAL #4b Stage 1 durable resume continuation", () => {
       }),
       registry,
     });
+    const appendRollout = vi.fn();
+    const resolved = new Set(opts.resolvedCallIds ?? []);
     session.rolloutStore = {
       assertCompactionProjectionReady: () => {},
       append: vi.fn(),
-      appendRollout: vi.fn(),
+      appendRollout,
+      liveToolCallResolved: (callId: string) => resolved.has(callId),
       rolloutPath: "/tmp/does-not-matter.jsonl",
     } as unknown as Session["rolloutStore"];
-
-    // Resume prefix: an assistant message with a DANGLING side-effecting
-    // tool_use (no recorded result).
     const history: LLMMessage[] = [
       { role: "user", content: "settle the task" },
       {
@@ -7872,14 +7943,13 @@ describe("runTurn — GOAL #4b Stage 1 durable resume continuation", () => {
         toolCalls: [{ id: "settle-1", name: "settle", arguments: "{}" }],
       },
     ];
-
     await drain(
       session.runTurn("", {
-        subId: "turn-resumed-1",
+        subId: opts.turnId,
         history,
         displayUserMessage: null,
         resume: {
-          turnId: "turn-resumed-1",
+          turnId: opts.turnId,
           fromIteration: 1,
           fromCheckpointSeq: 1,
           persistedMessageCount: history.length,
@@ -7897,6 +7967,17 @@ describe("runTurn — GOAL #4b Stage 1 durable resume continuation", () => {
         },
       }),
     );
+    const persistedSettleResults = appendRollout.mock.calls.filter(
+      ([item]: [{ type: string; payload?: { toolCallId?: string } }]) =>
+        item.type === "response_item" && item.payload?.toolCallId === "settle-1",
+    );
+    return { executeSpy, dispatchSpy, events, persistedSettleResults };
+  }
+
+  test("THE HEADLINE SAFETY TEST: a side-effecting dangling tool_use is NOT re-dispatched on resume (no double side effect)", async () => {
+    const { executeSpy, dispatchSpy, events } = await resumeWithDanglingSettle({
+      turnId: "turn-resumed-1",
+    });
 
     // The on-chain-safety property: the side-effecting tool is NEVER
     // re-dispatched on resume.
@@ -7917,6 +7998,25 @@ describe("runTurn — GOAL #4b Stage 1 durable resume continuation", () => {
     // The turn re-opened durably.
     expect(events.some((e) => e.msg.type === "turn_resumed")).toBe(true);
     expect(events.some((e) => e.msg.type === "turn_complete")).toBe(true);
+  });
+
+  test("a dangling call the bootstrap replay already closed is paired for the model but not persisted a second time", async () => {
+    const { events, persistedSettleResults } = await resumeWithDanglingSettle({
+      turnId: "turn-resumed-closed",
+      resolvedCallIds: ["settle-1"],
+    });
+
+    expect(events.some((e) => e.msg.type === "turn_complete")).toBe(true);
+    // The rollout already holds the replay's result: no second one reaches it.
+    expect(persistedSettleResults).toHaveLength(0);
+  });
+
+  test("a dangling call nobody has resolved yet gets its synthetic result persisted", async () => {
+    const { persistedSettleResults } = await resumeWithDanglingSettle({
+      turnId: "turn-resumed-open",
+    });
+
+    expect(persistedSettleResults).toHaveLength(1);
   });
 
   test("crash mid-drain → resume CONTINUES (restored counters hold pre-crash values, not reset)", async () => {
@@ -8091,6 +8191,7 @@ describe("runTurn — GOAL #4b Stage 1 durable resume continuation", () => {
       assertCompactionProjectionReady: () => {},
       append: vi.fn(),
       appendRollout: vi.fn(),
+      liveToolCallResolved: () => false,
       rolloutPath: "/tmp/does-not-matter.jsonl",
     } as unknown as Session["rolloutStore"];
 
@@ -8137,5 +8238,104 @@ describe("runTurn — GOAL #4b Stage 1 durable resume continuation", () => {
       ),
     ).toBe(false);
     expect(events.some((e) => e.msg.type === "turn_complete")).toBe(true);
+  });
+});
+
+describe("provider outage wait (#2212)", () => {
+  function connectionError(): Error {
+    return Object.assign(new Error("Connection error."), { code: "ECONNRESET" });
+  }
+
+  /** Spend the fast ladder at once so each slow retry is one provider call. */
+  async function spentLadder(): Promise<() => void> {
+    const recovery = await import("../recovery/fallback-ladder.js");
+    const reserveRecoveryReentry = recovery.reserveRecoveryReentry;
+    const spy = vi
+      .spyOn(recovery, "reserveRecoveryReentry")
+      .mockImplementation(async (session, state, opts) => {
+        state.recoveryReentryCount = recovery.MAX_RECOVERY_REENTRIES;
+        return reserveRecoveryReentry(session, state, opts);
+      });
+    return () => spy.mockRestore();
+  }
+
+  function failingThenSucceeding(failures: number): { provider: LLMProvider; attempts: () => number } {
+    let attempts = 0;
+    const provider: LLMProvider = {
+      ...mkProvider({}),
+      chatStream: async (
+        _messages: LLMMessage[],
+        onChunk: StreamProgressCallback,
+      ): Promise<LLMResponse> => {
+        attempts += 1;
+        if (attempts <= failures) throw connectionError();
+        onChunk({ content: "resumed", done: false });
+        return {
+          content: "resumed",
+          toolCalls: [],
+          usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 },
+          model: "test-model",
+          finishReason: "stop",
+        };
+      },
+    };
+    return { provider, attempts: () => attempts };
+  }
+
+  test("waits out a provider outage with a slow backoff and finishes the turn", async () => {
+    const restore = await spentLadder();
+    try {
+      const { provider, attempts } = failingThenSucceeding(2);
+      const { session, events } = mkSession({
+        provider,
+        registry: mkRegistry(),
+        configStoreBase: {
+          provider_outage_wait_ms: 60_000,
+          provider_outage_retry_ms: 1,
+        },
+      });
+      await drain(session.runTurn("hello", { ctx: mkCtx() }));
+      expect(attempts()).toBe(3);
+      const waits = events.filter(
+        (event) =>
+          event.msg.type === "warning" &&
+          (event.msg.payload as { cause?: string }).cause === "provider_outage_wait",
+      );
+      expect(waits).toHaveLength(2);
+      expect(String((waits[0]!.msg.payload as { message: string }).message)).toContain("retry 1 in 0 s");
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          msg: expect.objectContaining({ type: "agent_message", payload: expect.objectContaining({ message: "resumed" }) }),
+        }),
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  test("ends the turn when the first slow retry would exceed the operator's patience", async () => {
+    const restore = await spentLadder();
+    try {
+      const { provider, attempts } = failingThenSucceeding(5);
+      const { session, events } = mkSession({
+        provider,
+        registry: mkRegistry(),
+        configStoreBase: {
+          provider_outage_wait_ms: 1,
+          provider_outage_retry_ms: 1_000,
+        },
+      });
+      await drain(session.runTurn("hello", { ctx: mkCtx() }));
+      expect(attempts()).toBe(1);
+      expect(
+        events.some(
+          (event) =>
+            event.msg.type === "warning" &&
+            (event.msg.payload as { cause?: string }).cause === "provider_outage_wait",
+        ),
+      ).toBe(false);
+    } finally {
+      restore();
+    }
   });
 });

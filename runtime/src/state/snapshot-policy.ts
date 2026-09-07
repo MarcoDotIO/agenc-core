@@ -7,9 +7,13 @@ import {
   pruneSessionSnapshotsForSession,
   type AgentRunRetentionPolicy,
   type AgentSnapshotPruningReport,
+  type RolloutPruningReport,
   type RolloutRetentionPolicy,
 } from "./pruning.js";
-import type { StateSqliteDriver } from "./sqlite-driver.js";
+import type {
+  StateFreePageReclaim,
+  StateSqliteDriver,
+} from "./sqlite-driver.js";
 import {
   normalizeToolRecoveryCategory,
   recordInFlightToolCallCompletion,
@@ -65,6 +69,16 @@ export interface SnapshotPolicyOptions {
   // Aggregated snapshot-retention report, delivered from the periodic tick
   // (and close) whenever rows were pruned since the previous report.
   readonly onPruneReport?: (report: AgentSnapshotPruningReport) => void;
+  /** Called after a periodic tick returned free pages of the state database to the file system. */
+  readonly onReclaimReport?: (report: StateFreePageReclaim) => void;
+  /**
+   * Called after a retention sweep permanently deleted session directories.
+   * The sweep is irreversible and runs unattended on the periodic timer, so a
+   * deployment that never set `rollout_days` is opted in by upgrading: what it
+   * removed has to be recoverable from the log, not only from the disk that no
+   * longer holds it.
+   */
+  readonly onRolloutPruneReport?: (report: RolloutPruningReport) => void;
   readonly snapshotRetention?: AgentRunRetentionPolicy;
   // Rollout/session disk-retention sweep config. Disabled unless
   // `rolloutRetention.retention_days` is set AND `rolloutSessionsDir` resolves;
@@ -192,6 +206,10 @@ export class AgenCSessionSnapshotPolicy {
   readonly #clearTimeout: (timer: SnapshotPolicyTimer) => void;
   readonly #onError: (error: unknown) => void;
   readonly #onPruneReport: ((report: AgentSnapshotPruningReport) => void) | undefined;
+  readonly #onReclaimReport: ((report: StateFreePageReclaim) => void) | undefined;
+  readonly #onRolloutPruneReport:
+    | ((report: RolloutPruningReport) => void)
+    | undefined;
   #prunedSinceReport = 0;
   readonly #prunedSessionsSinceReport = new Set<string>();
   #snapshotRetention: AgentRunRetentionPolicy | undefined;
@@ -254,6 +272,8 @@ export class AgenCSessionSnapshotPolicy {
       ((timer) => clearTimeout(timer as ReturnType<typeof setTimeout>));
     this.#onError = options.onError ?? (() => {});
     this.#onPruneReport = options.onPruneReport;
+    this.#onReclaimReport = options.onReclaimReport;
+    this.#onRolloutPruneReport = options.onRolloutPruneReport;
     this.#snapshotRetention = options.snapshotRetention;
     this.#rolloutRetention = options.rolloutRetention;
     this.#rolloutSessionsDir = options.rolloutSessionsDir;
@@ -366,7 +386,7 @@ export class AgenCSessionSnapshotPolicy {
       return;
     }
     try {
-      pruneRolloutSessions(this.#driver, {
+      const report = pruneRolloutSessions(this.#driver, {
         sessionsDir: this.#rolloutSessionsDir,
         retention_days: retentionDays,
         ...(this.#activeSessionId !== undefined
@@ -375,6 +395,8 @@ export class AgenCSessionSnapshotPolicy {
         now: this.#now,
         onError: this.#onError,
       });
+      // Silence is only honest when nothing was destroyed.
+      if (report.prunedSessions > 0) this.#onRolloutPruneReport?.(report);
     } catch (error) {
       this.#onError(error);
     }
@@ -632,8 +654,19 @@ export class AgenCSessionSnapshotPolicy {
     // Piggy-back the disk-retention sweep on the same throttled tick so
     // rollout/session pruning runs on a bounded timer, not a tight loop.
     this.sweepRolloutRetention();
+    this.#reclaimFreePages();
     this.#reportPruning();
     return records;
+  }
+
+  /** Bounded, incremental only: a full vacuum belongs to daemon start. */
+  #reclaimFreePages(): void {
+    try {
+      const report = this.#driver.reclaimFreePages();
+      if (report.mode !== "none") this.#onReclaimReport?.(report);
+    } catch (error) {
+      this.#onError(error);
+    }
   }
 
   loadLatest(sessionId: string): SnapshotPolicySnapshotRecord | undefined {

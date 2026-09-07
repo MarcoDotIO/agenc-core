@@ -1591,6 +1591,11 @@ function requestParentFollowupTurn(params: {
   readonly parent: Session;
 }): void {
   const parent = params.parent;
+  // The user stopped this session's last turn and has not spoken since: hold
+  // the receipt in the mailbox for the next user turn instead of starting a
+  // turn of our own, which would resume the very work the user stopped
+  // (#2236: an interrupted verifier's receipt restarted an 18-minute turn).
+  if (parent.stoppedByUserSinceLastPrompt === true) return;
   // Coalesce bursts of subagent completions into ONE parent turn. Each
   // completion notifies the parent's mailbox and then requests a follow-up
   // turn; without coalescing, N near-simultaneous completions queue N
@@ -1620,6 +1625,11 @@ function requestParentFollowupTurn(params: {
   const schedule = (delayMs = PARENT_FOLLOWUP_COALESCE_MS): void => {
     state.timer = setTimeout(() => {
       state.timer = null;
+      // A stop that landed inside the coalescing window holds the burst too.
+      if (parent.stoppedByUserSinceLastPrompt === true) {
+        followupTurnStateByParent.delete(parent);
+        return;
+      }
       state.submitInFlight = true;
       let transientSubmitFailure = false;
       void parent
@@ -2544,7 +2554,7 @@ function stripModelSuppliedChildArgs(
   return out;
 }
 
-function injectChildToolArgs(
+export function injectChildToolArgs(
   parsedArgs: Record<string, unknown>,
   toolName: string,
   opts: {
@@ -2571,17 +2581,29 @@ function injectChildToolArgs(
   if (opts.worktree?.path) {
     injectedArgs = withSignedAllowedRoots(injectedArgs, [opts.worktree.path]);
   }
-  if (
-    opts.worktree?.path &&
-    (toolName === "system.bash" ||
-      toolName === "exec_command" ||
-      toolName === "apply_patch") &&
-    (typeof injectedArgs.cwd !== "string" || injectedArgs.cwd.length === 0)
-  ) {
-    injectedArgs.cwd = opts.worktree.path;
+  if (opts.worktree?.path) {
+    // Each tool names its working-directory field differently. exec_command
+    // takes `workdir` and rejects `cwd` as a removed alias, so injecting
+    // `cwd` there made every exec_command in a worktree child fail with a
+    // message that blamed the model for a field it never sent.
+    const field = WORKTREE_CWD_FIELD_BY_TOOL[toolName];
+    if (
+      field !== undefined &&
+      (typeof injectedArgs[field] !== "string" ||
+        (injectedArgs[field] as string).length === 0)
+    ) {
+      injectedArgs[field] = opts.worktree.path;
+    }
   }
   return injectedArgs;
 }
+
+/** Tools pinned to the child's worktree, and the argument that carries it. */
+export const WORKTREE_CWD_FIELD_BY_TOOL: Readonly<Record<string, string>> = {
+  "system.bash": "cwd",
+  exec_command: "workdir",
+  apply_patch: "cwd",
+};
 
 async function applyChildToolPolicy(
   tool: Pick<Tool, "name">,

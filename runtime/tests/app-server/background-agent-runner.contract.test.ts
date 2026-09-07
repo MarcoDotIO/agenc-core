@@ -578,6 +578,7 @@ function makeTopLevelRunner(opts: {
   const rolloutStore = {
     rolloutPath: `/tmp/${opts.conversationId}.jsonl`,
     readAll: () => [...rolloutItems],
+    liveHistoryBlockedReason: vi.fn((): string | undefined => undefined),
     assertRunSuspendable: vi.fn(() => {}),
     recordRunSuspensionEvent: vi.fn(() => {}),
     recordRunStartupActivationEvent: vi.fn(() => {}),
@@ -806,6 +807,8 @@ function makeTopLevelRunner(opts: {
       unsafePeek: () => sessionState,
     },
     abortAllTasks: vi.fn(async () => {}),
+    markStoppedByUser: vi.fn(),
+    clearUserStop: vi.fn(),
     trackDurableOperation: <T>(operation: Promise<T>): Promise<T> => {
       durableOperations.add(operation);
       void operation.then(
@@ -2313,6 +2316,81 @@ describe("AgenC delegate background-agent runner", () => {
     expect(runtimeEnvironment).not.toHaveProperty("AGENC_CREDENTIAL_DOCS_MCP");
   });
 
+  it.each([30_000, 50])("bounds a hung stop at %i ms, aborts execution, and retires the generation", async (timeoutMs) => {
+    const release = Promise.withResolvers<void>();
+    const h = makeTopLevelRunner({
+      conversationId: "session-stop-deadline",
+      additionalRunnerOptions: { agentStopTimeoutMs: timeoutMs },
+      bootstrapShutdown: vi.fn(() => release.promise),
+    });
+    const abortController = new AbortController();
+    const beginShutdown = vi.fn();
+    Object.assign(h.session, {
+      abortController, beginShutdown,
+      abortAllTasks: vi.fn(() => release.promise),
+    });
+    await h.runner.startAgent({
+      objective: "bounded stop", initialContent: [],
+      unattendedAllow: [], unattendedDeny: [],
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let settled = false;
+    const stopping = h.runner.stopAgent("session-stop-deadline").catch((error: unknown) => {
+      settled = true;
+      return error;
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(timeoutMs);
+      expect(abortController.signal.aborted).toBe(true);
+      expect(beginShutdown).toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(settled).toBe(true);
+      expect(await stopping).toMatchObject({
+        name: "DaemonOperationTimeoutError", code: "DAEMON_OPERATION_TIMEOUT",
+      });
+      expect(await h.runner.getAgentSnapshot("session-stop-deadline")).toBeNull();
+    } finally {
+      release.resolve();
+      await stopping;
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds restore waiting for a previous generation without starting another bootstrap", async () => {
+    const release = Promise.withResolvers<void>();
+    const h = makeTopLevelRunner({
+      conversationId: "session-restore-deadline",
+      bootstrapShutdown: vi.fn(() => release.promise),
+    });
+    Object.assign(h.session, {
+      abortController: new AbortController(),
+      abortAllTasks: vi.fn(() => release.promise),
+    });
+    await h.runner.startAgent({
+      objective: "bounded restore", initialContent: [],
+      unattendedAllow: [], unattendedDeny: [],
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    h.stub.pushStatus({ status: "completed", turnId: "old-turn", endedAtMs: 2, lastMessage: "done" });
+    await vi.advanceTimersByTimeAsync(0);
+    let settled = false;
+    const restoring = h.runner.restoreAgent({
+      agentId: "session-restore-deadline", objective: "bounded restore",
+      reopenTerminalRun: true,
+    }).catch((error: unknown) => { settled = true; return error; });
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(settled).toBe(true);
+      expect(await restoring).toMatchObject({ name: "DaemonOperationTimeoutError" });
+      expect(h.bootstrap).toHaveBeenCalledOnce();
+    } finally {
+      release.resolve();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await restoring;
+      vi.useRealTimers();
+    }
+  });
+
   it("waits for the exact terminal generation cleanup before explicit restore", async () => {
     let releaseShutdown!: () => void;
     const shutdownBlocked = new Promise<void>((resolve) => {
@@ -2363,6 +2441,36 @@ describe("AgenC delegate background-agent runner", () => {
     await expect(
       runner.getAgentSnapshot("session-generation-race"),
     ).resolves.not.toBeNull();
+  });
+
+  it("reports a cold-restored agent idle until a turn starts", async () => {
+    // A hydrated thread reports pending_init, which maps to "running"; with
+    // nothing to resume the restored agent must read idle until its next
+    // prompt, not sit in every agent list as a working agent.
+    const harness = makeTopLevelRunner({
+      conversationId: "session-restored-idle",
+      threadInitialStatus: { status: "pending_init" },
+    });
+    await expect(
+      harness.runner.restoreAgent({
+        agentId: "session-restored-idle",
+        objective: "retained objective",
+        explicitColdResume: true,
+        initialMessages: [{ role: "user" as const, content: "retained" }],
+      }),
+    ).resolves.toBe(true);
+    const restored = await harness.runner.getAgentSnapshot("session-restored-idle");
+    expect(restored?.status).toBe("idle");
+
+    harness.stub.pushStatus({
+      status: "running",
+      turnId: "turn-after-restart",
+      startedAtMs: 3,
+    });
+    await vi.waitFor(async () => {
+      const snapshot = await harness.runner.getAgentSnapshot("session-restored-idle");
+      expect(snapshot?.status).toBe("running");
+    });
   });
 
   it("retires a failed restore generation so an exact retry can proceed", async () => {
@@ -8799,6 +8907,34 @@ describe("AgenC delegate background-agent runner", () => {
     expect(control.sendInput).toHaveBeenCalledOnce();
   });
 
+  it("refuses a message once the session's live history is blocked", async () => {
+    const { runner, rolloutStore } = makeTopLevelRunner({
+      conversationId: "session-history-blocked",
+    });
+    await runner.startAgent({
+      objective: "history closes after this",
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    const reason =
+      'tool-pair history rejected during live append: tool result repeats "call-22" (44 UTF-8 bytes)';
+    rolloutStore.liveHistoryBlockedReason.mockReturnValue(reason);
+
+    await expect(
+      runner.submitAgentMessage("session-history-blocked", {
+        sessionId: "session_1",
+        content: "another prompt",
+        originalContent: "another prompt",
+        messageId: "blocked-message",
+        streamId: "blocked-message",
+        acceptedAt: "2026-08-17T00:00:00.000Z",
+      }),
+    ).rejects.toMatchObject({
+      code: "SESSION_HISTORY_BLOCKED",
+      message: expect.stringContaining(reason),
+    });
+  });
+
   it("[managed-thread] rejects opt-in admission during the initial turn without changing legacy FIFO", async () => {
     const initialSubmissionStarted = Promise.withResolvers<void>();
     const releaseInitialSubmission = Promise.withResolvers<void>();
@@ -9768,6 +9904,8 @@ describe("AgenC delegate background-agent runner", () => {
 
     expect(interrupted).toBe(true);
     expect(session.abortAllTasks).toHaveBeenCalledWith("interrupted");
+    // #2236: the stop is latched so child receipts do not restart the turn.
+    expect(session.markStoppedByUser).toHaveBeenCalledTimes(1);
     expect(stub.thread.submit).toHaveBeenCalledWith({
       type: "interrupt",
       reason: "user_cancel",

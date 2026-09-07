@@ -79,6 +79,7 @@ import {
 } from "../../workflow/evidence-record.js";
 import {
   extractBlockers,
+  ReviewInvocationError,
   ReviewParseError,
   runIndependentReview,
   type ReviewerInvoker,
@@ -328,6 +329,14 @@ export interface VerifiedChangeWorkflowControllerDeps {
   readonly commands: WorkflowCommandRunner;
   readonly spawner: WorkflowAgentSpawner;
   readonly reviewer: ReviewerInvoker;
+  /**
+   * The model the daemon would give a new session, used as the reviewer model
+   * when the caller pins neither `reviewerModel` nor `model`. Without it the
+   * spec froze a placeholder that reached the provider as a model id (desktop
+   * soak, 2026-09-06: a 404 on `default-reviewer` ended a goal in
+   * `unknown_outcome` after every other stage had committed).
+   */
+  readonly defaultReviewerModel?: () => string | undefined;
   readonly evidenceLedger: (spec: WorkflowSpec) => Promise<WorkflowEvidenceLedger>;
   readonly warn: (message: string) => void;
   readonly now?: () => Date;
@@ -366,6 +375,15 @@ export interface WorkflowStartResult {
 }
 
 /** Intake failed before the pipeline began; the terminal result is durable. */
+/** The journaled failure message of a non-committed effect, as a suffix, or "". */
+function describeEffectFailure(result: unknown): string {
+  if (typeof result !== "object" || result === null) return "";
+  const failure = (result as { readonly failure?: unknown }).failure;
+  if (typeof failure !== "object" || failure === null) return "";
+  const message = (failure as { readonly message?: unknown }).message;
+  return typeof message === "string" && message.length > 0 ? `: ${message}` : "";
+}
+
 export class WorkflowIntakeError extends Error {
   constructor(
     readonly runId: string,
@@ -379,6 +397,22 @@ export class WorkflowIntakeError extends Error {
 
 const DEFAULT_MAX_IMPLEMENT_ATTEMPTS = 2;
 const DEFAULT_PERMISSION_MODE: WorkflowSpec["permissionMode"] = "acceptEdits";
+
+/**
+ * The permission mode a workflow's children run under. A run's children are
+ * headless sessions in the run's worktree: in `default` mode nothing can
+ * approve them, so every edit, write and command is refused and the implement
+ * step dies on the repeat-failure backstop (desktop soak F63, ten minutes and
+ * three dollars for nothing). `default` and an unset mode both become the
+ * workflow's own default; the other modes pass through.
+ */
+export function resolveWorkflowPermissionMode(
+  requested: WorkflowSpec["permissionMode"] | undefined,
+): WorkflowSpec["permissionMode"] {
+  return requested === undefined || requested === "default"
+    ? DEFAULT_PERMISSION_MODE
+    : requested;
+}
 /** Bounded per-stage retry budget for stage-level (non-verdict) failures. */
 const MAX_STAGE_ATTEMPTS = 2;
 const ZERO_ESTIMATE = {
@@ -393,6 +427,17 @@ const EVIDENCE_MESSAGE_LIMIT = 20_000;
 // ---------------------------------------------------------------------------
 // Internal control flow
 // ---------------------------------------------------------------------------
+
+/** Outcome of closing a run that no live pipeline is driving (see cancelDetached). */
+export type WorkflowDetachedCancelOutcome =
+  | "live"
+  | "not_a_workflow"
+  | "already_terminal"
+  | "cancelled"
+  | "not_recorded";
+
+/** Event id prefix for terminals recorded without a session journal. */
+const WORKFLOW_DETACHED_TERMINAL_EVENT_PREFIX = "workflow-detached-terminal:";
 
 interface WorkflowTerminalIntent {
   readonly status: RunTerminalStatus;
@@ -487,6 +532,14 @@ interface RunContext {
     readonly testResult: RunArtifactPointer;
   };
   verifyVerdict?: string;
+  /**
+   * The verification agent's final message from the latest verify attempt,
+   * read back from the committed child evidence so a resumed run carries it
+   * too. Soak F73: without it the re-implement prompt said only
+   * `Agent verdict: FAIL` and the implementer changed nothing, while the
+   * second verifier re-derived the same defects from scratch.
+   */
+  verifyReport?: string;
   review?: VerifiedChangeReviewRecord;
   reviewNonBlocking?: readonly string[];
   export?: ExportedPatchArtifacts;
@@ -538,11 +591,16 @@ export class VerifiedChangeWorkflowController {
       );
     }
     const runId = params.runId ?? this.#newRunId();
+    if (params.permissionMode === "default") {
+      this.#deps.warn(
+        `workflow ${runId} was started in default permission mode, which has no approver for its headless children; running it with ${DEFAULT_PERMISSION_MODE}`,
+      );
+    }
     const repo = this.#deps.durability({ runId, repoPath: params.repoPath });
     const journal = await this.#deps.journal.open(runId, {
       repoPath: params.repoPath,
       policy: {
-        permissionMode: params.permissionMode ?? DEFAULT_PERMISSION_MODE,
+        permissionMode: resolveWorkflowPermissionMode(params.permissionMode),
         ...(params.unattendedAllow !== undefined
           ? { unattendedAllow: params.unattendedAllow }
           : {}),
@@ -559,7 +617,12 @@ export class VerifiedChangeWorkflowController {
     const base = await this.#deps.worktrees.captureBaseState(params.repoPath, {
       runId,
     });
-    const spec = freezeWorkflowSpec(runId, params, base);
+    const spec = freezeWorkflowSpec(
+      runId,
+      params,
+      base,
+      this.#deps.defaultReviewerModel?.(),
+    );
     const specDigest = computeSpecDigest(spec);
     const admission = this.#deps.admission({
       runId,
@@ -646,12 +709,88 @@ export class VerifiedChangeWorkflowController {
         if (started) resumed.push(runId);
       } catch (error) {
         if (error instanceof M5WorkflowFailpointError) throw error;
-        this.#deps.warn(
-          `workflow resume failed for ${runId}: ${errorMessage(error)}`,
+        const message = errorMessage(error);
+        this.#deps.warn(`workflow resume failed for ${runId}: ${message}`);
+        // Nothing is driving this run any more and, when the journal itself
+        // failed to open, nothing can journal through its session. Left as
+        // it is, the run reads "running" forever and run.cancel cannot reach
+        // it (a goal that survived a daemon restart used to do exactly
+        // that). Close it durably as failed instead.
+        this.#recordDetachedTerminal(
+          repo,
+          runId,
+          "failed",
+          `workflow resume failed after a daemon restart: ${message}. Any worktree the run created is left in place for review; re-submit the request to continue the work.`,
         );
       }
     }
     return resumed;
+  }
+
+  /**
+   * `run.cancel` reaches a live pipeline through the admission cascade, which
+   * the pipeline observes and terminalizes as cancelled. A run with no live
+   * pipeline in this process (its resume failed, or the process that ran it
+   * is gone) has nothing observing that cascade: the agents-rail row turns
+   * cancelled while the workflow projection stays "running". Close the
+   * projection directly so status and cancel agree.
+   */
+  cancelDetached(runId: string, reason: string): WorkflowDetachedCancelOutcome {
+    if (this.#active.has(runId)) return "live";
+    const repo = this.#deps.durability({ runId });
+    if (repo.getEffect(runId, "workflow.intake") === undefined) {
+      return "not_a_workflow";
+    }
+    if (repo.getCurrentTerminalResult(runId) !== undefined) {
+      return "already_terminal";
+    }
+    return this.#recordDetachedTerminal(
+      repo,
+      runId,
+      "cancelled",
+      `cancelled by run.cancel (${reason}); the run had no live pipeline`,
+    )
+      ? "cancelled"
+      : "not_recorded";
+  }
+
+  /**
+   * Durable-only terminal for a run without a live writer, the same offline
+   * authority run.cancel and child terminals already use. Never throws: a
+   * failure here is logged and the caller reports it, because the run is
+   * already beyond any journal this process can open.
+   */
+  #recordDetachedTerminal(
+    repo: StateRunDurabilityRepository,
+    runId: string,
+    status: "failed" | "cancelled",
+    finalMessage: string,
+  ): boolean {
+    try {
+      if (repo.getCurrentTerminalResult(runId) !== undefined) return true;
+      const epoch = repo.currentEpoch(runId)?.epoch;
+      if (epoch === undefined) return false;
+      repo.recordTerminalResult({
+        epoch,
+        eventId: `${WORKFLOW_DETACHED_TERMINAL_EVENT_PREFIX}${runId}:${epoch}`,
+        result: {
+          runId,
+          status,
+          exitCode: 1,
+          stopReason: null,
+          finalMessage,
+          usage: null,
+          lastSequence: null,
+          finishedAt: this.#nowIso(),
+        },
+      });
+      return true;
+    } catch (error) {
+      this.#deps.warn(
+        `workflow ${runId} could not record its ${status} terminal: ${errorMessage(error)}`,
+      );
+      return false;
+    }
   }
 
   async #resumeRun(
@@ -824,10 +963,13 @@ export class VerifiedChangeWorkflowController {
       },
     });
     if (result.outcome !== "committed") {
+      // The journal keeps the failure; the client used to see only
+      // "workflow intake failed" while the cause sat in run_effects.
+      const failure = describeEffectFailure(result);
       throw new WorkflowHaltError({
         status: result.outcome === "cancelled" ? "cancelled" : "failed",
         stopReason: null,
-        finalMessage: `workflow intake ${result.outcome}`,
+        finalMessage: `workflow intake ${result.outcome}${failure}`,
       });
     }
     if (ctx.ledger === undefined) {
@@ -1047,7 +1189,17 @@ export class VerifiedChangeWorkflowController {
         attempt,
         spawnKind: "verify_agent",
         childRunId: `${ctx.runId}:verify-agent#${attempt}`,
-        prompt: buildVerifyAgentPrompt(ctx.spec, records),
+        prompt: buildVerifyAgentPrompt(
+          ctx.spec,
+          records,
+          attempt > 1 && ctx.verifyReport !== undefined
+            ? {
+                attempt: attempt - 1,
+                verdict: ctx.verifyVerdict ?? "FAIL",
+                report: ctx.verifyReport,
+              }
+            : undefined,
+        ),
         decorate: (outcome) => {
           const verdict = parseVerificationVerdict(outcome.finalMessage ?? "");
           return {
@@ -1087,6 +1239,7 @@ export class VerifiedChangeWorkflowController {
     const verdict = agent.evidence.verdict ?? "FAIL";
     ctx.verification = { records, allPassed, testResult };
     ctx.verifyVerdict = verdict;
+    ctx.verifyReport = agent.evidence.child?.finalMessage;
     return allPassed && verdict === "PASS";
   }
 
@@ -1219,11 +1372,16 @@ export class VerifiedChangeWorkflowController {
                 review.artifact,
               );
             } catch (error) {
-              if (error instanceof ReviewParseError) {
-                // A settled-but-unparseable reviewer is a KNOWN failure —
-                // durable for adoption too, so a crash in the commit window
-                // resumes into the same failed outcome (and its bounded
-                // retry), never into unknown_outcome.
+              if (
+                error instanceof ReviewParseError ||
+                error instanceof ReviewInvocationError
+              ) {
+                // A settled-but-unparseable reviewer, or one whose single
+                // call failed before any output (soak F76: a 403 on the
+                // reviewer's token), is a KNOWN failure — durable for
+                // adoption too, so a crash in the commit window resumes
+                // into the same failed outcome (and its bounded retry),
+                // never into unknown_outcome.
                 this.#recordReviewChildTerminal(ctx, childRunId, {
                   status: "failed",
                   finalMessage: error.message,
@@ -1235,7 +1393,10 @@ export class VerifiedChangeWorkflowController {
                     stage: "workflow.review",
                     attempt,
                     failure: {
-                      reason: "review_unparseable",
+                      reason:
+                        error instanceof ReviewParseError
+                          ? "review_unparseable"
+                          : "review_invocation_failed",
                       message: error.message,
                     },
                   },
@@ -2337,10 +2498,35 @@ export class VerifiedChangeWorkflowController {
 // Spec freeze + prompts
 // ---------------------------------------------------------------------------
 
+/**
+ * The reviewer model is resolved once, here, and pinned: the caller's
+ * `reviewerModel`, else the caller's `model`, else the model the daemon gives
+ * a new session. A start that can name none is refused instead of freezing a
+ * name the provider has never heard of.
+ */
+function resolveReviewerModel(
+  runId: string,
+  params: WorkflowStartParams,
+  daemonDefaultModel: string | undefined,
+): string {
+  const candidate =
+    params.reviewerModel ?? params.model ?? daemonDefaultModel;
+  const trimmed = candidate?.trim() ?? "";
+  if (trimmed.length === 0) {
+    throw new WorkflowIntakeError(
+      runId,
+      null,
+      "no reviewer model: pass `reviewerModel` or `model`, or configure the daemon's default model",
+    );
+  }
+  return trimmed;
+}
+
 function freezeWorkflowSpec(
   runId: string,
   params: WorkflowStartParams,
   base: BaseState,
+  daemonDefaultModel: string | undefined,
 ): WorkflowSpec {
   return {
     runId,
@@ -2354,9 +2540,8 @@ function freezeWorkflowSpec(
     },
     ...(params.model !== undefined ? { model: params.model } : {}),
     ...(params.provider !== undefined ? { provider: params.provider } : {}),
-    reviewerModel:
-      params.reviewerModel ?? params.model ?? "default-reviewer",
-    permissionMode: params.permissionMode ?? DEFAULT_PERMISSION_MODE,
+    reviewerModel: resolveReviewerModel(runId, params, daemonDefaultModel),
+    permissionMode: resolveWorkflowPermissionMode(params.permissionMode),
     ...(params.unattendedAllow !== undefined
       ? { unattendedAllow: params.unattendedAllow }
       : {}),
@@ -2407,9 +2592,13 @@ function buildImplementPrompt(ctx: RunContext, attempt: number): string {
           `- ${record.label}: exit ${record.exitCode}` +
           (record.timedOut ? " (timed out)" : ""),
       ),
-      "",
-      "Fix the failures above, then stop.",
     );
+    // Soak F73: the verdict alone told the implementer nothing; the report
+    // names the failures it has to fix.
+    if (ctx.verifyReport !== undefined) {
+      lines.push("", "### Verifier's report", ctx.verifyReport);
+    }
+    lines.push("", "Fix every failure reported above, then stop.");
   }
   return lines.join("\n");
 }
@@ -2417,11 +2606,21 @@ function buildImplementPrompt(ctx: RunContext, attempt: number): string {
 function buildVerifyAgentPrompt(
   spec: WorkflowSpec,
   records: readonly VerifiedChangeCommandRecord[],
+  previous?: {
+    readonly attempt: number;
+    readonly verdict: string;
+    readonly report: string;
+  },
 ): string {
   return [
     "You are an ADVERSARIAL verification agent for a proposed code change.",
     "Independently verify the change in the current worktree against the goal.",
     "Re-run spot checks; do not trust the implementer's claims.",
+    // Soak F65: the verifier wrote its fixtures to /tmp and by redirection into
+    // tracked paths, and the sandbox refused both; say where scratch may go.
+    "Write any scratch files or fixtures you need under `tmp/` inside the worktree:",
+    "the sandbox refuses writes outside the workspace (including /tmp) and shell",
+    "redirection into other workspace paths.",
     "",
     "## Goal",
     spec.goal,
@@ -2432,6 +2631,19 @@ function buildVerifyAgentPrompt(
         `- ${record.label}: exit ${record.exitCode}` +
         (record.timedOut ? " (timed out)" : ""),
     ),
+    // Soak F73: a second verifier that starts blind re-derives the previous
+    // findings from scratch; hand it the report and have it re-check those
+    // first, then keep verifying independently.
+    ...(previous !== undefined
+      ? [
+          "",
+          `## Previous verification attempt ${previous.attempt} (verdict ${previous.verdict})`,
+          "The change was re-implemented after this report. Re-check every",
+          "failure it lists first, then continue your own independent verification.",
+          "",
+          previous.report,
+        ]
+      : []),
     "",
     "End your final message with exactly one line:",
     "VERDICT: PASS | FAIL | PARTIAL",

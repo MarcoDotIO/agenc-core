@@ -30,7 +30,10 @@ Further restarts wait 250 ms, then 1 s, then 4 s. After the cap it throws
 opens the TUI and shows the `daemon-autostart-failed` status notice. Background
 agents and reconnectable sessions stay unavailable until `agenc daemon start`
 succeeds. Inspect with `agenc daemon status`; stop a wedged process with
-`agenc daemon stop`.
+`agenc daemon stop`. Off Linux an unbound daemon is never signalled; if its
+heartbeat is fresh (still starting, or leaving after a cancelled startup),
+autostart waits up to 30 s for it to exit before refusing. A daemon whose
+startup was cancelled bounds each cleanup task to 5 s so it cannot linger.
 
 Ready-wait timeout for clients that start the daemon
 (`AGENC_DAEMON_READY_TIMEOUT_MS`):
@@ -66,6 +69,17 @@ agenc daemon reload                # in-place config reload
 agenc daemon restart
 agenc daemon stop
 ```
+
+`agenc daemon status` distinguishes three states. `running (pid N)` with uptime,
+memory and the project state databases on disk (count, total, largest): the daemon is bound and answering. `alive but not yet bound (pid N)`
+with its last heartbeat: the process is beating but has not published its
+identity record, because it is still starting (recovering its agent runs, which
+takes a while under memory pressure) or the record was removed; lifecycle
+commands wait for the record, and the exit code stays 1 until it appears.
+`stopped`, with the previous daemon's last heartbeat when one was left behind:
+a daemon that vanished without any handler running (an OS SIGKILL, for
+instance) leaves that heartbeat, so the last known pid, memory and event-loop
+lag survive the exit.
 
 Packaging units under `packaging/` (systemd, launchd, Windows service) run
 `agenc daemon start --foreground`.

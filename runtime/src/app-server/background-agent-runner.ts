@@ -16,6 +16,7 @@ import {
   type LocalRuntimeBootstrap,
 } from "../bin/bootstrap.js";
 import { ensureAgentControl } from "../bin/delegate-tool.js";
+import { AgentControl } from "../agents/control.js";
 import { clearSession } from "../commands/clear.js";
 import { runTurn } from "../session/run-turn.js";
 import {
@@ -158,6 +159,13 @@ import {
   cloneFrozenRuntimeSettingsSnapshot,
 } from "../state/runtime-settings-snapshot.js";
 import { runWithAgentRuntimeOptions } from "../session/runtime-options.js";
+import { shutdownSessionLifecycle } from "../session/lifecycle.js";
+import { withTimeout } from "../utils/sleep.js";
+import {
+  DaemonOperationScope,
+  DAEMON_AGENT_STOP_TIMEOUT_MS,
+  DAEMON_AGENT_HARD_STOP_TIMEOUT_MS,
+} from "./operation-deadline.js";
 
 import {
   AgenCBackgroundAgentSuspensionShutdownError,
@@ -371,6 +379,7 @@ export {
 } from "./background-agent-runner/tool-recovery.js";
 
 export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentRunner {
+  readonly #agentStopTimeoutMs: number;
   readonly #bootstrap: AgenCBootstrapFunction;
   readonly #requireSandboxReadyAtStartup: boolean;
   readonly #ensureAgentControl: AgenCEnsureAgentControlFunction;
@@ -384,6 +393,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
   #realtimeCallClient: AgenCRealtimeCallClient | undefined;
   #realtimeConnectTransport: AgenCBackgroundRealtimeTransportConnector;
   readonly #active = new Map<string, ActiveBackgroundAgent>();
+  readonly #quiescing = new WeakMap<ActiveBackgroundAgent, Promise<void>>();
   readonly #pendingExplicitRestores = new Set<string>();
   readonly #pendingEvents = new Map<string, BackgroundAgentDaemonEvent[]>();
   readonly #pendingActiveToolCallIds = new Map<string, Set<string>>();
@@ -400,6 +410,10 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     | undefined;
 
   constructor(options: AgenCDelegateBackgroundAgentRunnerOptions = {}) {
+    this.#agentStopTimeoutMs = options.agentStopTimeoutMs ?? DAEMON_AGENT_STOP_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.#agentStopTimeoutMs) || this.#agentStopTimeoutMs <= 0 || this.#agentStopTimeoutMs > 2_147_483_647) {
+      throw new RangeError("agentStopTimeoutMs must be a positive timer interval");
+    }
     this.#bootstrap = options.bootstrap ?? bootstrapLocalRuntimeSession;
     this.#requireSandboxReadyAtStartup = options.bootstrap === undefined;
     this.#ensureAgentControl = options.ensureAgentControl ?? ensureAgentControl;
@@ -448,6 +462,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
   async startAgent(
     params: AgenCBackgroundAgentStartParams,
   ): Promise<AgenCBackgroundAgentStartResult> {
+    params.signal?.throwIfAborted();
     // Materialize the client's complete allowlisted snapshot on top of the
     // runner's captured env. Protocol clear markers become absent runtime keys
     // so daemon-start provider/config values cannot leak into this session.
@@ -465,6 +480,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       () =>
         runWithBootstrapSessionScope(() =>
           this.#bootstrap({
+      ...(params.signal !== undefined ? { signal: params.signal } : {}),
       ...(mergedEnv !== undefined ? { env: mergedEnv } : {}),
       ...(this.#authBackend !== undefined
         ? { authBackend: this.#authBackend }
@@ -494,6 +510,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           }),
         ),
     );
+    const unbindCancellation = this.#bindBootstrapCancellation(bootstrap, params.signal);
     const uninstallApprovalBridge = this.#installDaemonApprovalBridge(
       bootstrap.session,
     );
@@ -502,6 +519,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     let authorityOwner: ActiveBackgroundAgent | undefined;
     let uninstallPermissionAuthorityCoordinator = (): void => {};
     try {
+      params.signal?.throwIfAborted();
       uninstallPermissionAuthorityCoordinator =
         installDaemonPermissionAuthorityCoordinator(
           bootstrap,
@@ -672,6 +690,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       };
       this.#pendingEvents.delete(managedThread.threadId);
       this.#pendingActiveToolCallIds.delete(managedThread.threadId);
+      params.signal?.throwIfAborted();
       this.#active.set(managedThread.threadId, active);
       active.unsubscribeMcpSurfaceInvalidations =
         this.#installMcpSurfaceInvalidationBridge(active);
@@ -743,16 +762,18 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
               }
             : {}),
         };
+        params.signal?.throwIfAborted();
         active.pendingMessageSubmissionCount += 1;
-        const initialSubmission = active.messageSubmissionQueue.then(() =>
-          runWithCurrentRuntimeSession(active.bootstrap.session, () =>
+        const initialSubmission = active.messageSubmissionQueue.then(() => {
+          params.signal?.throwIfAborted();
+          return runWithCurrentRuntimeSession(active.bootstrap.session, () =>
             managedThread.submit({
               type: "user_input",
               input: preparedFirstInput,
               submitOptions: firstSubmitOptions,
             }),
-          ),
-        );
+          );
+        });
         const trackedInitialSubmission = initialSubmission.finally(() => {
           active.pendingMessageSubmissionCount = Math.max(
             0,
@@ -786,9 +807,39 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     } catch (error) {
       uninstallPermissionAuthorityCoordinator();
       uninstallApprovalBridge();
-      await bootstrap.shutdown().catch(() => {});
+      bootstrap.session.beginShutdown?.();
+      bootstrap.session.abortController?.abort(error);
+      if (authorityOwner !== undefined &&
+          this.#active.get(authorityOwner.thread.threadId) === authorityOwner) {
+        await this.#retireUnpublishedRestoreGeneration(
+          authorityOwner.thread.threadId, authorityOwner,
+        ).catch(() => {});
+      } else {
+        await withTimeout(bootstrap.shutdown(), this.#agentStopTimeoutMs,
+          "failed agent bootstrap cleanup timed out").catch(() => {});
+      }
       throw error;
+    } finally {
+      unbindCancellation();
     }
+  }
+
+  #bindBootstrapCancellation(bootstrap: LocalRuntimeBootstrap, signal?: AbortSignal): () => void {
+    const abort = (): void => {
+      bootstrap.session.beginShutdown?.();
+      bootstrap.session.abortController?.abort(signal?.reason);
+      const control = bootstrap.session.services.agentControl;
+      void withTimeout(shutdownSessionLifecycle({
+        session: bootstrap.session,
+        ...(control instanceof AgentControl ? { agentControl: control } : {}),
+        mcpManager: bootstrap.mcpManager,
+        skipMemoryExtractionDrain: true,
+        shutdownBudgetMs: DAEMON_AGENT_HARD_STOP_TIMEOUT_MS,
+      }), DAEMON_AGENT_HARD_STOP_TIMEOUT_MS, "cancelled bootstrap teardown timed out").catch(() => undefined);
+    };
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+    return () => signal?.removeEventListener("abort", abort);
   }
 
   async getAgentSnapshot(
@@ -859,6 +910,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
   async restoreAgent(
     params: AgenCBackgroundAgentRestoreParams,
   ): Promise<boolean> {
+    params.signal?.throwIfAborted();
     if (
       params.restoreAttemptId !== undefined &&
       params.restoreAttemptId.length === 0
@@ -879,7 +931,16 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       const previous = this.#active.get(params.agentId);
       if (previous !== undefined) {
         if (!explicitRestore) return true;
-        await previous.cleanupComplete;
+        const cleanup = new DaemonOperationScope(
+          `restoreAgent ${params.agentId} previous generation cleanup`,
+          this.#agentStopTimeoutMs,
+          params.signal,
+        );
+        try {
+          await cleanup.wait(() => previous.cleanupComplete);
+        } finally {
+          cleanup.dispose();
+        }
         if (this.#active.get(params.agentId) === previous) {
           throw new Error(
             `terminal generation ${params.agentId} did not relinquish its runtime`,
@@ -896,6 +957,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       let authorityOwner: ActiveBackgroundAgent | undefined;
       let uninstallPermissionAuthorityCoordinator = (): void => {};
       let insertedGeneration: ActiveBackgroundAgent | undefined;
+      let unbindCancellation = (): void => {};
       try {
         // Restores retain the same complete per-client snapshot semantics as
         // first start, including removal of cleared daemon-start state.
@@ -910,6 +972,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           () =>
             runWithBootstrapSessionScope(() =>
               this.#bootstrap({
+          ...(params.signal !== undefined ? { signal: params.signal } : {}),
           ...(mergedEnv !== undefined ? { env: mergedEnv } : {}),
           ...(this.#authBackend !== undefined
             ? { authBackend: this.#authBackend }
@@ -964,6 +1027,8 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
               }),
             ),
         );
+        unbindCancellation = this.#bindBootstrapCancellation(bootstrap, params.signal);
+        params.signal?.throwIfAborted();
         uninstallApprovalBridge = this.#installDaemonApprovalBridge(
           bootstrap.session,
         );
@@ -1077,7 +1142,15 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           bootstrap,
           control,
           thread: managedThread,
-          status: "running",
+          // A restored agent is only running when there is a turn to pick
+          // back up. Otherwise it is idle until its next prompt; reporting
+          // "running" here kept every session restored by a daemon restart
+          // listed as a working agent for the rest of the day (#2167).
+          status:
+            canonicalRuntimeState.pendingStartupActivationResumeEventId !==
+            undefined
+              ? "running"
+              : "idle",
           startedAt,
           ...(params.restoreAttemptId !== undefined
             ? { restoreAttemptId: params.restoreAttemptId }
@@ -1202,6 +1275,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         };
         this.#pendingEvents.delete(params.agentId);
         this.#pendingActiveToolCallIds.delete(params.agentId);
+        params.signal?.throwIfAborted();
         this.#active.set(params.agentId, active);
         active.unsubscribeMcpSurfaceInvalidations =
           this.#installMcpSurfaceInvalidationBridge(active);
@@ -1210,6 +1284,18 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         active.unsubscribeElicitationEvents =
           this.#installSessionEventLogBridge(active);
         this.#trackAgentStatus(active);
+        // The thread replays its current status on subscribe, and a hydrated
+        // thread reports pending_init, which maps to "running". A restored
+        // agent with no turn to pick up is idle until its next prompt; left
+        // as "running" it sat in every agent list as a working agent for the
+        // rest of the day (#2167).
+        if (
+          canonicalRuntimeState.pendingStartupActivationResumeEventId ===
+            undefined &&
+          managedThread.status().status === "pending_init"
+        ) {
+          active.status = "idle";
+        }
         active.unsubscribePhaseEvents = bootstrap.session.subscribeToEvents(
           (phase) => {
             const progress = phaseEventToProgressEvent(phase);
@@ -1231,6 +1317,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           currentSessionId: params.currentSessionId,
           onReplayToolResult: params.onReplayToolResult,
         });
+        params.signal?.throwIfAborted();
         return true;
       } catch (error) {
         const cleanupErrors: unknown[] = [];
@@ -1250,7 +1337,10 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         } else {
           uninstallApprovalBridge?.();
           try {
-            await bootstrap?.shutdown();
+            bootstrap?.session.beginShutdown?.();
+            bootstrap?.session.abortController?.abort(error);
+            await withTimeout(Promise.resolve(bootstrap?.shutdown()),
+              this.#agentStopTimeoutMs, "failed restore cleanup timed out");
           } catch (cleanupError) {
             cleanupErrors.push(cleanupError);
           }
@@ -1265,6 +1355,8 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           throw error;
         }
         return false;
+      } finally {
+        unbindCancellation();
       }
     } finally {
       if (explicitRestore) this.#pendingExplicitRestores.delete(params.agentId);
@@ -1316,17 +1408,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
 
     const errors: unknown[] = [];
     try {
-      await this.#drainDispatchChain(active);
-    } catch (error) {
-      errors.push(error);
-    }
-    try {
-      await active.bootstrap.shutdown();
-    } catch (error) {
-      errors.push(error);
-    }
-    try {
-      await this.#drainDispatchChain(active);
+      await this.#quiesceAgent(agentId, active);
     } catch (error) {
       errors.push(error);
     }
@@ -1433,6 +1515,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
   ): Promise<void> {
     const active = this.#active.get(agentId);
     if (active === undefined) return;
+    active.ingressClosed = true;
     active.status = "stopping";
     active.lastActiveAt = this.#now();
     let stopError: unknown;
@@ -1459,9 +1542,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       // Bootstrap lifecycle quiesces the root turn, descendants, execs, hooks,
       // and tracked durable continuations before Session's close-boundary
       // callback appends the terminal as the canonical tail.
-      await this.#drainDispatchChain(active);
-      await active.bootstrap.shutdown();
-      await this.#drainDispatchChain(active);
+      await this.#quiesceAgent(agentId, active);
     } catch (error) {
       stopError ??= error;
     }
@@ -1470,6 +1551,10 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       stopError ??= new Error(
         `run ${agentId} shutdown completed without a durable terminal result`,
       );
+    }
+    if (stopError !== undefined) {
+      active.status = "error";
+      active.lastActiveAt = this.#now();
     }
     await this.#notifyActiveAgentTerminated(agentId, active);
     if (this.#active.get(agentId) === active) {
@@ -1498,6 +1583,55 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     }
   }
 
+  #quiesceAgent(agentId: string, active: ActiveBackgroundAgent, initialError?: unknown): Promise<void> {
+    const pending = this.#quiescing.get(active);
+    if (pending !== undefined) return pending;
+    const task = this.#performQuiescence(agentId, active, initialError);
+    this.#quiescing.set(active, task);
+    return task;
+  }
+
+  async #performQuiescence(agentId: string, active: ActiveBackgroundAgent, initialError?: unknown): Promise<void> {
+    const graceful = new DaemonOperationScope(
+      `stopAgent ${agentId} quiescence`, this.#agentStopTimeoutMs,
+    );
+    try {
+      if (initialError !== undefined) throw initialError;
+      await graceful.wait(() => this.#drainDispatchChain(active));
+      await graceful.wait(() => active.bootstrap.shutdown());
+      await graceful.wait(() => this.#drainDispatchChain(active));
+    } catch (error) {
+      active.ingressClosed = true;
+      active.status = "error";
+      active.lastActiveAt = this.#now();
+      const session = active.bootstrap.session;
+      session.beginShutdown?.();
+      session.abortController?.abort(error);
+      const hard = new DaemonOperationScope(
+        `stopAgent ${agentId} hard teardown`, DAEMON_AGENT_HARD_STOP_TIMEOUT_MS,
+      );
+      try {
+        // Start resource cancellation even if bootstrap is stuck before its
+        // own session-shutdown step (for example in sidecar cleanup).
+        await hard.wait(() => shutdownSessionLifecycle({
+          session,
+          agentControl: active.control,
+          mcpManager: active.bootstrap.mcpManager,
+          skipMemoryExtractionDrain: true,
+          shutdownBudgetMs: DAEMON_AGENT_HARD_STOP_TIMEOUT_MS,
+        }));
+      } catch {
+        // The original failure remains authoritative. stopAgent still removes
+        // this generation and reports that teardown could not be completed.
+      } finally {
+        hard.dispose();
+      }
+      throw error;
+    } finally {
+      graceful.dispose();
+    }
+  }
+
   async suspendIdleAgentForDaemonShutdown(
     agentId: string,
   ): Promise<AgenCBackgroundAgentDaemonShutdownResult> {
@@ -1509,7 +1643,18 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     active.ingressClosed = true;
     active.status = "stopping";
     active.lastActiveAt = this.#now();
-    await this.#drainDispatchChain(active);
+    const drain = new DaemonOperationScope(
+      `suspendAgent ${agentId} dispatch drain`, this.#agentStopTimeoutMs,
+    );
+    try {
+      await drain.wait(() => this.#drainDispatchChain(active));
+    } catch (error) {
+      await this.#quiesceAgent(agentId, active, error).catch(() => undefined);
+      await this.stopAgent(agentId, "daemon_shutdown_dispatch_timeout");
+      throw error;
+    } finally {
+      drain.dispose();
+    }
 
     if (!this.#canSuspendIdleAgent(agentId, active)) {
       await this.stopAgent(agentId, "daemon_shutdown_not_idle");
@@ -1526,12 +1671,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     };
     const shutdownErrors: unknown[] = [];
     try {
-      await active.bootstrap.shutdown();
-    } catch (error) {
-      shutdownErrors.push(error);
-    }
-    try {
-      await this.#drainDispatchChain(active);
+      await this.#quiesceAgent(agentId, active);
     } catch (error) {
       shutdownErrors.push(error);
     }
@@ -1764,6 +1904,9 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     if (active === undefined || !isRunnableActiveAgent(active)) {
       throw new Error(`AgenC daemon agent not running: ${agentId}`);
     }
+    // The user speaks again: child receipts held since a stop may now start
+    // follow-up turns (#2236).
+    active.bootstrap.session.clearUserStop?.();
     const contentFingerprint = messageContentFingerprint(
       params.originalContent,
     );
@@ -1808,6 +1951,18 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       throw new AgenCBackgroundAgentMessageError(
         "TURN_IN_PROGRESS",
         `session ${params.sessionId} already has an active or queued turn`,
+      );
+    }
+    // A history the live tool-pair validator has closed cannot take the user
+    // message this turn would start with. Refusing here gives the client the
+    // reason; opening the turn gave it an empty turn that ended in seconds.
+    const historyBlocked =
+      active.bootstrap.rolloutStore.liveHistoryBlockedReason();
+    if (historyBlocked !== undefined) {
+      throw new AgenCBackgroundAgentMessageError(
+        "SESSION_HISTORY_BLOCKED",
+        `session ${params.sessionId} cannot start a turn: ${historyBlocked}. ` +
+          "Its history no longer accepts new entries; continue in a new session.",
       );
     }
 
@@ -3988,6 +4143,8 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     const active = this.#active.get(agentId);
     if (active === undefined || !isInterruptibleActiveAgent(active))
       return false;
+    // A client asked for the stop; hold child receipts until the next prompt.
+    active.bootstrap.session.markStoppedByUser?.();
     try {
       await active.bootstrap.session.abortAllTasks("interrupted");
     } catch {
@@ -4043,6 +4200,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         ...(turnAfterAttempt !== expectedTurnId ? { stale: true } : {}),
       };
     }
+    active.bootstrap.session.markStoppedByUser?.();
     for (const [childThreadId] of active.control.openThreadSpawnChildren(
       active.thread.threadId,
     )) {
@@ -4357,12 +4515,10 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         // journaled, while daemon delivery is intentionally serialized on an
         // async chain. Drain that already-committed turn tail before shutdown
         // can close the writer or lifecycle teardown can retire its route.
-        await this.#drainDispatchChain(active);
-        await active.bootstrap.shutdown().catch(() => {});
+        await this.#quiesceAgent(agentId, active).catch(() => {});
         // The durable close finalizer appends run_terminal during shutdown.
         // Keep the session route live until that new canonical tail has also
         // crossed the same ordered delivery chain.
-        await this.#drainDispatchChain(active);
         await this.#notifyActiveAgentTerminated(agentId, active);
         if (this.#active.get(agentId) !== generation) return;
         const bufferedEvents = active.bufferedEvents.splice(0);
@@ -4422,7 +4578,14 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       ...(active.terminal !== undefined ? { terminal: active.terminal } : {}),
     };
     try {
-      await this.#onActiveAgentTerminated(agentId, terminalSnapshot);
+      const notification = new DaemonOperationScope(
+        `agent ${agentId} termination notification`, DAEMON_AGENT_HARD_STOP_TIMEOUT_MS,
+      );
+      try {
+        await notification.wait(() => this.#onActiveAgentTerminated?.(agentId, terminalSnapshot));
+      } finally {
+        notification.dispose();
+      }
     } catch {
       // Lifecycle owns projection error reporting; cleanup must still revoke
       // runtime resources and execution authority.

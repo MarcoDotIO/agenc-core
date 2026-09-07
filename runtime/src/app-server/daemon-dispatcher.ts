@@ -16,6 +16,7 @@ import { OWNER_TELEGRAM_METHODS, type OwnerTelegramMethod } from "../gateway/own
 import { RoutineError, type RoutineService } from "../routines/service.js";
 import type { RoutineUpdatedEvent } from "../routines/types.js";
 import { isSafeSessionIdSegment } from "../session/session-store.js";
+import { DaemonOperationTimeoutError } from "./operation-deadline.js";
 
 import {
   AgenCDaemonAgentLifecycleError,
@@ -216,6 +217,15 @@ import type { CodePredictionService } from "../services/code-prediction/service.
  */
 export interface AgenCDaemonWorkflowStartService {
   startRun(params: RunStartParams): Promise<RunStartResult>;
+  /**
+   * Closes a workflow run's projection when run.cancel finds no live
+   * pipeline for it. Optional: older wirings without it keep the previous
+   * behaviour (agents-rail cancel only).
+   */
+  cancelDetachedRun?(params: {
+    readonly runId: string;
+    readonly reason: string;
+  }): string | Promise<string>;
 }
 
 export interface AgenCDaemonConnectionInitializeState {
@@ -1005,6 +1015,7 @@ export class AgenCDaemonJsonRpcDispatcher {
           id,
           await this.#agentManager.createAgent(
             validateAgentCreateParams(params),
+            { signal },
           ),
         );
       case "agent.list":
@@ -1058,13 +1069,18 @@ export class AgenCDaemonJsonRpcDispatcher {
           id,
           await this.#runInspection.evidence(validateRunEvidenceParams(params)),
         );
-      case "run.cancel":
-        return successResponse(
-          id,
-          await this.#agentManager.cancelRunTree(
-            validateRunCancelParams(params),
-          ),
-        );
+      case "run.cancel": {
+        const cancelParams = validateRunCancelParams(params);
+        const result = await this.#agentManager.cancelRunTree(cancelParams);
+        // A workflow run with no live pipeline has nothing observing the
+        // cancellation cascade; close its projection so run.status agrees
+        // with the cancel that just succeeded.
+        await this.#workflow?.cancelDetachedRun?.({
+          runId: cancelParams.runId,
+          reason: cancelParams.reason ?? "run.cancel",
+        });
+        return successResponse(id, result);
+      }
       case "run.start":
         if (this.#workflow === undefined) {
           return methodNotImplementedResponse(id, method);
@@ -2322,6 +2338,7 @@ function methodSupportsRequestCancellation(
   method: AgenCDaemonKnownMethod,
 ): boolean {
   return (
+    method === "agent.create" ||
     method === "fs.fuzzy_search" ||
     method === "commandExec.start" ||
     method === "csvJob.review.list" ||
@@ -5633,6 +5650,11 @@ function mapDispatchError(
 ): AgenCDaemonResponse {
   if (error instanceof RemoteError) return errorResponse(id, -32000, error.code, { code: error.code });
   if (error instanceof RoutineError) return errorResponse(id, -32602, error.message, { code: error.code });
+  if (error instanceof DaemonOperationTimeoutError) {
+    return errorResponse(id, -32000, error.message, {
+      code: error.code, operation: error.operation, timeoutMs: error.timeoutMs,
+    });
+  }
   if (error instanceof PermissionRuleMutationPrecommitError) {
     return errorResponse(id, -32602, error.message, {
       code: "PERMISSION_RULE_MUTATION_REJECTED",

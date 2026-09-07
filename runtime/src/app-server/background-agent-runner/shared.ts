@@ -85,6 +85,7 @@ import type {
 import type { AgentRuntimeOptions } from "../../session/runtime-options.js";
 
 export interface AgenCBackgroundAgentStartParams {
+  readonly signal?: AbortSignal;
   readonly objective: string;
   readonly cwd?: string;
   readonly model?: string;
@@ -129,6 +130,7 @@ export interface AgenCBackgroundAgentStartResult {
 }
 
 export interface AgenCBackgroundAgentRestoreParams {
+  readonly signal?: AbortSignal;
   readonly agentId: string;
   readonly objective: string;
   readonly cwd?: string;
@@ -298,7 +300,10 @@ export interface AgenCBackgroundAgentMessageTerminal extends JsonObject {
 }
 
 export type AgenCBackgroundAgentMessageErrorCode =
-  "TURN_IN_PROGRESS" | "CLIENT_MESSAGE_ID_CONFLICT" | "PROMPT_BLOCKED";
+  | "TURN_IN_PROGRESS"
+  | "CLIENT_MESSAGE_ID_CONFLICT"
+  | "PROMPT_BLOCKED"
+  | "SESSION_HISTORY_BLOCKED";
 
 export class AgenCBackgroundAgentMessageError extends Error {
   readonly code: AgenCBackgroundAgentMessageErrorCode;
@@ -804,6 +809,7 @@ function positiveInteger(value: unknown): number {
 }
 
 export interface AgenCDelegateBackgroundAgentRunnerOptions {
+  readonly agentStopTimeoutMs?: number;
   readonly bootstrap?: AgenCBootstrapFunction;
   readonly ensureAgentControl?: AgenCEnsureAgentControlFunction;
   readonly authBackend?: AuthBackend;
