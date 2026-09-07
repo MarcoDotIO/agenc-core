@@ -76,6 +76,12 @@ describe("desktop MCP contract", () => {
     await seed("sample", { transport: "http", endpoint: "https://example.test/mcp" });
     expect((await mcpDesktopInventory(context)).servers[0]).toMatchObject({ authenticated: false, needsAuthentication: false, authenticationSupported: false });
   });
+  test("sorts environment names alphabetically without exposing their values", async () => {
+    await seed("sample", { command: "node", env: { ZEBRA: "zebra-private", alpha: "alpha-private", Beta: "beta-private" } });
+    const inventory = await mcpDesktopInventory(context);
+    expect(inventory.servers[0]?.env).toEqual(["alpha", "Beta", "ZEBRA"].map((name) => ({ name, configured: true, sensitive: true })));
+    expect(JSON.stringify(inventory)).not.toMatch(/(?:zebra|alpha|beta)-private/u);
+  });
   test("removes configured:false secrets, retains redacted values and accepts an explicit empty string", async () => {
     await seed("sample", { command: "node", env: { REMOVE: "removed-secret", KEEP: "retained-secret", EMPTY: "old" } });
     const first = (await mcpDesktopInventory(context)).servers[0]!;

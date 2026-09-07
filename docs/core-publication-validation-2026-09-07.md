@@ -79,3 +79,12 @@ failed before the fix and pass afterward.
 
 Only the isolated worktree and feature branch are updated. The original worktree
 and running Core remain unchanged; this is not release or deployment evidence.
+
+A subsequent changed-file sweep selected 44 test files from the integrated PR
+diff; the default hermetic configuration ran **1,216 tests in 42 files**, all
+passing. Configuration-excluded lanes are not included in that count.
+SonarCloud then requested an explicit alphabetical comparator for MCP
+environment names. That bounded change retains redaction, adds a mixed-case
+ordering/redaction regression, and passed all **14 MCP management tests** plus
+the three no-emit TypeScript checks. Hosted checks remain pending until their
+results appear on the PR.

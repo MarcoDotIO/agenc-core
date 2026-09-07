@@ -59,7 +59,7 @@ export async function mcpDesktopInventory(context: ManagementContext) {
       name, source: config.pluginSource ?? config.scope,
       ...(config.pluginServer === undefined ? {} : { pluginId: config.pluginServer.pluginName }),
       transport: config.type === undefined ? "stdio" : config.type,
-      ...(config.type === undefined || config.type === "stdio" ? { command: config.command, args: config.args ?? [], env: Object.keys(config.env ?? {}).sort().map((name) => ({ name, configured: true, sensitive: true })), envPassthrough: config.env_vars ?? [], ...(config.cwd ? { cwd: config.cwd } : {}) } : { ...("url" in config ? { url: config.url } : {}), args: [], env: [], envPassthrough: [] }),
+      ...(config.type === undefined || config.type === "stdio" ? { command: config.command, args: config.args ?? [], env: Object.keys(config.env ?? {}).sort((left, right) => left.localeCompare(right, "en")).map((name) => ({ name, configured: true, sensitive: true })), envPassthrough: config.env_vars ?? [], ...(config.cwd ? { cwd: config.cwd } : {}) } : { ...("url" in config ? { url: config.url } : {}), args: [], env: [], envPassthrough: [] }),
       enabled: !("enabled" in config && config.enabled === false), editable,
       authenticationSupported, authenticated, needsAuthentication: authenticationSupported && !authenticated,
       ...(authenticationUnavailable ? { authenticationUnavailable: true } : {}),
