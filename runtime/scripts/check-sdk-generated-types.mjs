@@ -5,6 +5,8 @@ import { lstat, open, readFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { renderSdkWireTypes } from "./sdk-wire-types.mjs";
+import { checkSdkWireParity } from "./check-sdk-wire-parity.mjs";
 import {
   createSourceFile,
   isInterfaceDeclaration,
@@ -21,6 +23,7 @@ const paths = {
   generated: "src/entrypoints/sdk/coreTypes.generated.ts",
   runtimeProtocol: "src/app-server/protocol/index.ts",
   packageTranscriptV2: "../packages/agenc-sdk/src/transcript-v2.generated.ts",
+  packageWire: "../packages/agenc-sdk/src/protocol-wire.generated.ts",
   packageWorkflowResult:
     "../packages/agenc-sdk/src/workflow-result.generated.ts",
 };
@@ -152,6 +155,19 @@ export async function synchronizeTranscriptV2Generated({
 }) {
   const runtimeProtocol = await readFile(runtimeProtocolPath, "utf8");
   const expected = renderTranscriptV2Generated(runtimeProtocol);
+  return synchronizeGeneratedFile({ generatedPath, expected, write });
+}
+
+export async function synchronizeSdkWireGenerated({
+  runtimeProtocolPath,
+  generatedPath,
+  write = false,
+}) {
+  const expected = await renderSdkWireTypes(runtimeProtocolPath);
+  return synchronizeGeneratedFile({ generatedPath, expected, write });
+}
+
+async function synchronizeGeneratedFile({ generatedPath, expected, write }) {
   let current;
   try {
     current = await readFile(generatedPath, "utf8");
@@ -175,6 +191,26 @@ export async function synchronizeTranscriptV2Generated({
   return { changed: true, matches: true, expected };
 }
 
+function appendWireParityFailures(failures, parity) {
+  for (const [surface, methods] of Object.entries(parity.mismatches)) {
+    expectCondition(
+      failures,
+      methods.length === 0,
+      `${surface}: ${methods.join(", ")}`,
+    );
+  }
+  for (const diagnostic of parity.diagnostics) {
+    failures.push(`${diagnostic.file ?? "compiler"}: ${diagnostic.message}`);
+  }
+}
+
+function reportSdkGeneratedTypesSuccess(mode) {
+  const message = mode === "write"
+    ? `regenerated SDK artifacts; run ${checkCommand} to verify wire parity`
+    : "verified committed SDK types";
+  process.stdout.write(`[sdk generated types] ${message}\n`);
+}
+
 async function main() {
   const mode = parseSdkGeneratedTypesMode(process.argv.slice(2));
   const transcriptV2Path = path.join(
@@ -187,6 +223,7 @@ async function main() {
     generated,
     packageWorkflowResult,
     transcriptV2,
+    wire,
   ] = await Promise.all([
     readRuntimeFile(paths.schemas),
     readRuntimeFile(paths.coreTypes),
@@ -195,6 +232,11 @@ async function main() {
     synchronizeTranscriptV2Generated({
       runtimeProtocolPath: path.join(runtimeRoot, paths.runtimeProtocol),
       generatedPath: transcriptV2Path,
+      write: mode === "write",
+    }),
+    synchronizeSdkWireGenerated({
+      runtimeProtocolPath: path.join(runtimeRoot, paths.runtimeProtocol),
+      generatedPath: path.join(runtimeRoot, paths.packageWire),
       write: mode === "write",
     }),
   ]);
@@ -207,6 +249,9 @@ async function main() {
       transcriptV2.changed
         ? `[sdk generated types] wrote ${displayPath}\n`
         : `[sdk generated types] ${displayPath} is already current\n`,
+    );
+    process.stdout.write(
+      `[sdk generated types] ${wire.changed ? "wrote" : "current"} ${paths.packageWire}\n`,
     );
   }
   const failures = [];
@@ -345,6 +390,15 @@ async function main() {
     transcriptV2.matches,
     `${paths.packageTranscriptV2} is not the exact generated transcript.v2 mirror; regenerate it from ${paths.runtimeProtocol}`,
   );
+  expectCondition(
+    failures,
+    wire.matches,
+    `${paths.packageWire} is stale; run ${checkCommand} -- --write`,
+  );
+
+  if (mode === "check") {
+    appendWireParityFailures(failures, checkSdkWireParity());
+  }
 
   if (failures.length > 0) {
     process.stderr.write(
@@ -354,7 +408,7 @@ async function main() {
     return;
   }
 
-  process.stdout.write("[sdk generated types] verified committed SDK types\n");
+  reportSdkGeneratedTypesSuccess(mode);
 }
 
 if (
