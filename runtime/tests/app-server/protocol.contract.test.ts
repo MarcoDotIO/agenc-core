@@ -160,6 +160,9 @@ const expectedNotifications = [
 ] as const;
 
 const expectedInternalMethods = [
+  "audio.whisper.status",
+  "audio.whisper.install",
+  "audio.whisper.transcribe",
   "workspace.editor.acquire",
   "workspace.editor.sync",
   "workspace.editor.staleAuthority.refresh",

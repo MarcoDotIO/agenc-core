@@ -758,6 +758,9 @@ export type AgenCDaemonRequest = AgenCDaemonRequestWithParams<"telegram.capabili
 export const AGENC_DAEMON_METHOD_CAPABILITIES_KEY = "daemon.methods" as const;
 
 export const AGENC_DAEMON_INTERNAL_METHODS = [
+    "audio.whisper.status",
+    "audio.whisper.install",
+    "audio.whisper.transcribe",
     "workspace.editor.acquire",
     "workspace.editor.sync",
     "workspace.editor.staleAuthority.refresh",
