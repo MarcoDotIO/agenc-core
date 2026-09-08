@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   AGENC_DAEMON_HEARTBEAT_FRESH_MS,
+  claimAbandonedDaemonHeartbeat,
+  describeAbandonedDaemonExit,
   describeDaemonHeartbeat,
   describeUnboundDaemonHeartbeat,
   installAgenCDaemonHeartbeat,
@@ -12,6 +14,7 @@ import {
   readAgenCDaemonHeartbeat,
   reportLastDaemonHeartbeat,
   resolveAgenCDaemonHeartbeatPath,
+  resolveAgenCDaemonPreviousHeartbeatPath,
 } from "../../src/app-server/daemon-heartbeat.js";
 
 // #2199: a daemon that dies in a way no handler can see leaves its last
@@ -141,6 +144,82 @@ describe("daemon heartbeat", () => {
     expect(reportLastDaemonHeartbeat(io, path, 1)).toBe(false);
     expect(reportLastDaemonHeartbeat(io, path, null)).toBe(true);
     expect(lines).toHaveLength(2);
+  });
+
+  // #2199: the replacement's first beat used to overwrite the record of the
+  // exit it was replacing, three seconds after it happened.
+  describe("the heartbeat of the daemon this one replaced", () => {
+    it("keeps a dead daemon's heartbeat where the next beat cannot reach it", () => {
+      const previousPath = resolveAgenCDaemonPreviousHeartbeatPath(home);
+      writeFileSync(path, JSON.stringify({ ...readOrSample(), pid: 79303 }));
+      const claimed = claimAbandonedDaemonHeartbeat({
+        path,
+        previousPath,
+        pid: proc.pid,
+        isPidRunning: () => false,
+      });
+      expect(claimed?.pid).toBe(79303);
+      expect(existsSync(path)).toBe(false);
+      const dispose = installAgenCDaemonHeartbeat({ path, intervalMs: 1_000, proc });
+      try {
+        expect(readAgenCDaemonHeartbeat(path)?.pid).toBe(proc.pid);
+        expect(readAgenCDaemonHeartbeat(previousPath)?.pid).toBe(79303);
+      } finally {
+        dispose();
+      }
+      // A clean stop removes this daemon's beat, never the kept exit.
+      expect(readAgenCDaemonHeartbeat(previousPath)?.pid).toBe(79303);
+    });
+
+    it("describes the exit with the dead pid, the age and its last vitals", () => {
+      expect(
+        describeAbandonedDaemonExit(
+          { ...readOrSample(), pid: 79303 },
+          Date.parse("2026-09-06T12:39:45.000Z"),
+        ),
+      ).toBe(
+        "the previous daemon (pid 79303) exited without recording a reason; " +
+          "its last heartbeat was at 2026-09-06T12:39:00.000Z, 45 s ago: " +
+          "rss 600 MB, heap 250 MB, event-loop lag 0 ms, up 27 min",
+      );
+    });
+
+    it("leaves a live daemon's heartbeat, its own, and an absent one alone", () => {
+      const previousPath = resolveAgenCDaemonPreviousHeartbeatPath(home);
+      const claim = (isPidRunning: (pid: number) => boolean) =>
+        claimAbandonedDaemonHeartbeat({ path, previousPath, pid: proc.pid, isPidRunning });
+      expect(claim(() => false)).toBeNull(); // no heartbeat on disk
+      // A takeover starts beside a running daemon: its file is still in use.
+      writeFileSync(path, JSON.stringify({ ...readOrSample(), pid: 79303 }));
+      expect(claim((pid) => pid === 79303)).toBeNull();
+      expect(readAgenCDaemonHeartbeat(path)?.pid).toBe(79303);
+      // A restart that reuses this process's own pid has nothing to report.
+      writeFileSync(path, JSON.stringify(readOrSample()));
+      expect(claim(() => false)).toBeNull();
+      expect(existsSync(previousPath)).toBe(false);
+    });
+
+    it("does not report an exit a racing daemon already claimed", () => {
+      const claimed = claimAbandonedDaemonHeartbeat({
+        path,
+        // An unwritable directory stands in for the rename another starting
+        // daemon won: the file is gone from under this one either way.
+        previousPath: join(home, "missing-dir", "daemon-heartbeat.prev.json"),
+        pid: proc.pid,
+        isPidRunning: () => false,
+      });
+      expect(claimed).toBeNull();
+      writeFileSync(path, JSON.stringify({ ...readOrSample(), pid: 79303 }));
+      const stillOnDisk = claimAbandonedDaemonHeartbeat({
+        path,
+        previousPath: join(home, "missing-dir", "daemon-heartbeat.prev.json"),
+        pid: proc.pid,
+        isPidRunning: () => false,
+      });
+      // The rename failed but the evidence is still there and about to be
+      // overwritten, so it is reported rather than lost in silence.
+      expect(stillOnDisk?.pid).toBe(79303);
+    });
   });
 
   it("describes long uptimes in hours", () => {

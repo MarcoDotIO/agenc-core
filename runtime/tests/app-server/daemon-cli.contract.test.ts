@@ -39,6 +39,7 @@ import { AgenCDaemonSessionManager } from "./session-lifecycle.js";
 import { ensureAgenCDaemonAutostart } from "./daemon-autostart.js";
 import {
   AGENC_DAEMON_HEARTBEAT_FRESH_MS,
+  readAgenCDaemonHeartbeat,
   resolveAgenCDaemonHeartbeatPath,
 } from "./daemon-heartbeat.js";
 import {
@@ -3226,6 +3227,147 @@ describe("AgenC daemon CLI", () => {
     expect(result.err).toContain(
       "indeterminate for unbound pid 4602; no portable instance identity is available",
     );
+  });
+
+  // #2199: the daemon that autostarts three seconds after a silent kill used
+  // to overwrite its predecessor's last heartbeat and say nothing about it, so
+  // the exit the user lost a turn to left nothing to read anywhere.
+  it("records the daemon it replaced and keeps that daemon's last heartbeat", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const io = createIo();
+    const signalProcess = createSignalProcess();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    host.runningPids.add(host.pid);
+    // The killed daemon's last beat: its pid is gone, and a clean stop would
+    // have removed the file, so this heartbeat is an exit no handler saw.
+    writeFileSync(
+      resolveAgenCDaemonHeartbeatPath(agencHome),
+      JSON.stringify({
+        pid: 79303,
+        beat: 312,
+        at: new Date(Date.now() - 3_000).toISOString(),
+        uptimeS: 1_560,
+        rssMb: 397,
+        heapUsedMb: 108,
+        eventLoopLagMs: 2,
+      }),
+    );
+    const running = runAgenCDaemonCli(
+      { kind: "command", action: "run" },
+      { host, io, signalProcess },
+    );
+    try {
+      await waitForPid(pidPath, DAEMON_MILESTONE_BUDGET_MS, {
+        running,
+        stderrText: io.stderrText,
+      });
+      expect(io.stderrText()).toContain(
+        "the previous daemon (pid 79303) exited without recording a reason",
+      );
+      expect(io.stderrText()).toContain(
+        "rss 397 MB, heap 108 MB, event-loop lag 2 ms, up 26 min",
+      );
+      const kept = readAgenCDaemonHeartbeat(
+        join(agencHome, "daemon-heartbeat.prev.json"),
+      );
+      expect(kept?.pid).toBe(79303);
+      expect(kept?.beat).toBe(312);
+    } finally {
+      await stopRunningDaemons([{ signalProcess, running }]);
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  // #2199: daemon.log appends across daemons, so the detached daemon the app
+  // autostarts is the one that has to leave the record on disk.
+  it("writes the replaced daemon's exit into the log that survives it", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    host.env.AGENC_DAEMON_RUN = "1";
+    const io = createIo();
+    const signalProcess = createSignalProcess();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    host.runningPids.add(host.pid);
+    writeFileSync(
+      resolveAgenCDaemonHeartbeatPath(agencHome),
+      JSON.stringify({
+        pid: 79303,
+        beat: 312,
+        at: "2026-09-06T16:22:46.000Z",
+        uptimeS: 1_560,
+        rssMb: 397,
+        heapUsedMb: 108,
+        eventLoopLagMs: 2,
+      }),
+    );
+    const running = runAgenCDaemonCli(
+      { kind: "command", action: "run" },
+      { host, io, signalProcess },
+    );
+    try {
+      await waitForPid(pidPath, DAEMON_MILESTONE_BUDGET_MS, {
+        running,
+        stderrText: io.stderrText,
+      });
+      const log = await readFile(join(agencHome, "daemon.log"), "utf8");
+      expect(log).toContain(
+        "agenc: the previous daemon (pid 79303) exited without recording a reason; " +
+          "its last heartbeat was at 2026-09-06T16:22:46.000Z",
+      );
+      expect(log).toContain(join(agencHome, "daemon-heartbeat.prev.json"));
+    } finally {
+      await stopRunningDaemons([{ signalProcess, running }]);
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  // #2199: after the replacement is up, `status` is where a user who saw only
+  // "connection closed" learns that a daemon was replaced and where to look.
+  it("status names the daemon the running one replaced and points at the evidence", async () => {
+    const agencHome = await tempAgencHome();
+    const host = { ...createHost(agencHome), platform: "linux" as const };
+    const io = createIo();
+    host.runningPids.add(4555);
+    await writeAgenCDaemonPid(resolveAgenCDaemonPidPath(host.env, host.userHome), 4555);
+    writeFileSync(
+      join(agencHome, "daemon-heartbeat.prev.json"),
+      JSON.stringify({
+        pid: 79303,
+        beat: 312,
+        at: new Date(Date.now() - 45_000).toISOString(),
+        uptimeS: 1_560,
+        rssMb: 397,
+        heapUsedMb: 108,
+        eventLoopLagMs: 2,
+      }),
+    );
+
+    await expect(
+      runAgenCDaemonCli(
+        { kind: "command", action: "status" },
+        {
+          host,
+          io,
+          requestHealthStats: vi.fn(async () => {
+            throw new Error("health.stats unavailable");
+          }),
+          inspectLegacyDaemonProcess: inspectLegacyTestDaemon,
+          waitForDaemonReady: async () => true,
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const out = io.stdoutText();
+    expect(out).toContain("AgenC daemon running (pid 4555)");
+    expect(out).toContain(
+      "replaced: the previous daemon (pid 79303) exited without recording a reason",
+    );
+    expect(out).toContain("45 s ago: rss 397 MB");
+    expect(out).toContain(join(agencHome, "daemon-heartbeat.prev.json"));
+    expect(out).toContain(join(agencHome, "daemon-spawn-stderr.prev.log"));
+
+    await rm(agencHome, { recursive: true, force: true });
   });
 
   it("reload targets the authenticated sidecar instead of a live reused pid", async () => {

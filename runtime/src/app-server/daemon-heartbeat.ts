@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync, rmSync } from "node:fs";
+import { readFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { writeDurableAtomicFileSync } from "../utils/durable-atomic-file.js";
@@ -38,6 +38,64 @@ export interface DaemonHeartbeatProcess {
 
 export function resolveAgenCDaemonHeartbeatPath(daemonHome: string): string {
   return join(daemonHome, AGENC_DAEMON_HEARTBEAT_FILENAME);
+}
+
+/**
+ * The heartbeat left behind by a daemon that died where no handler could run.
+ * The replacement autostarts seconds later and its first beat overwrote the
+ * file, so the only record of the exit was gone before anyone could read it
+ * (#2199). A starting daemon moves it here, and nothing but the next such
+ * exit replaces it.
+ */
+export const AGENC_DAEMON_PREVIOUS_HEARTBEAT_FILENAME =
+  "daemon-heartbeat.prev.json";
+
+export function resolveAgenCDaemonPreviousHeartbeatPath(
+  daemonHome: string,
+): string {
+  return join(daemonHome, AGENC_DAEMON_PREVIOUS_HEARTBEAT_FILENAME);
+}
+
+/**
+ * Keep the heartbeat of the daemon this one replaced, and return it to be
+ * reported. A clean stop removes the file, so a heartbeat whose process is
+ * gone is an exit that ran no handler: a SIGKILL, or an abort with crash
+ * reporting off. A heartbeat whose pid is still alive belongs to a live
+ * daemon and is left where it is, so a takeover never blinds `status`.
+ */
+export function claimAbandonedDaemonHeartbeat(options: {
+  readonly path: string;
+  readonly previousPath: string;
+  readonly pid: number;
+  readonly isPidRunning: (pid: number) => boolean;
+}): DaemonHeartbeat | null {
+  const heartbeat = readAgenCDaemonHeartbeat(options.path);
+  if (heartbeat === null || heartbeat.pid === options.pid) return null;
+  if (options.isPidRunning(heartbeat.pid)) return null;
+  try {
+    renameSync(options.path, options.previousPath);
+  } catch {
+    // Another starting daemon claimed it first, or it cannot be kept. Report
+    // it only while it is still on disk, so a race does not report it twice.
+    const current = readAgenCDaemonHeartbeat(options.path);
+    if (current?.pid !== heartbeat.pid || current.beat !== heartbeat.beat) {
+      return null;
+    }
+  }
+  return heartbeat;
+}
+
+/** One line for the daemon's log and for `status`: which daemon this one replaced. */
+export function describeAbandonedDaemonExit(
+  heartbeat: DaemonHeartbeat,
+  nowMs: number,
+): string {
+  return (
+    `the previous daemon (pid ${heartbeat.pid}) exited without recording a reason; ` +
+    `its last heartbeat was at ${heartbeat.at}, ` +
+    `${heartbeatAgeSeconds(heartbeat, nowMs)} s ago: ` +
+    describeDaemonHeartbeatVitals(heartbeat)
+  );
 }
 
 /**
