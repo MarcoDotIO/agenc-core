@@ -810,6 +810,18 @@ function positiveInteger(value: unknown): number {
 
 export interface AgenCDelegateBackgroundAgentRunnerOptions {
   readonly agentStopTimeoutMs?: number;
+  /**
+   * Bound on the two waits a daemon restore adds around the durable-turn
+   * resume it drives (#2239): waiting for the recovered turn to START before
+   * `restoreAgent` returns, and waiting for a newer turn to release the
+   * history slot before the recovered conversation is merged back.
+   *
+   * Defaults to `DAEMON_AGENT_CREATE_TIMEOUT_MS`, the same deadline the
+   * bootstrap prewarm scope gave the resume when it ran inline, so the restore
+   * can never block longer than it did before the reorder. Injectable so tests
+   * do not have to burn the production deadline.
+   */
+  readonly durableResumeTimeoutMs?: number;
   readonly bootstrap?: AgenCBootstrapFunction;
   readonly ensureAgentControl?: AgenCEnsureAgentControlFunction;
   readonly authBackend?: AuthBackend;

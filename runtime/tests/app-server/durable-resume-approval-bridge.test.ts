@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AgenCDelegateBackgroundAgentRunner } from "../../src/app-server/background-agent-runner.js";
+import type { AgenCDelegateBackgroundAgentRunnerOptions } from "../../src/app-server/background-agent-runner/shared.js";
 import {
   bootstrapLocalRuntimeSession,
   type LocalRuntimeBootstrap,
@@ -184,6 +185,7 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
 
   function makeRunner(
     onBootstrapped?: (bootstrap: LocalRuntimeBootstrap) => void,
+    extra: Partial<AgenCDelegateBackgroundAgentRunnerOptions> = {},
   ): AgenCDelegateBackgroundAgentRunner {
     return new AgenCDelegateBackgroundAgentRunner({
       bootstrap: async (options) => {
@@ -197,6 +199,7 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
         AGENC_WORKSPACE: workspace,
         HOME: home,
       },
+      ...extra,
     });
   }
 
@@ -236,6 +239,38 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
       return emit.call(this, event, appendOpts);
     });
     return types;
+  }
+
+  /**
+   * Record every `warning` cause the session emits, from before bootstrap runs.
+   * The runner records why it stopped waiting on a stalled resume through this
+   * channel, so it is durable in the rollout and reaches a client on attach.
+   */
+  function recordEmittedWarnings(): Array<{
+    readonly cause: string;
+    readonly message: string;
+  }> {
+    const warnings: Array<{ readonly cause: string; readonly message: string }> =
+      [];
+    const emit = Session.prototype.emit;
+    vi.spyOn(Session.prototype, "emit").mockImplementation(function (
+      this: Session,
+      event: Parameters<Session["emit"]>[0],
+      appendOpts?: Parameters<Session["emit"]>[1],
+    ) {
+      if (event.msg.type === "warning") {
+        const payload = event.msg.payload as {
+          readonly cause?: unknown;
+          readonly message?: unknown;
+        };
+        warnings.push({
+          cause: String(payload.cause ?? ""),
+          message: String(payload.message ?? ""),
+        });
+      }
+      return emit.call(this, event, appendOpts);
+    });
+    return warnings;
   }
 
   async function waitUntil(
@@ -593,6 +628,197 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
 
     await runner.stopAgent(CONVERSATION_ID).catch(() => undefined);
   }, 60_000);
+
+
+  it("returns from a restore whose recovered turn stalls before it can start", async () => {
+    // The wait for `turn_resumed` replaced an inline resume that ran inside
+    // bootstrap's `DaemonOperationScope("session startup prewarm",
+    // DAEMON_AGENT_CREATE_TIMEOUT_MS)`, and everything the resume does before
+    // that event can block: `restoreCheckpointProviderRoute` ->
+    // `session.prepareProviderSwitch` (credential/provider I/O), `spawnTask`'s
+    // abort drain, the fsync-durable emit itself. `daemon-cli` awaits every
+    // recovered restore SERIALLY before `socketServer.listen()`, so an
+    // unbounded wait stops the daemon from ever listening — which also
+    // permanently prevents the client attach this whole fix exists to enable.
+    // The wait must expire and hand control back.
+    await stubProvider();
+    stubProviderAndMcp();
+
+    const warnings = recordEmittedWarnings();
+    const stalled = Promise.withResolvers<void>();
+    let resumeEnteredTurn = false;
+    let resumeFinished = false;
+    vi.spyOn(Session.prototype, "runTurn").mockImplementation(function (
+      _input: unknown,
+      options?: { readonly resume?: unknown },
+    ) {
+      const isResume = options?.resume !== undefined;
+      return (async function* () {
+        if (isResume) {
+          resumeEnteredTurn = true;
+          // Stall exactly where the review measured it: inside the resume,
+          // before any `turn_resumed` reaches the event log.
+          await stalled.promise;
+          resumeFinished = true;
+        }
+        return { reason: "completed" as const };
+      })() as never;
+    });
+
+    const runner = makeRunner(undefined, { durableResumeTimeoutMs: 500 });
+    const restore = runner.restoreAgent(restoreParams());
+    const outcome = await Promise.race([
+      restore.then(
+        () => "restoreAgent returned while the recovered turn was still stalled",
+      ),
+      new Promise<string>((resolve) =>
+        setTimeout(
+          () =>
+            resolve(
+              "restoreAgent never returned: the recovered turn stalled before turn_resumed",
+            ),
+          8_000,
+        ),
+      ),
+    ]);
+    expect(outcome).toBe(
+      "restoreAgent returned while the recovered turn was still stalled",
+    );
+    await expect(restore).resolves.toBe(true);
+
+    // Expiry is recorded, never silent: the operator and the attaching client
+    // both learn that the recovered turn had not started yet.
+    expect(resumeEnteredTurn).toBe(true);
+    expect(
+      warnings.filter(
+        (warning) => warning.cause === "durable_resume_start_timeout",
+      ),
+    ).toHaveLength(1);
+
+    // ...and the orphan is NOT abandoned. It is single-shot (see the
+    // "replay persists its abort" test), so cancelling it at the deadline
+    // would destroy the interrupted turn instead of merely delaying it.
+    expect(resumeFinished).toBe(false);
+    stalled.resolve();
+    await waitUntil(
+      () => resumeFinished,
+      "the resume to keep running in the background after the wait expired",
+    );
+
+    await runner.stopAgent(CONVERSATION_ID).catch(() => undefined);
+  }, 60_000);
+
+  it("re-applies the recovered conversation once a newer turn releases the slot", async () => {
+    // Moving the resume after `#hydrateRecoveredAgentState` created a window
+    // that did not exist on base: `syncSessionState` republishes
+    // `session.state.history` from the checkpoint prefix at EVERY sampling
+    // boundary, so once the resumed turn has sampled, the recovered
+    // conversation is gone until the re-apply lands. If a client message
+    // replaces the resume in between, the re-apply used to be skipped
+    // outright and `initialMessages` plus the re-dispatched `replayToolCalls`
+    // were lost for good. It must wait for the slot instead of dropping them.
+    //
+    // The busy slot is simulated by faking exactly the read the runner makes
+    // (`session.activeTurn.unsafePeek()`), which is the whole window: driving
+    // a real replacing turn to sit in that slot at the microsecond the resume
+    // settles is the interleaving the round-3 review could not construct.
+    await stubProvider();
+    stubProviderAndMcp();
+
+    const resumeSettled = Promise.withResolvers<void>();
+    vi.spyOn(Session.prototype, "runTurn").mockImplementation(function (
+      this: Session,
+      _input: unknown,
+      options?: { readonly resume?: unknown },
+    ) {
+      const session = this;
+      const isResume = options?.resume !== undefined;
+      return (async function* () {
+        if (isResume) {
+          // What the real resumed turn does to history: `syncSessionState`
+          // assigns it from the checkpoint prefix, which this fixture's
+          // checkpoint (`persistedMessageCount: 0`) makes empty.
+          await (
+            session as unknown as {
+              readonly state: {
+                with: (fn: (state: { history?: unknown }) => void) => Promise<void>;
+              };
+            }
+          ).state.with((state) => {
+            state.history = [];
+          });
+          // `turn_resumed` is what releases the runner's start barrier.
+          session.emit({
+            id: session.nextInternalSubId(),
+            msg: {
+              type: "turn_resumed",
+              payload: {
+                turnId: TURN_ID,
+                fromCheckpointSeq: 1,
+                fromIteration: 1,
+              },
+            },
+          } as never);
+          resumeSettled.resolve();
+        }
+        return { reason: "completed" as const };
+      })() as never;
+    });
+
+    let booted: LocalRuntimeBootstrap | undefined;
+    const runner = makeRunner(
+      (bootstrap) => {
+        booted = bootstrap;
+        // Hold the slot from before the resume settles, so the re-apply finds
+        // a newer turn owning the history exactly as a replacing client turn
+        // would.
+        vi.spyOn(bootstrap.session.activeTurn, "unsafePeek").mockReturnValue({
+          turnId: "client-turn-that-replaced-the-resume",
+        } as never);
+      },
+      { durableResumeTimeoutMs: 30_000 },
+    );
+
+    await expect(
+      runner.restoreAgent(restoreParams(recoveredRunState())),
+    ).resolves.toBe(true);
+    const bootstrap = booted!;
+    await resumeSettled.promise;
+
+    // While the newer turn owns the slot the recovered conversation stays
+    // erased — appending it under a live turn would rewrite that turn's
+    // context, and its next `syncSessionState` would overwrite it anyway.
+    await waitUntil(
+      async () => (await sessionHistory(bootstrap)).length > 0,
+      "history to be republished under the live turn",
+      750,
+    ).catch(() => undefined);
+    expect(await sessionHistory(bootstrap)).toEqual([]);
+
+    // The slot frees; the recovered conversation must come back rather than
+    // be dropped for good.
+    vi.mocked(bootstrap.session.activeTurn.unsafePeek).mockReturnValue(null);
+    await waitUntil(
+      async () =>
+        (await sessionHistory(bootstrap)).some(
+          (message) =>
+            message.role === "user" &&
+            message.content === RECOVERED_USER_MESSAGE,
+        ),
+      "the recovered conversation to survive the turn that replaced the resume",
+      10_000,
+    );
+    const history = await sessionHistory(bootstrap);
+    expect(
+      history.some(
+        (message) =>
+          message.role === "tool" && message.toolCallId === REPLAY_CALL_ID,
+      ),
+    ).toBe(true);
+
+    await runner.stopAgent(CONVERSATION_ID).catch(() => undefined);
+  }, 60_000);
+
 
   it("never withholds the resume from a restore that defers startup side effects", async () => {
     // A suspended / startup-activation-pending restore passes
