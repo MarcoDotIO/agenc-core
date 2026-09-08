@@ -2780,11 +2780,14 @@ function createSkillInvocationRuntimeTool(opts: ModelFacingToolOptions): Tool {
     },
     checkPermissions: async (input, context) =>
       checkSkillPermissions(input, context),
+    // Recording the invocation is the tool's only effect, so every refusal
+    // below is made before it. A bare error from a side-effecting tool is
+    // filed as an unknown outcome and gates the whole session (#2190).
     execute: async (args) => {
       const skillName = normalizeSkillName(stringValue(args.skill) ?? "");
-      if (!skillName) return json({ error: "skill is required" }, true);
+      if (!skillName) return refusal({ error: "skill is required" });
       if (isMcpToolName(skillName)) {
-        return json({ error: mcpToolUsedAsSkillMessage(skillName) }, true);
+        return refusal({ error: mcpToolUsedAsSkillMessage(skillName) });
       }
       const sessionOrError = getSessionOrError(opts);
       if (!("conversationId" in sessionOrError)) return sessionOrError;
@@ -2799,10 +2802,9 @@ function createSkillInvocationRuntimeTool(opts: ModelFacingToolOptions): Tool {
         const bundled = await findBundledSkillCommand(skillName);
         if (bundled?.getPromptForCommand !== undefined) {
           if (bundled.disableModelInvocation === true) {
-            return json(
-              { error: `skill is not model-invocable: ${bundled.name}` },
-              true,
-            );
+            return refusal({
+              error: `skill is not model-invocable: ${bundled.name}`,
+            });
           }
           const blocks = await bundled.getPromptForCommand(
             stringValue(args.args) ?? "",
@@ -2825,25 +2827,19 @@ function createSkillInvocationRuntimeTool(opts: ModelFacingToolOptions): Tool {
         const bundledNames = (await listBundledSkillNames()).filter(
           (name) => !(outcome.availableSkills ?? []).some((s) => s.name === name),
         );
-        return json(
-          {
-            error: `skill not found: ${skillName}`,
-            available: [
-              ...(outcome.availableSkills?.map((entry) => entry.name) ?? []),
-              ...bundledNames,
-            ].sort((a, b) => a.localeCompare(b)),
-          },
-          true,
-        );
+        return refusal({
+          error: `skill not found: ${skillName}`,
+          available: [
+            ...(outcome.availableSkills?.map((entry) => entry.name) ?? []),
+            ...bundledNames,
+          ].sort((a, b) => a.localeCompare(b)),
+        });
       }
 
       if (rendered.skill.disableModelInvocation === true) {
-        return json(
-          {
-            error: `skill is not model-invocable: ${rendered.skill.name}`,
-          },
-          true,
-        );
+        return refusal({
+          error: `skill is not model-invocable: ${rendered.skill.name}`,
+        });
       }
 
       const modelVisibleContent = isRepositoryControlledSkillSource(
@@ -4248,8 +4244,9 @@ function createPlanAndMessageTools(
       additionalProperties: false,
     },
     execute: async (args) => {
+      // Refused before the emit, so the refusal must not gate the session.
       const message = stringValue(args.message);
-      if (!message) return json({ error: "message is required" }, true);
+      if (!message) return refusal({ error: "message is required" });
       const session = opts.getSession();
       session?.emit({
         id: session.nextInternalSubId(),
