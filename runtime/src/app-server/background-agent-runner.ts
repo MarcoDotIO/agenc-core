@@ -1343,6 +1343,16 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
             onReplayToolResult: params.onReplayToolResult,
           });
         params.signal?.throwIfAborted();
+        // Whether there is anything to merge back is decided HERE, before any
+        // waiting: `daemon-cli` supplies recovered messages only when the
+        // snapshot carried them, so the ordinary recovered run — no snapshot
+        // conversation, no in-flight tool calls — has nothing to re-apply.
+        // Leaving that test inside the thunk would make such a run wait out
+        // the whole slot poll and then record a lost conversation that never
+        // existed.
+        const hasRecoveredConversation =
+          recoveredInitialMessages.length > 0 ||
+          recoveredReplayedMessages.length > 0;
         // Last: this generation now owns `#active`, the approval bridge, and
         // the canonical event bridge, so a resumed turn that needs approval
         // reaches a client instead of the arbiter default deny.
@@ -1353,11 +1363,13 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           // the recovered conversation hydrated just above. Re-apply it once
           // the turn is over, which is the order that held while the resume
           // ran inside bootstrap.
-          () =>
-            hydrateRecoveredSessionHistory(restoredSession, {
-              initialMessages: recoveredInitialMessages,
-              replayedMessages: recoveredReplayedMessages,
-            }),
+          hasRecoveredConversation
+            ? () =>
+                hydrateRecoveredSessionHistory(restoredSession, {
+                  initialMessages: recoveredInitialMessages,
+                  replayedMessages: recoveredReplayedMessages,
+                })
+            : undefined,
           // Callers that own a restore deadline (the on-demand lifecycle path)
           // release the wait immediately on abort; the daemon-startup path
           // passes none, which is why that wait is also bounded by a timeout.
@@ -4319,11 +4331,13 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
    *
    * `reapplyRecoveredHistory` runs after the resumed turn is over, because the
    * turn republishes `session.state.history` from its checkpoint prefix and
-   * would otherwise leave the daemon-recovered conversation erased.
+   * would otherwise leave the daemon-recovered conversation erased. It is
+   * `undefined` when the recovered run carried no conversation to merge, and
+   * then nothing waits and nothing is reported.
    */
   async #driveDeferredDurableResume(
     active: ActiveBackgroundAgent,
-    reapplyRecoveredHistory: () => Promise<void>,
+    reapplyRecoveredHistory: (() => Promise<void>) | undefined,
     signal: AbortSignal | undefined,
   ): Promise<void> {
     const runDeferredDurableTurnResume =
@@ -4353,6 +4367,9 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         // also decides this: a resume that threw after re-opening the turn
         // overwrote the recovered conversation just the same.
         if (!resumed && !turnWasOpened) return;
+        // No recovered conversation, nothing to wait for: a run with nothing
+        // to merge must not poll the turn slot and must not report a loss.
+        if (reapplyRecoveredHistory === undefined) return;
         await this.#reapplyRecoveredHistory(active, reapplyRecoveredHistory);
       } catch {
         // Nothing here may surface as an unhandled rejection on a live daemon.
@@ -4381,7 +4398,8 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
 
   /**
    * Restore the daemon-recovered conversation the resumed turn republished
-   * over.
+   * over. Only called when there IS one — the caller decides that before any
+   * waiting starts.
    *
    * A newer turn owning the session's turn slot is the hard case: a client
    * message that replaced the resume is the fresher authority, and merging the
@@ -4392,6 +4410,24 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
    * moved after `#hydrateRecoveredAgentState`. So the merge WAITS for the slot
    * instead, bounded by `durableResumeTimeoutMs`; only a slot that never frees
    * within that bound records the drop and gives up.
+   *
+   * Two limitations are accepted here rather than claimed away, and both are
+   * pinned by tests:
+   *
+   * 1. What the merge restores depends on what the replacing turn left behind.
+   *    Onto an EMPTY history it restores the whole recovered conversation;
+   *    onto a history that turn has already published, it appends only the
+   *    re-dispatched tool results, at the tail, and does NOT reintroduce
+   *    `initialMessages` ahead of a conversation that has moved on. Base never
+   *    faced that ordering because it merged before any client turn could
+   *    exist. Reordering a newer turn's own conversation to make room for the
+   *    recovered prefix would be the larger harm.
+   * 2. The bound is `durableResumeTimeoutMs`, a daemon-startup deadline;
+   *    nothing derives it from how long a client turn may run, so a replacing
+   *    turn that outlives it gives the merge up and records
+   *    `recovered_history_reapply_abandoned`. The alternative is a background
+   *    poll with no end on a session that may never free the slot. Losing the
+   *    merge is therefore possible, but never silent.
    *
    * The slot read and the merge are not one atomic step. The merge is
    * idempotent (`hydrateRecoveredSessionHistory` skips messages already in

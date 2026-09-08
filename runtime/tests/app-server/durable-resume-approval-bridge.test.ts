@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AgenCDelegateBackgroundAgentRunner } from "../../src/app-server/background-agent-runner.js";
 import type { AgenCDelegateBackgroundAgentRunnerOptions } from "../../src/app-server/background-agent-runner/shared.js";
+import { DAEMON_AGENT_CREATE_TIMEOUT_MS } from "../../src/app-server/operation-deadline.js";
 import {
   bootstrapLocalRuntimeSession,
   type LocalRuntimeBootstrap,
@@ -961,6 +962,418 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
     expect(decisions).toEqual([
       { mode: "unattended", glob: "allow", exec: "deny", edit: "pause" },
     ]);
+
+    await runner.stopAgent(CONVERSATION_ID).catch(() => undefined);
+  }, 60_000);
+
+  /**
+   * Replace the resumed turn with the two effects the runner reacts to: the
+   * `syncSessionState` republication that erases the daemon-recovered
+   * conversation (this fixture's checkpoint has `persistedMessageCount: 0`, so
+   * the prefix is empty), and the `turn_resumed` event that releases the start
+   * barrier. `settled` resolves once both have happened.
+   */
+  function stubResumedTurn(
+    opts: { readonly throwAfterStart?: boolean } = {},
+  ): { readonly settled: Promise<void> } {
+    const settled = Promise.withResolvers<void>();
+    vi.spyOn(Session.prototype, "runTurn").mockImplementation(function (
+      this: Session,
+      _input: unknown,
+      options?: { readonly resume?: unknown },
+    ) {
+      const session = this;
+      const isResume = options?.resume !== undefined;
+      return (async function* () {
+        if (isResume) {
+          await (
+            session as unknown as {
+              readonly state: {
+                with: (fn: (state: { history?: unknown }) => void) => Promise<void>;
+              };
+            }
+          ).state.with((state) => {
+            state.history = [];
+          });
+          session.emit({
+            id: session.nextInternalSubId(),
+            msg: {
+              type: "turn_resumed",
+              payload: {
+                turnId: TURN_ID,
+                fromCheckpointSeq: 1,
+                fromIteration: 1,
+              },
+            },
+          } as never);
+          settled.resolve();
+          if (opts.throwAfterStart === true) {
+            throw new Error("resume failed after re-opening the turn");
+          }
+        }
+        return { reason: "completed" as const };
+      })() as never;
+    });
+    return { settled: settled.promise };
+  }
+
+  /** Stall the resume before any `turn_resumed` reaches the event log. */
+  function stubStalledResume(): {
+    readonly entered: () => boolean;
+    readonly release: () => void;
+  } {
+    const stalled = Promise.withResolvers<void>();
+    let entered = false;
+    vi.spyOn(Session.prototype, "runTurn").mockImplementation(function (
+      _input: unknown,
+      options?: { readonly resume?: unknown },
+    ) {
+      const isResume = options?.resume !== undefined;
+      return (async function* () {
+        if (isResume) {
+          entered = true;
+          await stalled.promise;
+        }
+        return { reason: "completed" as const };
+      })() as never;
+    });
+    return { entered: () => entered, release: () => stalled.resolve() };
+  }
+
+  /**
+   * Observe the timers the runner installs. Both waits under test are timers:
+   * the start wait is one `setTimeout(durableResumeTimeoutMs)` and the slot
+   * poll is a run of `setTimeout(RECOVERED_HISTORY_SLOT_POLL_MS)` sleeps, so a
+   * poll that never starts and a bound that changed are both directly visible
+   * here instead of being asserted in prose.
+   */
+  function spyOnTimers(
+    onSet: (ms: number, timer: object) => void,
+    onClear?: (timer: object) => void,
+  ): void {
+    const realSetTimeout = globalThis.setTimeout as unknown as (
+      ...args: readonly unknown[]
+    ) => object;
+    const realClearTimeout = globalThis.clearTimeout as unknown as (
+      timer: unknown,
+    ) => void;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      ...args: readonly unknown[]
+    ) => {
+      const timer = realSetTimeout(...args);
+      const ms = args[1];
+      if (typeof ms === "number") onSet(ms, timer);
+      return timer;
+    }) as never);
+    if (onClear === undefined) return;
+    vi.spyOn(globalThis, "clearTimeout").mockImplementation(((
+      timer: unknown,
+    ) => {
+      if (typeof timer === "object" && timer !== null) onClear(timer);
+      realClearTimeout(timer);
+    }) as never);
+  }
+
+  /** The delay `#reapplyRecoveredHistory` sleeps between slot re-checks. */
+  const SLOT_POLL_MS = 25;
+
+  /** Hold the session's turn slot the way a replacing client turn would. */
+  function holdTurnSlot(bootstrap: LocalRuntimeBootstrap): void {
+    vi.spyOn(bootstrap.session.activeTurn, "unsafePeek").mockReturnValue({
+      turnId: "client-turn-that-replaced-the-resume",
+    } as never);
+  }
+
+  function releaseTurnSlot(bootstrap: LocalRuntimeBootstrap): void {
+    vi.mocked(bootstrap.session.activeTurn.unsafePeek).mockReturnValue(null);
+  }
+
+  function setSessionHistory(
+    bootstrap: LocalRuntimeBootstrap,
+    history: ReadonlyArray<Record<string, unknown>>,
+  ): Promise<void> {
+    return (
+      bootstrap.session as unknown as {
+        readonly state: {
+          with: (fn: (state: { history?: unknown }) => void) => Promise<void>;
+        };
+      }
+    ).state.with((state) => {
+      state.history = history.map((message) => ({ ...message }));
+    });
+  }
+
+  it("neither polls nor warns when the recovered run has nothing to merge", async () => {
+    // The emptiness test lives inside the merge thunk
+    // (`hydrateRecoveredSessionHistory` returns immediately for an empty
+    // recovered conversation), and `daemon-cli` only supplies recovered
+    // messages when the snapshot HAS them. So the ordinary recovered run — no
+    // snapshot conversation, no in-flight tool calls — must not spend the
+    // whole `durableResumeTimeoutMs` polling a slot it has nothing to write,
+    // and must not then tell the operator that a conversation nobody had was
+    // lost. The decision has to be made BEFORE the wait.
+    await stubProvider();
+    stubProviderAndMcp();
+
+    const warnings = recordEmittedWarnings();
+    let pollSleeps = 0;
+    spyOnTimers((ms) => {
+      if (ms === SLOT_POLL_MS) pollSleeps += 1;
+    });
+    const resumed = stubResumedTurn();
+
+    const runner = makeRunner(
+      (bootstrap) => {
+        // A newer client turn owns the slot for the rest of the test: if the
+        // wait ran at all, it would run to its deadline.
+        holdTurnSlot(bootstrap);
+      },
+      { durableResumeTimeoutMs: 300 },
+    );
+
+    // No `initialMessages`, no `replayToolCalls`: nothing to merge back.
+    await expect(runner.restoreAgent(restoreParams())).resolves.toBe(true);
+    await resumed.settled;
+
+    const sleepsBeforeWindow = pollSleeps;
+    // Five times the bound: a poll that started would have run out and
+    // recorded its warning well inside this window.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+
+    expect(
+      warnings.filter(
+        (warning) => warning.cause === "recovered_history_reapply_abandoned",
+      ),
+    ).toEqual([]);
+    expect(pollSleeps - sleepsBeforeWindow).toBe(0);
+
+    await runner.stopAgent(CONVERSATION_ID).catch(() => undefined);
+  }, 60_000);
+
+  it("bounds the production start wait by the startup-prewarm deadline it replaced", async () => {
+    // The commit's safety property is that the deferred resume never blocks
+    // the restore for longer than the inline resume it replaced, which ran
+    // inside `DaemonOperationScope("session startup prewarm",
+    // DAEMON_AGENT_CREATE_TIMEOUT_MS)`. Tests that inject their own bound
+    // cannot see that, so this one takes the PRODUCTION default and reads the
+    // timer the runner actually installs: while the resume is stalled before
+    // `turn_resumed`, the start wait is the only long timer still pending
+    // (the prewarm scope disposes its own when bootstrap returns).
+    await stubProvider();
+    stubProviderAndMcp();
+
+    const pendingLongTimers = new Map<object, number>();
+    spyOnTimers(
+      (ms, timer) => {
+        if (ms >= 100_000) pendingLongTimers.set(timer, ms);
+      },
+      (timer) => {
+        pendingLongTimers.delete(timer);
+      },
+    );
+    const stalled = stubStalledResume();
+
+    const runner = makeRunner();
+    const restore = runner.restoreAgent(restoreParams());
+    await waitUntil(
+      () => stalled.entered() && pendingLongTimers.size > 0,
+      "the start wait to be installed with the production default",
+    );
+    expect([...pendingLongTimers.values()]).toEqual([
+      DAEMON_AGENT_CREATE_TIMEOUT_MS,
+    ]);
+
+    stalled.release();
+    await expect(restore).resolves.toBe(true);
+    await runner.stopAgent(CONVERSATION_ID).catch(() => undefined);
+  }, 60_000);
+
+  it("records the abandoned merge when a newer turn never releases the slot", async () => {
+    // The other end of the wait: recovered content DOES exist, and the turn
+    // that replaced the resume outlives the bound. The merge is given up, and
+    // that loss is recorded rather than silent — the operator and the next
+    // client to attach both see which agent lost its recovered conversation.
+    await stubProvider();
+    stubProviderAndMcp();
+
+    const warnings = recordEmittedWarnings();
+    const resumed = stubResumedTurn();
+    let booted: LocalRuntimeBootstrap | undefined;
+    const runner = makeRunner(
+      (bootstrap) => {
+        booted = bootstrap;
+        holdTurnSlot(bootstrap);
+      },
+      { durableResumeTimeoutMs: 400 },
+    );
+
+    await expect(
+      runner.restoreAgent(restoreParams(recoveredRunState())),
+    ).resolves.toBe(true);
+    await resumed.settled;
+
+    await waitUntil(
+      () =>
+        warnings.some(
+          (warning) => warning.cause === "recovered_history_reapply_abandoned",
+        ),
+      "the abandoned merge to be recorded",
+      10_000,
+    );
+    const abandoned = warnings.filter(
+      (warning) => warning.cause === "recovered_history_reapply_abandoned",
+    );
+    expect(abandoned).toHaveLength(1);
+    expect(abandoned[0]!.message).toContain("400ms");
+    // The warning is not decorative: the recovered conversation really is gone
+    // from the session it was hydrated onto.
+    expect(await sessionHistory(booted!)).toEqual([]);
+
+    await runner.stopAgent(CONVERSATION_ID).catch(() => undefined);
+  }, 60_000);
+
+  it("re-applies the recovered conversation when the resume throws after re-opening the turn", async () => {
+    // `runDeferredDurableTurnResume` swallows the failure and reports
+    // `resumed: false`, but the turn had already re-opened and already
+    // republished `session.state.history` from its checkpoint prefix. Keying
+    // the re-apply off the attempt outcome alone would leave the recovered
+    // conversation erased for exactly the runs that failed.
+    await stubProvider();
+    stubProviderAndMcp();
+
+    const resumed = stubResumedTurn({ throwAfterStart: true });
+    let booted: LocalRuntimeBootstrap | undefined;
+    const runner = makeRunner(
+      (bootstrap) => {
+        booted = bootstrap;
+      },
+      { durableResumeTimeoutMs: 30_000 },
+    );
+
+    await expect(
+      runner.restoreAgent(restoreParams(recoveredRunState())),
+    ).resolves.toBe(true);
+    await resumed.settled;
+
+    await waitUntil(
+      async () =>
+        (await sessionHistory(booted!)).some(
+          (message) =>
+            message.role === "user" &&
+            message.content === RECOVERED_USER_MESSAGE,
+        ),
+      "the recovered conversation to survive a resume that threw after starting",
+      10_000,
+    );
+    expect(
+      (await sessionHistory(booted!)).some(
+        (message) =>
+          message.role === "tool" && message.toolCallId === REPLAY_CALL_ID,
+      ),
+    ).toBe(true);
+
+    await runner.stopAgent(CONVERSATION_ID).catch(() => undefined);
+  }, 60_000);
+
+  it("releases the start wait as soon as the caller's restore is aborted", async () => {
+    // The daemon-startup path passes no signal, which is why the timeout
+    // exists — but the on-demand lifecycle path (agent-lifecycle.ts, an
+    // `agent.create` resume waiter) owns its own deadline and DOES pass one.
+    // Its cancellation must release this wait immediately instead of waiting
+    // out a bound that belongs to daemon startup.
+    await stubProvider();
+    stubProviderAndMcp();
+
+    const stalled = stubStalledResume();
+    const controller = new AbortController();
+    const runner = makeRunner(undefined, {
+      durableResumeTimeoutMs: 30_000,
+      agentStopTimeoutMs: 2_000,
+    });
+    const restore = runner.restoreAgent(
+      restoreParams({ signal: controller.signal }),
+    );
+    const settled = restore.then(
+      () => "the restore resolved",
+      () => "the restore rejected",
+    );
+
+    await waitUntil(
+      () => stalled.entered(),
+      "the recovered turn to reach its stall",
+    );
+    const abortedAt = Date.now();
+    controller.abort(new Error("the caller cancelled the restore"));
+    const outcome = await Promise.race([
+      settled,
+      new Promise<string>((resolve) =>
+        setTimeout(
+          () => resolve("the restore was still waiting out its own timeout"),
+          10_000,
+        ),
+      ),
+    ]);
+    expect(outcome).toBe("the restore rejected");
+    expect(Date.now() - abortedAt).toBeLessThan(10_000);
+
+    stalled.release();
+    await runner.stopAgent(CONVERSATION_ID).catch(() => undefined);
+  }, 60_000);
+
+  it("appends only the replayed tool results when the replacing turn already published its own conversation", async () => {
+    // The realistic shape of a replaced resume, asserted rather than
+    // described: by the time the slot frees, the client turn that replaced the
+    // resume has published its OWN conversation. The merge then appends the
+    // re-dispatched tool results at the tail and does NOT reintroduce the
+    // recovered `initialMessages` ahead of a conversation that has moved on.
+    // That is a real ordering change from base (which merged before any client
+    // turn could exist) and it is the accepted trade the doc comment states.
+    await stubProvider();
+    stubProviderAndMcp();
+
+    const resumed = stubResumedTurn();
+    let booted: LocalRuntimeBootstrap | undefined;
+    const runner = makeRunner(
+      (bootstrap) => {
+        booted = bootstrap;
+        holdTurnSlot(bootstrap);
+      },
+      { durableResumeTimeoutMs: 30_000 },
+    );
+
+    await expect(
+      runner.restoreAgent(restoreParams(recoveredRunState())),
+    ).resolves.toBe(true);
+    const bootstrap = booted!;
+    await resumed.settled;
+
+    // What the replacing turn does that the busy-slot test never modelled: it
+    // publishes its own history before it releases the slot.
+    await setSessionHistory(bootstrap, [
+      { role: "user", content: "NEWER CLIENT MESSAGE" },
+      { role: "assistant", content: "the newer turn's answer" },
+    ]);
+    releaseTurnSlot(bootstrap);
+
+    await waitUntil(
+      async () => (await sessionHistory(bootstrap)).length > 2,
+      "the recovered tool results to be merged onto the newer conversation",
+      10_000,
+    );
+    const history = await sessionHistory(bootstrap);
+    expect(history.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "assistant",
+      "tool",
+    ]);
+    expect(history[0]!.content).toBe("NEWER CLIENT MESSAGE");
+    expect(history.at(-1)!.toolCallId).toBe(REPLAY_CALL_ID);
+    // Accepted limitation, pinned so it cannot drift into a claim: the
+    // recovered user message is NOT restored ahead of the newer conversation.
+    expect(
+      history.some((message) => message.content === RECOVERED_USER_MESSAGE),
+    ).toBe(false);
 
     await runner.stopAgent(CONVERSATION_ID).catch(() => undefined);
   }, 60_000);
