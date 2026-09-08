@@ -1,41 +1,25 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { RolloutStore } from "../../src/session/rollout-store.js";
+import { bindTemporaryAgencHome } from "../helpers/canonical-rollout-scan.js";
 
 // #2229: the scanner keeps the prefix it validated so bookkeeping stops
 // replaying the whole rollout. That moves cost into resident memory, so what
 // a scanner holds between scans has to stay small next to the session it
 // scans rather than growing with it.
 
-let temporaryHome = "";
-let previousHome: string | undefined;
-let temporaryWorkspace = "";
-
-beforeEach(() => {
-  temporaryHome = mkdtempSync(join(tmpdir(), "agenc-c2-retain-home-"));
-  temporaryWorkspace = mkdtempSync(join(tmpdir(), "agenc-c2-retain-work-"));
-  previousHome = process.env.AGENC_HOME;
-  process.env.AGENC_HOME = temporaryHome;
-});
-
-afterEach(() => {
-  if (previousHome === undefined) delete process.env.AGENC_HOME;
-  else process.env.AGENC_HOME = previousHome;
-  rmSync(temporaryHome, { recursive: true, force: true });
-  rmSync(temporaryWorkspace, { recursive: true, force: true });
-});
+const temporary = bindTemporaryAgencHome("agenc-c2-retain");
 
 describe("canonical rollout scanner retention", () => {
   it("does not hold a session-sized copy of the history between scans", () => {
     const rolloutPath = writeLargeRollout("retention-heap");
     const rolloutBytes = statSync(rolloutPath).size;
     expect(rolloutBytes).toBeGreaterThan(4 * 1_024 * 1_024);
-    const sessionTempRoot = join(temporaryHome, "retention-scan-temp");
+    const sessionTempRoot = join(temporary.home, "retention-scan-temp");
     mkdirSync(sessionTempRoot, { recursive: true });
 
     const evidence = measureRetainedHeap(rolloutPath, sessionTempRoot);
@@ -50,16 +34,16 @@ describe("canonical rollout scanner retention", () => {
 
 function writeLargeRollout(sessionId: string): string {
   const store = new RolloutStore({
-    cwd: temporaryWorkspace,
+    cwd: temporary.workspace,
     sessionId,
     agencVersion: "0.13.0",
-    sessionTempRoot: join(temporaryHome, "rollout-temp"),
+    sessionTempRoot: join(temporary.home, "rollout-temp"),
     autoStartScheduler: false,
   });
   store.open({
     sessionId,
     timestamp: new Date().toISOString(),
-    cwd: temporaryWorkspace,
+    cwd: temporary.workspace,
     originator: "canonical-scanner-retention-test",
     agencVersion: "0.13.0",
   });

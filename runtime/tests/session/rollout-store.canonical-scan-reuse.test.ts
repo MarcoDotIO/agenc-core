@@ -32,10 +32,9 @@ import {
   COMPACTION_SOURCE_DIGEST_DOMAIN,
   type CompactionPreparedSourceV1,
 } from "../../src/services/compact/transaction-types.js";
-import { compactConversationTransactionally } from "../../src/services/compact/transaction.js";
 import { scanCanonicalRollout } from "../../src/session/canonical-rollout-scanner.js";
 import { RolloutStore } from "../../src/session/rollout-store.js";
-import { bindCompactionTransactionHarness } from "../helpers/compaction-transaction-harness.js";
+import { commitWholeHistoryCompaction } from "../helpers/canonical-rollout-scan.js";
 
 let temporaryHome = "";
 let previousHome: string | undefined;
@@ -199,33 +198,11 @@ async function commitWholeHistory(
   store: RolloutStore,
   attemptId: string,
 ): Promise<void> {
-  const prepared = store.prepareSource(attemptId, []);
-  const harness = bindCompactionTransactionHarness(store, {
+  await commitWholeHistoryCompaction(store, {
+    attemptId,
+    customInstructions: "canonical scan reuse",
     contextWindowTokens: 2_000_000,
-    maxOutputTokens: 512,
   });
-  try {
-    const result = await compactConversationTransactionally(harness.context, {
-      customInstructions: "canonical scan reuse",
-      automatic: false,
-      messagesToKeep: [],
-      completeSourceMessages: prepared.messages,
-      messagesToSummarize: prepared.messages,
-      summaryPlacement: "before_keep",
-      createBoundaryMarker: () => ({
-        role: "user",
-        originalRole: "developer",
-        content: "compaction boundary",
-      }),
-      createSummaryMessage: (content) => ({ role: "user", content }),
-    });
-    if (result.transaction === undefined) {
-      throw new Error("compaction did not commit a transaction");
-    }
-  } finally {
-    harness.close();
-    store.flushDurable();
-  }
 }
 
 function appendRows(store: RolloutStore, rows: number, fill: number): void {

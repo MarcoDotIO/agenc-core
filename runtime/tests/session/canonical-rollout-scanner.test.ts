@@ -22,6 +22,7 @@ import {
   type CanonicalRolloutScan,
 } from "../../src/session/canonical-rollout-scanner.js";
 import { RolloutStore } from "../../src/session/rollout-store.js";
+import { commitWholeHistoryCompaction } from "../helpers/canonical-rollout-scan.js";
 import { bindCompactionTransactionHarness } from "../helpers/compaction-transaction-harness.js";
 
 let temporaryHome = "";
@@ -243,34 +244,11 @@ describe("canonical rollout compaction scanner", () => {
       // lifecycle below reaches it as an appended tail.
       scanner.scan(rolloutPath, options);
 
-      const prepared = store.prepareSource("agreement-attempt", []);
-      const harness = bindCompactionTransactionHarness(store, {
-        contextWindowTokens: 64_000,
-        maxOutputTokens: 512,
+      const committed = await commitWholeHistoryCompaction(store, {
+        attemptId: "agreement-attempt",
+        customInstructions: "prefix reuse agreement",
       });
-      try {
-        const result = await compactConversationTransactionally(
-          harness.context,
-          {
-            customInstructions: "prefix reuse agreement",
-            automatic: false,
-            messagesToKeep: [],
-            completeSourceMessages: prepared.messages,
-            messagesToSummarize: prepared.messages,
-            summaryPlacement: "before_keep",
-            createBoundaryMarker: () => ({
-              role: "user",
-              originalRole: "developer",
-              content: "compaction boundary",
-            }),
-            createSummaryMessage: (content) => ({ role: "user", content }),
-          },
-        );
-        expect(result.transaction).toBeDefined();
-      } finally {
-        harness.close();
-      }
-      store.flushDurable();
+      expect(committed).toBeDefined();
 
       const warm = scanner.scan(rolloutPath, options);
       const cold = scanCanonicalRollout(rolloutPath, options);
@@ -527,16 +505,8 @@ describe("canonical rollout compaction scanner", () => {
   });
 
   it("re-validates a rollout replaced at the same path", () => {
-    const store = createStore("prefix-inode-replaced");
-    const rolloutPath = store.rolloutPath;
-    const scanner = new CanonicalRolloutScanner();
-    const options = {
-      sessionTempRoot: join(temporaryHome, "scan-temp"),
-      expectedRunId: "prefix-inode-replaced",
-      expectedEpoch: 1,
-      maximumScanMilliseconds: 30_000,
-      compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
-    } as const;
+    const { store, scanner, options, rolloutPath } =
+      bindPrefixScanner("prefix-inode-replaced");
     try {
       appendMarkedRows(store, 40);
       const before = scanner.scan(rolloutPath, options);
@@ -556,16 +526,8 @@ describe("canonical rollout compaction scanner", () => {
   });
 
   it("re-validates a rollout truncated under it", () => {
-    const store = createStore("prefix-truncated");
-    const rolloutPath = store.rolloutPath;
-    const scanner = new CanonicalRolloutScanner();
-    const options = {
-      sessionTempRoot: join(temporaryHome, "scan-temp"),
-      expectedRunId: "prefix-truncated",
-      expectedEpoch: 1,
-      maximumScanMilliseconds: 30_000,
-      compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
-    } as const;
+    const { store, scanner, options, rolloutPath } =
+      bindPrefixScanner("prefix-truncated");
     try {
       appendMarkedRows(store, 40);
       const before = scanner.scan(rolloutPath, options);
@@ -636,35 +598,11 @@ function appendLargeHistory(store: RolloutStore, rows: number): void {
 }
 
 async function commitWholeHistory(store: RolloutStore, attemptId: string) {
-  const prepared = store.prepareSource(attemptId, []);
-  const harness = bindCompactionTransactionHarness(store, {
+  return commitWholeHistoryCompaction(store, {
+    attemptId,
+    customInstructions: "retention ceiling",
     contextWindowTokens: 2_000_000,
-    maxOutputTokens: 512,
   });
-  try {
-    const result = await compactConversationTransactionally(harness.context, {
-      customInstructions: "retention ceiling",
-      automatic: false,
-      messagesToKeep: [],
-      completeSourceMessages: prepared.messages,
-      messagesToSummarize: prepared.messages,
-      summaryPlacement: "before_keep",
-      createBoundaryMarker: () => ({
-        role: "user",
-        originalRole: "developer",
-        content: "compaction boundary",
-      }),
-      createSummaryMessage: (content) => ({ role: "user", content }),
-    });
-    const transaction = result.transaction;
-    if (transaction === undefined) {
-      throw new Error("compaction did not commit a transaction");
-    }
-    return transaction;
-  } finally {
-    harness.close();
-    store.flushDurable();
-  }
 }
 
 /** What the scan's lifecycle rows reconstructed and are still holding. */
@@ -675,6 +613,28 @@ function retainedPayloadBytes(scan: CanonicalRolloutScan): number {
       (total, record) => total + JSON.stringify(record.item.payload).length,
       0,
     );
+}
+
+/**
+ * A store, a scanner, and the scan options that name that store's rollout.
+ *
+ * Each caller still opens its own `try`/`finally` around what it does with
+ * them, so what is shared here is only how the three come to exist.
+ */
+function bindPrefixScanner(sessionId: string) {
+  const store = createStore(sessionId);
+  return {
+    store,
+    rolloutPath: store.rolloutPath,
+    scanner: new CanonicalRolloutScanner(),
+    options: {
+      sessionTempRoot: join(temporaryHome, "scan-temp"),
+      expectedRunId: sessionId,
+      expectedEpoch: 1,
+      maximumScanMilliseconds: 30_000,
+      compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
+    } as const,
+  };
 }
 
 /** Fixed-width markers so a record can be rewritten without resizing it. */

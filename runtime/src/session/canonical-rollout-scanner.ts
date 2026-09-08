@@ -640,9 +640,15 @@ function prefixFingerprint(options: CanonicalRolloutScanOptions): string {
     terminalPolicy: options.terminalPolicy ?? null,
     compactionSourceDigestDomain: options.compactionSourceDigestDomain,
     captureActiveHistory: options.captureActiveHistory === true,
+    /*
+     * Code-unit order, not `localeCompare`: this string keys a cache whose
+     * entries must match across machines, and locale-aware collation is not
+     * stable between them. A bare `.sort()` would do the same thing, but only
+     * by accident of these being strings.
+     */
     captureHistoryAtAttemptIds: [
       ...new Set(options.captureHistoryAtAttemptIds ?? []),
-    ].sort(),
+    ].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)),
   });
 }
 
