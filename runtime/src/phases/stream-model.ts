@@ -73,8 +73,21 @@ import {
   getInitialEffortSetting,
 } from "../utils/effort.js";
 import type { ReasoningEffort } from "../session/turn-context.js";
+import { resolveGeminiReasoningEffort } from "../llm/registry/gemini-thinking-models.js";
 
 type WireReasoningEffort = NonNullable<LLMChatOptions["reasoningEffort"]>;
+
+function resolveGeminiSessionReasoningEffort(
+  turnEffort: ReasoningEffort | undefined,
+  model: string,
+  effortSource: string | undefined,
+): WireReasoningEffort | undefined {
+  if (turnEffort !== undefined) return resolveGeminiReasoningEffort(model, turnEffort);
+  const configuredEffort = effortSource === "default"
+    ? undefined
+    : getInitialEffortSetting();
+  return resolveGeminiReasoningEffort(model, configuredEffort);
+}
 
 /**
  * Sessions created without an explicit reasoning effort — every
@@ -94,7 +107,19 @@ type WireReasoningEffort = NonNullable<LLMChatOptions["reasoningEffort"]>;
 function resolveSessionReasoningEffort(
   turnEffort: ReasoningEffort | undefined,
   supportedReasoningLevels?: ReadonlyArray<ReasoningEffort>,
+  selection?: {
+    readonly provider: string;
+    readonly model: string;
+    readonly effortSource?: string;
+  },
 ): WireReasoningEffort | undefined {
+  if (selection?.provider === "gemini") {
+    return resolveGeminiSessionReasoningEffort(
+      turnEffort,
+      selection.model,
+      selection.effortSource,
+    );
+  }
   let requested: ReasoningEffort | undefined;
   if (turnEffort === undefined) {
     requested = getInitialEffortSetting();
@@ -330,6 +355,12 @@ function buildProviderOptions(
     reasoningEffort: resolveSessionReasoningEffort(
       ctx.reasoningEffort,
       ctx.modelInfo.supportedReasoningLevels,
+      {
+        provider: session.services.provider.name,
+        model: session.config?.model ?? ctx.modelInfo.slug,
+        effortSource: session.services.configStore
+          ?.provenance?.("reasoning_effort")?.scope,
+      },
     ),
     reasoningSummary: ctx.reasoningSummary,
     modelVerbosity: ctx.modelVerbosity,
