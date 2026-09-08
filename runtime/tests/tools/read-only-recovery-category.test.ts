@@ -8,19 +8,12 @@ import {
   createModelFacingTools,
   __setLiveWebFetchDnsAllLookupForTests,
 } from "../../src/bin/model-facing-tools.js";
-import type {
-  AdmissionAcquireInput,
-  ExecutionAdmissionClient,
-} from "../../src/budget/admission-client.js";
-import type { AdmissionLease } from "../../src/budget/admission-types.js";
 import { runAdmittedToolCall } from "../../src/budget/admitted-tool-call.js";
 import type { ToolEvaluatorContext } from "../../src/permissions/evaluator.js";
-import { PermissionModeRegistry } from "../../src/permissions/permission-mode.js";
 import { createEmptyToolPermissionContext } from "../../src/permissions/types.js";
-import { EventLog, type Event } from "../../src/session/event-log.js";
-import type { Session } from "../../src/session/session.js";
 import { buildToolRegistry, type ToolRegistry } from "../../src/tool-registry.js";
 import type { Tool } from "../../src/tools/types.js";
+import { bindAdmittedToolHarness } from "../helpers/admitted-tool-harness.js";
 
 const READ_ONLY_TOOLS = ["web_fetch", "WebSearch", "XSearch", "Sleep"] as const;
 const READ_ONLY_EFFECT_EXCEPTIONS: Readonly<Record<string, string>> = {
@@ -63,54 +56,11 @@ function registeredTool(name: string): Tool {
 }
 
 function admissionHarness(toolPermissionContext = createEmptyToolPermissionContext()) {
-  const events: Event[] = [];
-  const eventLog = new EventLog();
-  eventLog.subscribe((event) => events.push(event));
-  const acquire = vi.fn(async (input: AdmissionAcquireInput): Promise<AdmissionLease> => ({
-    decision: "allow",
-    reservation: {
-      reservationId: input.stepId,
-      step: { runId: "run-web-recovery", stepId: input.stepId },
-      reservedCostUsd: input.maxCostUsd ?? 0,
-      reservedTokens: input.maxInputTokens + input.maxOutputTokens,
-      reservedAt: "2026-09-07T00:00:00.000Z",
-    },
-    request: {
-      step: { runId: "run-web-recovery", stepId: input.stepId },
-      kind: input.kind,
-      estimate: {
-        maxInputTokens: input.maxInputTokens,
-        maxOutputTokens: input.maxOutputTokens,
-        maxCostUsd: input.maxCostUsd,
-      },
-      workspaceId: workspaceRoot,
-      sessionId: "session-web-recovery",
-      parentScopeId: "turn-web-recovery",
-      autonomous: false,
-    },
-    signal: new AbortController().signal,
-  }));
-  const admission = {
-    scope: { runId: "run-web-recovery" },
-    acquire,
-    markDispatched: vi.fn(),
-    reconcile: vi.fn(() => ({ applied: true, outcome: "reconciled" })),
-    holdUnknown: vi.fn(),
-    void: vi.fn(),
-    acknowledgeCompletion: vi.fn(),
-  } as unknown as ExecutionAdmissionClient;
-  const session = {
-    conversationId: "session-web-recovery",
-    eventLog,
-    emit: (event: Event) => eventLog.emit(event),
-    rolloutStore: { assertToolAdmissionAllowed: vi.fn() },
-    services: {
-      executionAdmission: admission,
-      admissionRequired: true,
-      permissionModeRegistry: new PermissionModeRegistry(toolPermissionContext),
-    },
-  } as unknown as Session;
-  return { session, events, acquire };
+  return bindAdmittedToolHarness({
+    workspaceRoot,
+    label: "web-recovery",
+    toolPermissionContext,
+  });
 }
 
 describe("production read-only tool recovery", () => {

@@ -5,19 +5,12 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createModelFacingTools } from "../../src/bin/model-facing-tools.js";
-import type {
-  AdmissionAcquireInput,
-  ExecutionAdmissionClient,
-} from "../../src/budget/admission-client.js";
-import type { AdmissionLease } from "../../src/budget/admission-types.js";
 import { runAdmittedToolCall } from "../../src/budget/admitted-tool-call.js";
 import { LiveEffectMutationBlockedError } from "../../src/budget/effect-settlement-supervisor.js";
-import { PermissionModeRegistry } from "../../src/permissions/permission-mode.js";
-import { createEmptyToolPermissionContext } from "../../src/permissions/types.js";
-import { EventLog, type Event } from "../../src/session/event-log.js";
 import type { Session } from "../../src/session/session.js";
 import { buildToolRegistry, type ToolRegistry } from "../../src/tool-registry.js";
 import type { Tool } from "../../src/tools/types.js";
+import { bindAdmittedToolHarness } from "../helpers/admitted-tool-harness.js";
 
 /**
  * #2190. `Skill` and `SendUserMessage` read as read-only in their metadata and
@@ -57,59 +50,6 @@ function registeredTool(name: string): Tool {
   return tool;
 }
 
-function admissionHarness(): { readonly session: Session; readonly events: Event[] } {
-  const events: Event[] = [];
-  const eventLog = new EventLog();
-  eventLog.subscribe((event) => events.push(event));
-  const acquire = vi.fn(async (input: AdmissionAcquireInput): Promise<AdmissionLease> => ({
-    decision: "allow",
-    reservation: {
-      reservationId: input.stepId,
-      step: { runId: "run-refusal-gate", stepId: input.stepId },
-      reservedCostUsd: input.maxCostUsd ?? 0,
-      reservedTokens: input.maxInputTokens + input.maxOutputTokens,
-      reservedAt: "2026-09-08T00:00:00.000Z",
-    },
-    request: {
-      step: { runId: "run-refusal-gate", stepId: input.stepId },
-      kind: input.kind,
-      estimate: {
-        maxInputTokens: input.maxInputTokens,
-        maxOutputTokens: input.maxOutputTokens,
-        maxCostUsd: input.maxCostUsd,
-      },
-      workspaceId: workspaceRoot,
-      sessionId: "session-refusal-gate",
-      parentScopeId: "turn-refusal-gate",
-      autonomous: false,
-    },
-    signal: new AbortController().signal,
-  }));
-  const admission = {
-    scope: { runId: "run-refusal-gate" },
-    acquire,
-    markDispatched: vi.fn(),
-    reconcile: vi.fn(() => ({ applied: true, outcome: "reconciled" })),
-    holdUnknown: vi.fn(),
-    void: vi.fn(),
-    acknowledgeCompletion: vi.fn(),
-  } as unknown as ExecutionAdmissionClient;
-  const session = {
-    conversationId: "session-refusal-gate",
-    eventLog,
-    emit: (event: Event) => eventLog.emit(event),
-    rolloutStore: { assertToolAdmissionAllowed: vi.fn() },
-    services: {
-      executionAdmission: admission,
-      admissionRequired: true,
-      permissionModeRegistry: new PermissionModeRegistry(
-        createEmptyToolPermissionContext(),
-      ),
-    },
-  } as unknown as Session;
-  return { session, events };
-}
-
 /** Dispatch the way the executor does: cross the boundary, then execute. */
 async function admitted(
   session: Session,
@@ -135,7 +75,10 @@ describe.each([
   { tool: "SendUserMessage", args: {} },
 ])("a refused $tool leaves the session able to mutate", ({ tool, args }) => {
   it("files no unknown effect and does not block the next write", async () => {
-    const { session, events } = admissionHarness();
+    const { session, events } = bindAdmittedToolHarness({
+      workspaceRoot,
+      label: "refusal-gate",
+    });
 
     const refused = await admitted(session, "refused-call", registeredTool(tool), args);
     expect(refused.isError).toBe(true);
