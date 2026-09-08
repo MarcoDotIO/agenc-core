@@ -1004,17 +1004,28 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
               }
             : {}),
           deferSessionStartHooks: true,
-          // A daemon restore is exactly the case where an orphaned in-flight
-          // turn exists, and bootstrap would resume-continue it before this
-          // method can install the approval bridge or register the agent.
-          // Keep that one step for `#driveDeferredDurableResume` below (#2239).
-          deferDurableTurnResume: true,
+          // The two deferrals are mutually exclusive, and which one applies
+          // decides where the orphaned in-flight turn gets resumed (#2239).
+          //
+          // `deferAgentStartupSideEffects` already postpones the WHOLE startup
+          // prewarm — the durable resume with it — to the first ordinary
+          // submit, which cannot happen before this method returns, installs
+          // the approval bridge and registers the agent. That shape needs no
+          // help. Withholding the resume from it as well would strand the
+          // turn: nothing calls `runDeferredDurableTurnResume` once
+          // `restoreAgent` has returned, and the orphan is single-shot
+          // (bootstrap's replay persists its `turn_aborted{process_killed}`),
+          // so it would be lost rather than merely late.
+          //
+          // Otherwise bootstrap runs the prewarm inline and would
+          // resume-continue the turn before either prerequisite exists, so
+          // that one step is kept for `#driveDeferredDurableResume` below.
           ...(params.resumeSuspendedRun === true ||
           params.resumeStartupActivationPending === true
             ? {
                 deferAgentStartupSideEffects: true,
               }
-            : {}),
+            : { deferDurableTurnResume: true }),
           argv: buildBootstrapArgv(
             restoreBootstrapSelection(params),
             this.#argv,
@@ -1308,21 +1319,43 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           params.agentId,
           active,
         );
-        await this.#hydrateRecoveredAgentState({
-          agentId: params.agentId,
-          session: bootstrap.session,
-          registry: bootstrap.registry,
-          thread: managedThread,
-          initialMessages: params.initialMessages ?? [],
-          replayToolCalls: params.replayToolCalls ?? [],
-          currentSessionId: params.currentSessionId,
-          onReplayToolResult: params.onReplayToolResult,
-        });
+        const restoredSession = bootstrap.session;
+        const recoveredInitialMessages = params.initialMessages ?? [];
+        const recoveredReplayedMessages =
+          await this.#hydrateRecoveredAgentState({
+            agentId: params.agentId,
+            session: restoredSession,
+            registry: bootstrap.registry,
+            thread: managedThread,
+            initialMessages: recoveredInitialMessages,
+            replayToolCalls: params.replayToolCalls ?? [],
+            currentSessionId: params.currentSessionId,
+            onReplayToolResult: params.onReplayToolResult,
+          });
         params.signal?.throwIfAborted();
         // Last: this generation now owns `#active`, the approval bridge, and
         // the canonical event bridge, so a resumed turn that needs approval
         // reaches a client instead of the arbiter default deny.
-        this.#driveDeferredDurableResume(active);
+        await this.#driveDeferredDurableResume(
+          params.agentId,
+          active,
+          // The resumed turn republishes `session.state.history` from the
+          // checkpoint prefix it continues (`syncSessionState`), which erases
+          // the recovered conversation hydrated just above. Re-apply it once
+          // the turn is over, which is the order that held while the resume
+          // ran inside bootstrap.
+          () =>
+            hydrateRecoveredSessionHistory(restoredSession, {
+              initialMessages: recoveredInitialMessages,
+              replayedMessages: recoveredReplayedMessages,
+            }),
+        );
+        // Waiting for the recovered turn to start is a new suspension point,
+        // so an abort raised during it must still fail the restore rather
+        // than publish this generation. `#bindBootstrapCancellation` aborts
+        // the session on that signal, which ends the resumed turn and
+        // releases the wait above.
+        params.signal?.throwIfAborted();
         return true;
       } catch (error) {
         const cleanupErrors: unknown[] = [];
@@ -1776,7 +1809,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     readonly onReplayToolResult?: (
       result: AgenCBackgroundAgentReplayToolResult,
     ) => void | Promise<void>;
-  }): Promise<void> {
+  }): Promise<readonly LLMMessage[]> {
     const replayedMessages = await replayRecoveredToolCalls({
       thread: params.thread,
       parent: params.session,
@@ -1796,6 +1829,10 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       initialMessages: params.initialMessages,
       replayedMessages,
     });
+    // Returned so the caller can re-apply the history merge after a durable
+    // resume has republished the same slot; the tool calls themselves are
+    // dispatched exactly once, here (#2239).
+    return replayedMessages;
   }
 
   async attachAgentSessionEvents(
@@ -4237,32 +4274,77 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
    * AFTER `#active.set`, because `#requestDaemonToolDecision` denies outright
    * for an agent that is not registered.
    *
-   * Deliberately NOT awaited by `restoreAgent`: an approval has no default
-   * timeout, so awaiting it would block the whole restore — and the daemon's
-   * own startup — on a human decision that cannot be delivered until restore
-   * returns and a client attaches. The permission request is buffered on the
-   * agent until then. The promise is retained on the generation so the
-   * in-flight resume stays observable; stopping the agent aborts the session,
-   * which ends the resumed turn.
+   * Returns once the recovered turn has STARTED (`turn_resumed`) or the resume
+   * has finished without one — never once it has completed. Waiting for the
+   * start closes the window in which `restoreAgent` had already returned while
+   * the resume was still queued: a client that submitted in that window had
+   * its brand-new turn aborted `replaced` by the late resume. With the
+   * recovered turn already holding the session's turn slot, the newer user
+   * message replaces the resume instead, which is the direction every other
+   * in-flight turn follows. Waiting for COMPLETION is not an option: an
+   * approval has no default timeout, so it would block the restore — and the
+   * daemon's own startup — on a decision that cannot be delivered until
+   * restore returns and a client attaches. The request buffers on the agent
+   * until then.
    *
-   * A user message that arrives while the resumed turn waits for its approval
-   * is never queued behind it: `Session.spawnTask` aborts the running turn as
-   * `replaced`, so the new message wins exactly as it does for any other
-   * in-flight turn.
+   * `reapplyRecoveredHistory` runs after the resumed turn is over, because the
+   * turn republishes `session.state.history` from its checkpoint prefix and
+   * would otherwise leave the daemon-recovered conversation erased.
    */
-  #driveDeferredDurableResume(active: ActiveBackgroundAgent): void {
+  async #driveDeferredDurableResume(
+    agentId: string,
+    active: ActiveBackgroundAgent,
+    reapplyRecoveredHistory: () => Promise<void>,
+  ): Promise<void> {
     const runDeferredDurableTurnResume =
       active.bootstrap.runDeferredDurableTurnResume;
     if (typeof runDeferredDurableTurnResume !== "function") return;
-    active.durableResumeComplete = (async () => {
+    let signalStarted = (): void => {};
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    const stopWatchingForStart = subscribeDurableResumeStarted(
+      active.bootstrap.session,
+      () => signalStarted(),
+    );
+    const finished = (async () => {
       try {
-        await runDeferredDurableTurnResume();
+        const attempt = await runDeferredDurableTurnResume();
+        if (attempt.resumed !== true) return;
+        await this.#reapplyRecoveredHistory(
+          agentId,
+          active,
+          reapplyRecoveredHistory,
+        );
       } catch {
         // The resume is best-effort and already records its own failure on
         // the conversation thread record; it must never surface as an
         // unhandled rejection on a live daemon.
+      } finally {
+        stopWatchingForStart();
+        signalStarted();
       }
     })();
+    void finished.catch(() => undefined);
+    await Promise.race([finished, started]);
+  }
+
+  /**
+   * Restore the daemon-recovered conversation the resumed turn republished
+   * over. Skipped when a newer turn owns the history — a user message that
+   * replaced the resume is the fresher authority, and appending recovered
+   * tool results underneath it would rewrite a live turn's context — and when
+   * this generation no longer owns the agent.
+   */
+  async #reapplyRecoveredHistory(
+    agentId: string,
+    active: ActiveBackgroundAgent,
+    reapplyRecoveredHistory: () => Promise<void>,
+  ): Promise<void> {
+    if (this.#active.get(agentId) !== active) return;
+    if (!isRunnableActiveAgent(active)) return;
+    if (active.bootstrap.session.activeTurn.unsafePeek() !== null) return;
+    await reapplyRecoveredHistory();
   }
 
   #installDaemonApprovalBridge(
@@ -5089,6 +5171,25 @@ async function consumeDaemonPendingProviderSwitches(
       `provider switch to ${pending.provider}/${pending.model} could not be applied before turn: ${outcome.reason}`,
     );
   }
+}
+
+/**
+ * Call `onStarted` the first time the session re-opens a durable turn.
+ *
+ * `turn_resumed` is emitted by `run-turn` immediately after `spawnTask` has
+ * installed the recovered turn as the session's active turn and before any
+ * phase work, so it is the earliest point at which the resume can no longer be
+ * beaten to the turn slot by a client message (#2239).
+ */
+function subscribeDurableResumeStarted(
+  session: LocalRuntimeBootstrap["session"],
+  onStarted: () => void,
+): () => void {
+  // Typed on purpose: renaming the event or the subscription must break the
+  // build here rather than turn the start barrier into a silent no-op.
+  return session.eventLog.subscribe((event) => {
+    if (event.msg.type === "turn_resumed") onStarted();
+  });
 }
 
 // Install the daemon turn driver. Prompt ingress normally runs before durable
