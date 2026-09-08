@@ -1,8 +1,5 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useMemo } from "react";
 
-import { logError } from "../../../utils/log.js";
-import { getTaskOutputPath } from "../../../utils/task/diskOutput.js";
-import { tailFile } from "../../../utils/fsOperations.js";
 import { Box, Text } from "../../ink.js";
 import { useKeybindings } from "../../keybindings/useKeybinding.js";
 import { useRegisterKeybindingContext } from "../../keybindings/KeybindingContext.js";
@@ -13,6 +10,9 @@ import { orderAgentTasks, resolveAgentSelection } from "../agents/AgentsRail.js"
 import { useWorkbenchState } from "../state.js";
 import { stopWorkbenchTask, workbenchStopActionForTask } from "../tasks/stopActions.js";
 import { EmptySurface, SurfaceHeader } from "./PreviewSurface.js";
+import { useTaskTail } from "./useTaskTail.js";
+
+const TAIL_BYTES = 16_000;
 
 export function AgentSurface({ focused }: { readonly focused: boolean }): React.ReactElement {
   const workbench = useWorkbenchState();
@@ -22,39 +22,12 @@ export function AgentSurface({ focused }: { readonly focused: boolean }): React.
     const taskList = orderAgentTasks(Object.values(tasks).filter((item: any) => item.type !== "local_bash"));
     return resolveAgentSelection(taskList, workbench.selectedAgentTaskId).selectedTask;
   }, [tasks, workbench.selectedAgentTaskId]);
-  const [tailState, setTailState] = useState<{ readonly taskId: string | null; readonly content: string }>({
-    taskId: null,
-    content: "",
+  const { content: tail, error } = useTaskTail({
+    taskId: task?.id,
+    status: task?.status,
+    maxBytes: TAIL_BYTES,
+    pollIntervalMs: 1_000,
   });
-  const tail = tailState.taskId === task?.id ? tailState.content : "";
-
-  useEffect(() => {
-    if (!task?.id) {
-      setTailState({ taskId: null, content: "" });
-      return;
-    }
-    const taskId = task.id;
-    setTailState((current) => current.taskId === taskId ? current : { taskId, content: "" });
-    let mounted = true;
-    const readTail = () => {
-      tailFile(getTaskOutputPath(taskId), 16_000)
-        .then((result) => {
-          if (mounted) setTailState({ taskId, content: result.content });
-        })
-        .catch((error) => {
-          if (!mounted) return;
-          logError(error);
-          // Keep the last successful tail visible across transient read failures.
-        });
-    };
-    readTail();
-    const timer = task.status === "running" ? setInterval(readTail, 1_000) : null;
-    timer?.unref?.();
-    return () => {
-      mounted = false;
-      if (timer) clearInterval(timer);
-    };
-  }, [task?.id, task?.status]);
 
   useRegisterKeybindingContext("Surface", focused);
   useKeybindings(
@@ -79,6 +52,7 @@ export function AgentSurface({ focused }: { readonly focused: boolean }): React.
   return (
     <Box flexDirection="column" width="100%" height="100%" overflow="hidden">
       <SurfaceHeader title="AGENT" detail={`${task.status} - ${task.description}`} focused={focused} />
+      {error !== null ? <Text color="error" wrap="truncate-end">Output read failed: {error}</Text> : null}
       <Text wrap="truncate-end">id {task.id}</Text>
       <Text wrap="truncate-end">type {task.type}</Text>
       <Text wrap="truncate-end">elapsed {formatTaskElapsed(task)}</Text>

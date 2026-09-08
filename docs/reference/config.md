@@ -258,7 +258,7 @@ otherwise.
 | `model_provider` | `grok` |
 | `approval_policy` | `on-request` |
 | `sandbox_mode` | `workspace-write` |
-| `reasoning_effort` | `medium` |
+| `reasoning_effort` | `medium`; omitted for Gemini unless explicitly configured |
 | `approvals_reviewer` | `user` |
 | `agent_max_depth` | `1` |
 | `auth.backend` | `remote` |
@@ -268,6 +268,7 @@ otherwise.
 | `mcp.server.enabled` | `false` |
 | `mcp.server.transport` | `stdio` |
 | `daemon.autostart` | `true` |
+| `daemon.agent_stop_timeout_ms` | `30000` |
 | `gateway.defaultAgent` | `default` |
 | `gateway.hooks.enabled` | `false` |
 | `project_root_markers` | `.git`, `package.json`, `Cargo.toml`, `pyproject.toml` |
@@ -307,6 +308,7 @@ otherwise.
 | `agent.retention.snapshot_days` | `3` |
 | `agent.retention.snapshot_max_count` | `10000` |
 | `agent.retention.snapshot_max_bytes` | `67108864` |
+| `agent.retention.rollout_days` | `30` (0 keeps every session) |
 
 `max_turns` is unset by default; an unset turn cap does not impose a
 synthetic stop. `stream_watchdog_timeout_ms` defaults to `600000` (ten
@@ -316,6 +318,15 @@ the stream with a retryable `stream_idle` error at the deadline. Set it to
 turns only: a one-shot review delegate (`/review`, guardian approval review)
 carries its own deadline, so the ten-minute default is not layered on top of
 it. A value you configure yourself is still honoured inside a review delegate.
+
+`provider_outage_wait_ms` and `provider_outage_retry_ms` govern what happens
+after the fast reconnect ladder gives up on a transient provider error
+(connection refused or reset, a 5xx, a request timeout). Instead of ending the
+turn, the runtime waits `provider_outage_retry_ms` (30 s), then twice that,
+doubling up to ten times the base (5 min), and tries again until the waits
+would exceed `provider_outage_wait_ms` (30 min); each wait is announced by a
+`provider_outage_wait` warning event, and cancelling the turn ends it at once.
+A streamed tool call that makes a retry unsafe still ends the turn immediately.
 The guardian approval review behind a permission prompt runs under a
 ten-minute deadline of its own, so a dead provider socket expires that review
 instead of parking the approval. `[budget]`, `[heartbeat]`, `[browser]`, and
@@ -375,6 +386,8 @@ names; `[]` denotes an array entry. Open maps accept keys at the indicated
 | `autonomous_mode` | Boolean autonomous runtime mode. |
 | `coordinator_mode` | Boolean coordinator-only main-session behavior. |
 | `stream_watchdog_timeout_ms` | Non-negative inter-chunk idle timeout; default `600000`, `0` disables. |
+| `provider_outage_wait_ms` | Non-negative total time a turn keeps waiting for a provider outage to end once the reconnect ladder is spent; default `1800000` (30 minutes), `0` ends the turn as soon as the ladder is exhausted. |
+| `provider_outage_retry_ms` | Positive first slow-retry delay during a provider outage, doubling up to ten times this value; default `30000`. |
 
 Project-root discovery happens before project and local configuration can be
 loaded. Its marker authority is therefore limited to the built-in/plugin/user
@@ -391,7 +404,7 @@ from a late CLI layer is rejected.
 | --- | --- |
 | `autoUpdates`, `autoUpdatesChannel` | Update enablement and `latest`/`stable` channel. Absent enablement preserves the updater default. |
 | `respectGitignore`, `includeGitInstructions` | Git-aware discovery and instruction behavior. |
-| `transcriptPersistenceEnabled` | Persist session transcripts (default `true`). Retention is configured only by `agent.retention.rollout_days`. |
+| `transcriptPersistenceEnabled` | Persist session transcripts (default `true`). Retention: `agent.retention.rollout_days`, default 30 days; sessions untouched for longer are deleted with their rollout files; 0 keeps every session. |
 | `outputStyle` | Named assistant response style. |
 | `defaultShell` | `bash` or `powershell`. |
 | `language` | Preferred response language. |
@@ -547,6 +560,7 @@ optional `headers`), `github` (`repo`, optional `ref`, `path`, `sparsePaths`),
 | `mcp_servers.<server>.command`, `mcp_servers.<server>.args`, `mcp_servers.<server>.cwd` | Stdio process launch fields. |
 | `mcp_servers.<server>.env`, `mcp_servers.<server>.env.<name>`, `mcp_servers.<server>.env_vars` | Literal environment map and inherited variable-name array. |
 | `mcp_servers.<server>.endpoint`, `mcp_servers.<server>.headers`, `mcp_servers.<server>.headers.<name>` | Remote URL and header map. |
+| `mcp_servers.<server>.oauth` | Public OAuth metadata for HTTP/SSE connections: `clientId`, `scopes`, `authServerMetadataUrl`, `callbackPort`, and `xaa`. Metadata URLs require HTTPS; callback ports range from 1024 to 65535. Credentials stay in native storage, and this block cannot accompany an `Authorization` header. |
 | `mcp_servers.<server>.enabled`, `mcp_servers.<server>.required`, `mcp_servers.<server>.timeout` | Enablement, required-startup policy, and timeout. |
 | `mcp_servers.<server>.default_tools_approval_mode` | Server-wide approval default. |
 | `mcp_servers.<server>.enabled_tools`, `mcp_servers.<server>.disabled_tools` | Tool arrays. |
@@ -688,6 +702,7 @@ environment ingress.
 | Paths | Type / meaning |
 | --- | --- |
 | `daemon`, `daemon.autostart` | Daemon block and automatic daemon startup. The local daemon transport is fixed by the platform runtime. |
+| `daemon.agent_stop_timeout_ms` | Graceful agent stop and previous-generation cleanup deadline in milliseconds (default `30000`, positive integer up to `2147483647`). A stop that exceeds this deadline aborts execution and allows up to `5000` ms for hard teardown before reporting failure. Restart the daemon after changing this setting. |
 | `browser` | Chromium execution policy. |
 | `browser.executable_path`, `browser.profile_dir` | Browser binary/profile paths. |
 | `browser.headless`, `browser.allow_private_network`, `browser.no_sandbox` | Security/runtime booleans. |

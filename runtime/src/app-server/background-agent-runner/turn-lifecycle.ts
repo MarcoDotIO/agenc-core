@@ -20,6 +20,7 @@ import type {
 } from "../protocol/index.js";
 import { MAX_SESSION_SHELL_RESULT_TEXT_UTF8_BYTES } from "../protocol/index.js";
 import type { RunTerminalResult } from "../../contracts/run-contracts.js";
+import { classifyTurnTerminal, createTurnFailedEvent } from "../../contracts/turn-terminal.js";
 
 import {
   AgenCBackgroundAgentMessageError,
@@ -81,6 +82,32 @@ function hasOpenAgentDescendants(
     for (const [childThreadId] of children) pending.push(childThreadId);
   }
   return false;
+}
+
+/**
+ * How many live agents are still unwinding under this root thread. Named in
+ * the refusal a stop-in-flight returns so the user reads what the wait is for
+ * rather than a bare "busy" (#2201).
+ */
+function stoppingAgentSuffix(
+  control: AgentControl,
+  rootThreadId: string,
+): string {
+  const childrenByParent = control.liveThreadSpawnChildren();
+  const pending = [rootThreadId];
+  const visited = new Set<string>();
+  let count = 0;
+  while (pending.length > 0) {
+    const parent = pending.pop()!;
+    if (visited.has(parent)) continue;
+    visited.add(parent);
+    for (const [childThreadId] of childrenByParent.get(parent) ?? []) {
+      count += 1;
+      pending.push(childThreadId);
+    }
+  }
+  if (count === 0) return "";
+  return ` (${count} agent${count === 1 ? "" : "s"} still stopping)`;
 }
 
 function runtimeActiveTurnId(
@@ -443,12 +470,45 @@ function commitDurableRunCancellationRequest(
   }
 }
 
+function closeFailedRunTurn(
+  active: ActiveBackgroundAgent,
+  result: RunTerminalResult,
+): void {
+  if (result.status !== "failed") return;
+  let openTurnId: string | undefined;
+  for (const item of active.bootstrap.rolloutStore.readAll()) {
+    if (item.type !== "event_msg") continue;
+    const event = item.payload.msg;
+    if (event.type === "turn_started") {
+      openTurnId = event.payload.turnId;
+    } else if (classifyTurnTerminal(event, {
+      expectedTurnId: openTurnId,
+      legacyJournal: true,
+    }) !== undefined) {
+      openTurnId = undefined;
+    }
+  }
+  if (openTurnId === undefined) return;
+  const eventId = `turn-failed:${openTurnId}`;
+  active.bootstrap.session.emit({
+    id: eventId,
+    eventId,
+    msg: createTurnFailedEvent({
+      turnId: openTurnId,
+      code: "background_agent_error",
+      message: result.finalMessage ?? result.stopReason ?? "background agent failed",
+      completedAt: Date.parse(result.finishedAt),
+    }),
+  });
+}
+
 function commitDurableRunTerminal(
   active: ActiveBackgroundAgent,
   runId: string,
   result: RunTerminalResult,
 ): AgenCBackgroundAgentTerminalSnapshot {
   if (active.terminal !== undefined) return active.terminal;
+  closeFailedRunTurn(active, result);
   const epoch = active.runEpoch;
   const session = active.bootstrap.session;
   const lastSequenceBeforeTerminal =
@@ -727,6 +787,7 @@ export {
   isInterruptibleActiveAgent,
   hasRuntimeActiveTurn,
   hasOpenAgentDescendants,
+  stoppingAgentSuffix,
   runtimeActiveTurnId,
   isClearInFlight,
   shellSubmissionMessageId,

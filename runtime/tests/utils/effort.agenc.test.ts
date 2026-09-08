@@ -171,13 +171,32 @@ test('Meta Muse models expose and apply their exact catalog effort levels', asyn
   expect(modelSupportsEffortForContext('muse-spark-1.3', context)).toBe(true)
   expect(
     getAvailableEffortLevelsForContext('muse-spark-1.3', context),
-  ).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh'])
+  ).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
   expect(
     getDefaultEffortForModelForContext('muse-spark-1.3', context),
   ).toBe('medium')
   expect(
     resolveAppliedEffortForContext('muse-spark-1.3', 'max', context),
+  ).toBe('max')
+  expect(
+    resolveAppliedEffortForContext('muse-spark-1.3', 'xhigh', context),
   ).toBe('xhigh')
+  expect(
+    resolveAppliedEffortForContext('muse-spark-1.2', 'max', context),
+  ).toBe('xhigh')
+  expect(getAvailableEffortLevelsForContext('muse-spark-1.3-contributor', context))
+    .not.toContain('max')
+  expect(getAvailableEffortLevelsForContext('muse-spark-1.3-unverified', context))
+    .not.toContain('max')
+  expect(getAvailableEffortLevelsForContext('meta/muse-spark-1.3-unverified', context))
+    .not.toContain('max')
+  expect(getAvailableEffortLevelsForContext('meta/muse-spark-1.3', context))
+    .toContain('max')
+  const levels = getAvailableEffortLevelsForContext('muse-spark-1.3', context)
+  expect(effortValueToReasoningEffort('max', levels)).toBe('max')
+  expect(effortValueToReasoningEffort('xhigh', levels)).toBe('xhigh')
+  expect(reasoningEffortToEffortLevel('max')).toBe('max')
+  expect(reasoningEffortToEffortLevel('xhigh')).toBe('xhigh')
   expect(effortValueToReasoningEffort('minimal')).toBe('minimal')
   expect(reasoningEffortToEffortLevel('minimal')).toBe('minimal')
 })

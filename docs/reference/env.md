@@ -35,6 +35,8 @@ Boolean-like values that go through `applyEnvOverrides` treat
 | `AGENC_AGENT_MAX_DEPTH` | Non-negative subagent nesting cap projected to `agent_max_depth`; `0` disables spawning |
 | `AGENC_COORDINATOR_MODE` | Overrides `coordinator_mode` both ways when the `COORDINATOR_MODE` build flag is on (it is on in `runtime/src/build/feature.ts`). `0` / `false` / `off` force off |
 | `AGENC_STREAM_IDLE_TIMEOUT_MS` | Stream idle deadline in milliseconds. Unset keeps the `600000` config default; `0` means no idle deadline |
+| `AGENC_PROVIDER_OUTAGE_WAIT_MS` | Overrides `provider_outage_wait_ms`: how long a turn keeps waiting for a provider outage to end after the reconnect ladder is spent. Unset keeps the `1800000` default; `0` ends the turn when the ladder is exhausted |
+| `AGENC_PROVIDER_OUTAGE_RETRY_MS` | Overrides `provider_outage_retry_ms`: the first slow-retry delay during a provider outage, doubling up to ten times the value. Unset keeps the `30000` default |
 | `AGENC_MARKETPLACE_CLI` | Path to marketplace-cli (`[protocol].cli_path`) |
 
 ## Provider credentials and endpoints
@@ -59,6 +61,7 @@ Credential values are not written into the canonical config snapshot.
 | Cerebras | `CEREBRAS_API_KEY`, `CEREBRAS_BASE_URL` |
 | Z.AI Pay-As-You-Go | `ZAI_API_KEY`, `ZAI_BASE_URL` |
 | Z.AI Coding Plan | `ZAI_CODING_PLAN_API_KEY`, `ZAI_CODING_PLAN_BASE_URL` |
+| Kimi (Moonshot) | `MOONSHOT_API_KEY`; native endpoint fixed to global `https://api.moonshot.ai/v1` |
 | Gemini | `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_ACCESS_TOKEN`, `GEMINI_AUTH_MODE` (`api-key`, `access-token`, or `adc`), `GEMINI_BASE_URL`, `GEMINI_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_QUOTA_PROJECT`, `GOOGLE_APPLICATION_CREDENTIALS`, `GEMINI_VERTEX_LOCATION`, `GOOGLE_CLOUD_LOCATION`, `GEMINI_CACHED_CONTENT` |
 | Mistral | `MISTRAL_API_KEY`, `MISTRAL_BASE_URL` |
 | NVIDIA NIM | `NVIDIA_API_KEY`, `NVIDIA_BASE_URL` |
@@ -82,6 +85,11 @@ the runtime appends `/chat/completions` or `/images/generations`.
 separate Coding Plan chat route. The Coding Plan credential is never used for
 image generation, and a Z.AI media request never uses another provider's key.
 
+`MOONSHOT_API_KEY` authorizes only the native global `kimi` provider. That
+route has no endpoint environment override and never borrows
+`OPENAI_API_KEY`; custom or regional compatible endpoints belong under the
+separate `openai-compatible` provider.
+
 Amazon Bedrock uses the required access/secret pair for direct SigV4 signing;
 the session token is optional. Only the Bedrock variables in the table are
 consumed by this provider.
@@ -95,6 +103,15 @@ wins over `OPENAI_API_KEY` only for the selected `openai` provider. Its stored
 subscription access token also wins over `PROVIDER_CODE_API_KEY` on ChatGPT
 subscription requests; that variable is an explicit fallback, not a second
 stored credential path.
+
+`OPENAI_AUTH_MODE` and `GROK_AUTH_MODE` capture a non-secret authentication
+preference for the selected provider: `auto` (also the unset/empty default),
+`oauth`, or `api-key`. Other values are rejected. Automatic selection preserves
+the provider's existing credential precedence. Explicit OAuth cannot fall back
+to paid API keys if sign-in is absent; explicit API-key selection cannot use an
+OAuth sign-in. Neither explicit selection silently obtains managed credentials.
+These values are captured with the session environment and do not delete saved
+credentials or change another session's selection.
 
 Gemini project identity has one ordered surface: `GEMINI_PROJECT_ID` wins over
 `GOOGLE_CLOUD_PROJECT`. Other Google project-name aliases are not consumed.
@@ -243,6 +260,7 @@ These have their own pages. Short map:
 
 | Var | Effect |
 | --- | --- |
+| `AGENC_TEST_NEOVIM_INPUT_TRACE` | Test-only JSONL output path for embedded Neovim input acknowledgements. Records session identity, BUFFER focus, sequence, RPC phase, and mode without input text. Enables bounded read-only mode probes; unset in ordinary runs. See [embedded Neovim testing](../embedded-neovim-buffer.md). |
 | `AGENC_ONBOARDING` | First-run wizard control captured for the owning TUI session. `force` shows the wizard even after completion; `0`, `false`, or `off` suppress it. Unset follows persisted `onboarding.json` state |
 | `AGENC_TUI_WORKBENCH` | `0` uses classic fullscreen instead of workbench |
 | `AGENC_NO_FLICKER` | `0` disables fullscreen; `1` forces it on, including under tmux `-CC`. When unset, tmux `-CC` disables fullscreen; otherwise `tui.flickerFreeMode` is authoritative and defaults to on |

@@ -21,8 +21,7 @@ import {
 } from "./provider-info.js";
 
 const DONOR_MODEL_IDS = Object.freeze([
-  // gpt-5 (the openai built-in default) is registered first so the default
-  // resolves through the single-source registry rather than heuristic fallback.
+  // Keep the original catalog order after the newly registered models.
   "gpt-5",
   "gpt-5.5",
   "gpt-5.4",
@@ -30,6 +29,12 @@ const DONOR_MODEL_IDS = Object.freeze([
   "gpt-5.3-codex", // branding-scan: allow OpenAI model identifier
   "gpt-5.2",
   "codex-auto-review", // branding-scan: allow OpenAI model identifier
+]);
+const EXTENDED_REASONING_MODEL_IDS = Object.freeze([
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-6-astra",
 ]);
 
 describe("LLM registry", () => {
@@ -139,13 +144,17 @@ describe("LLM registry", () => {
   it("preserves the complete bundled donor model catalog shape", () => {
     const entries = listRegisteredModelCatalogEntries("openai");
 
-    expect(entries.map((entry) => entry.model)).toEqual(DONOR_MODEL_IDS);
+    expect(entries.map((entry) => entry.model)).toEqual([
+      ...EXTENDED_REASONING_MODEL_IDS,
+      ...DONOR_MODEL_IDS,
+    ]);
     for (const entry of entries) {
       expect(entry.supportedReasoningLevels).toEqual([
         "low",
         "medium",
         "high",
         "xhigh",
+        ...(EXTENDED_REASONING_MODEL_IDS.includes(entry.model) ? ["max"] : []),
       ]);
       expect(entry.supportsVerbosity).toBe(true);
       expect(entry.supportsParallelToolCalls).toBe(true);

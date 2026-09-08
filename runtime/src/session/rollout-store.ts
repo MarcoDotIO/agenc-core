@@ -74,7 +74,7 @@ import { ThreadSpawnEdgeRepository } from "../state/spawn-edges.js";
 import { StateRunDurabilityRepository } from "../state/run-durability.js";
 import { recordInFlightToolCallUnknownOutcome } from "../state/tool-output-rotation.js";
 import { resolveUnknownOutcomeEffect } from "../state/unknown-outcome-gate.js";
-import { sanitizePath } from "../utils/path.js";
+import { projectStorageKey } from "../utils/project-storage-key.js";
 import { isRecord } from "../utils/record.js";
 import {
   EFFECT_EVIDENCE_FORMAT_VERSION,
@@ -774,6 +774,7 @@ export class RolloutStore {
     CompactionSourcePayloadBundlesV1
   >();
   private liveToolPairProjection: ToolPairProjection | undefined;
+  private liveToolPairProjectionId: string | undefined;
   private liveToolPairValidator: StreamingToolPairValidator | undefined;
   private openedAt: string | undefined;
   private openedEpoch: number | undefined;
@@ -3450,7 +3451,35 @@ export class RolloutStore {
       throw new Error("live tool-pair projection did not initialize");
     }
     this.liveToolPairProjection = context.projection;
+    this.liveToolPairProjectionId = context.projectionId;
     this.liveToolPairValidator = validator;
+  }
+
+  /**
+   * Why this session's live history can no longer take a response item, once
+   * the live tool-pair validator has closed on a failure; `undefined` while
+   * appends are still accepted. Callers that start turns check this before
+   * opening one, so a client hears the reason instead of watching an empty
+   * turn end.
+   */
+  liveHistoryBlockedReason(): string | undefined {
+    const failure = this.liveToolPairValidator?.terminalFailureOutcome;
+    if (failure === undefined) return undefined;
+    return new ToolPairHistoryBlockedError("live append", failure).message;
+  }
+
+  /**
+   * Whether the live history already holds a result for this tool call. A
+   * durable resume asks before it persists a synthetic result for a dangling
+   * call: the bootstrap replay may already have closed the call, and a second
+   * result for one call id is a duplicate the live validator rejects, which
+   * blocks the session's history for good.
+   */
+  liveToolCallResolved(callId: string): boolean {
+    const projection = this.liveToolPairProjection;
+    const projectionId = this.liveToolPairProjectionId;
+    if (projection === undefined || projectionId === undefined) return false;
+    return projection.find(projectionId, callId)?.resultIndex !== undefined;
   }
 
   private validateLiveResponseItem(message: ToolPairMessage): void {
@@ -3674,6 +3703,16 @@ export class RolloutStore {
   /** @internal Test seam for write-success/fsync-failure recovery. */
   setFsyncImplForTest(impl: (fd: number) => void): void {
     this.store.setFsyncImplForTest(impl);
+  }
+
+  /**
+   * Register (or clear) a listener for successful rollout appends.
+   * `FileThreadStore` uses this to keep `thread_rollout_items` current.
+   */
+  setOnRolloutCommitted(
+    listener: ((rolloutPath: string) => void) | undefined,
+  ): void {
+    this.store.setOnRolloutCommitted(listener);
   }
 
   close(): void {
@@ -4325,7 +4364,7 @@ export class RolloutStore {
         resolve(
           this.store.agencHome,
           "projects",
-          sanitizePath(this.store.cwd),
+          projectStorageKey(this.store.cwd),
           this.sessionId,
           "tool-results",
         ),

@@ -73,8 +73,21 @@ import {
   getInitialEffortSetting,
 } from "../utils/effort.js";
 import type { ReasoningEffort } from "../session/turn-context.js";
+import { resolveGeminiReasoningEffort } from "../llm/registry/gemini-thinking-models.js";
 
 type WireReasoningEffort = NonNullable<LLMChatOptions["reasoningEffort"]>;
+
+function resolveGeminiSessionReasoningEffort(
+  turnEffort: ReasoningEffort | undefined,
+  model: string,
+  effortSource: string | undefined,
+): WireReasoningEffort | undefined {
+  if (turnEffort !== undefined) return resolveGeminiReasoningEffort(model, turnEffort);
+  const configuredEffort = effortSource === "default"
+    ? undefined
+    : getInitialEffortSetting();
+  return resolveGeminiReasoningEffort(model, configuredEffort);
+}
 
 /**
  * Sessions created without an explicit reasoning effort — every
@@ -94,14 +107,21 @@ type WireReasoningEffort = NonNullable<LLMChatOptions["reasoningEffort"]>;
 function resolveSessionReasoningEffort(
   turnEffort: ReasoningEffort | undefined,
   supportedReasoningLevels?: ReadonlyArray<ReasoningEffort>,
+  selection?: {
+    readonly provider: string;
+    readonly model: string;
+    readonly effortSource?: string;
+  },
 ): WireReasoningEffort | undefined {
-  let requested: ReasoningEffort | undefined;
-  if (turnEffort === undefined) {
-    requested = getInitialEffortSetting();
-  } else if (turnEffort !== "none") {
-    requested = turnEffort;
+  if (selection?.provider === "gemini") {
+    return resolveGeminiSessionReasoningEffort(
+      turnEffort,
+      selection.model,
+      selection.effortSource,
+    );
   }
-  if (requested === undefined) return undefined;
+  const requested = turnEffort ?? getInitialEffortSetting();
+  if (requested === undefined || requested === "none") return undefined;
   if (requested === "max" || requested === "xhigh") {
     if (supportedReasoningLevels === undefined) {
       return requested === "max" ? "xhigh" : requested;
@@ -128,6 +148,8 @@ import type {
 import { runAdmittedModelCall } from "../budget/admitted-model-call.js";
 
 export interface StreamModelRequestContract {
+  /** Internal managed transport UUID, stable for every retry of this snapshot. */
+  readonly managedRequestId?: string;
   readonly input: ReadonlyArray<LLMMessage>;
   readonly tools: ReadonlyArray<LLMTool>;
   readonly parallelToolCalls: boolean;
@@ -300,6 +322,9 @@ function buildProviderOptions(
   const traceSink = resolveProviderTraceSink(session);
   return {
     signal,
+    ...(request.managedRequestId !== undefined
+      ? { managedRequestId: request.managedRequestId }
+      : {}),
     tools: cloneProviderTools(request.tools),
     parallelToolCalls: request.parallelToolCalls,
     ...(systemPrompt.length > 0 ? { systemPrompt } : {}),
@@ -325,6 +350,12 @@ function buildProviderOptions(
     reasoningEffort: resolveSessionReasoningEffort(
       ctx.reasoningEffort,
       ctx.modelInfo.supportedReasoningLevels,
+      {
+        provider: session.services.provider.name,
+        model: session.config?.model ?? ctx.modelInfo.slug,
+        effortSource: session.services.configStore
+          ?.provenance?.("reasoning_effort")?.scope,
+      },
     ),
     reasoningSummary: ctx.reasoningSummary,
     modelVerbosity: ctx.modelVerbosity,

@@ -11,6 +11,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, test } from "vitest";
 
+import { hardenedContainerRuntimeSmokeProgram } from "../../../scripts/check-clean-build.mjs";
+
 const REPO_ROOT = resolve(process.cwd(), "..");
 const BROAD_HOSTED_GATE_COMMANDS = [
   "npm test",
@@ -363,7 +365,7 @@ describe("reproducible install and release contract", () => {
     expect(powershellJob).toContain('["powershellTestRuntime"]["linux-x64"]');
     expect(powershellJob).toContain("--require-zero-skips");
     expect(powershellJob).toContain("--config vitest.powershell.config.ts");
-    expect(powershellJob).toContain("const expectedTests = 40");
+    expect(powershellJob).toContain("const expectedTests = 51");
     expect(powershellJob).toContain("numTotalTestSuites: 5");
     expect(powershellJob).toContain("numPassedTestSuites: 5");
     for (const testFile of [
@@ -437,11 +439,19 @@ describe("reproducible install and release contract", () => {
     expect(macosJob).toContain("runs-on: macos-15");
     expect(macosJob).toContain("Run the exact macOS red-probe runner contract");
     expect(macosJob).toContain("tests/fnd/red-probe-runner.contract.test.ts");
-    expect(macosJob).toContain("numTotalTests: 66");
-    expect(macosJob).toContain("numPassedTests: 66");
-    expect(macosJob).toContain("testResult.assertionResults.length !== 66");
+    expect(macosJob).toContain("numTotalTests: 79");
+    expect(macosJob).toContain("numPassedTests: 79");
+    expect(macosJob).toContain("testResult.assertionResults.length !== 79");
+    expect(macosJob).toMatch(
+      /red-probe-runner\.contract\.test\.ts\s*\\\s*--allowOnly=false\s*\\\s*--maxWorkers=1/u,
+    );
+    expect(macosJob).toContain('2>&1 | tee "$RUNNER_TEMP/macos-red-probe-runner.log"');
+    expect(macosJob).toContain("failure() && steps.macos-red-probe-runner.outcome == 'failure'");
+    expect(macosJob).toContain("${{ runner.temp }}/macos-red-probe-runner.json");
+    expect(macosJob).toContain("${{ runner.temp }}/macos-red-probe-runner.log");
+    expect(macosJob).toContain("retention-days: 1");
     expect(macosJob).toContain(
-      "macOS red-probe runner passed 66 tests in 1 file with zero skipped",
+      "macOS red-probe runner passed 79 tests in 1 file with zero skipped",
     );
     expect(macosJob).toContain(
       "Run the exact macOS FND/native capability lane",
@@ -449,6 +459,9 @@ describe("reproducible install and release contract", () => {
     expect(macosJob).toContain("tests/agents/jobs/csv-output.native.test.ts");
     expect(macosJob).toContain(
       "tests/durability/atomic-artifact.darwin.test.ts",
+    );
+    expect(macosJob).toContain(
+      "tests/eval-contract/platform-protection.darwin.test.ts",
     );
     expect(macosJob).toContain("tests/fnd/benchmark-harness-faults.test.ts");
     expect(macosJob).toContain("tests/fnd/bounded-file-io.test.ts");
@@ -462,10 +475,10 @@ describe("reproducible install and release contract", () => {
       "tests/utils/secureStorage/macOsKeychainHelper.darwin.test.ts",
     );
     expect(macosJob).toContain("--config vitest.native.config.ts");
-    expect(macosJob).toContain("numTotalTestSuites: 14");
-    expect(macosJob).toContain("numTotalTests: 101");
+    expect(macosJob).toContain("numTotalTestSuites: 16");
+    expect(macosJob).toContain("numTotalTests: 105");
     expect(macosJob).toContain(
-      "macOS FND/native capability lane passed 101 tests in 9 files with zero skipped",
+      "macOS FND/native capability lane passed 105 tests in 10 files with zero skipped",
     );
     expect(macosJob).toContain(
       "Run the suites that only fail on macOS when darwin is broken",
@@ -521,6 +534,7 @@ describe("reproducible install and release contract", () => {
       "tests/app-server/windows-named-pipe.win32.test.ts",
     );
     expect(windowsJob).toContain("tests/agents/jobs/csv-output.native.test.ts");
+    expect(windowsJob).toContain("tests/agents/workflow-filesystem.win32.test.ts");
     expect(windowsJob).toContain(
       "tests/durability/atomic-artifact.win32.test.ts",
     );
@@ -537,8 +551,8 @@ describe("reproducible install and release contract", () => {
       "tests/workspace/bound-helper-transport.win32.test.ts",
     );
     expect(windowsJob).toContain("--config vitest.native.config.ts");
-    expect(windowsJob).toContain("numTotalTestSuites: 18");
-    expect(windowsJob).toContain("numTotalTests: 104");
+    expect(windowsJob).toContain("numTotalTestSuites: 19");
+    expect(windowsJob).toContain("numTotalTests: 111");
     expect(windowsJob).toContain(
       "npm.cmd ci --ignore-scripts --no-audit --no-fund",
     );
@@ -548,7 +562,7 @@ describe("reproducible install and release contract", () => {
     );
     expect(windowsJob).not.toContain("npm_config_build_from_source");
     expect(windowsJob).toContain(
-      "Windows FND/native capability lane passed 104 tests in 11 files with zero skipped",
+      "Windows FND/native capability lane passed 111 tests in 12 files with zero skipped",
     );
 
     // Six lanes: default-suite plus the five hosted capability lanes.
@@ -2232,11 +2246,7 @@ describe("reproducible install and release contract", () => {
     );
     expect(cleanBuild).toContain("checkedJavaScriptProgram(");
     expect(cleanBuild).toContain('"hardened container runtime smoke"');
-    const hardenedSmoke = cleanBuild.match(
-      /checkedJavaScriptProgram\(\s*String\.raw`([\s\S]*?)`,\s*"hardened container runtime smoke"/,
-    );
-    expect(hardenedSmoke).not.toBeNull();
-    const hardenedSmokeSource = hardenedSmoke?.[1] ?? "";
+    const hardenedSmokeSource = hardenedContainerRuntimeSmokeProgram();
     expect(() => new Function(hardenedSmokeSource)).not.toThrow();
     expect(hardenedSmokeSource).toContain('.split("\\n")');
     expect(hardenedSmokeSource).not.toContain('.split("\\\\n")');

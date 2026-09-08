@@ -4669,55 +4669,83 @@ function AgenCTuiShell(props: AgenCTuiShellProps): React.ReactElement {
     () => listTuiCommandList(commandRegistry),
     [commandRegistry],
   );
-  // The slash palette (and findCommand execution) previously saw ONLY built-in
-  // Commands include skills from `.agenc/skills` and bundled sources.
-  // skills, and plugin commands were loaded for the model but never surfaced
-  // in the composer. Load the full command set for this workspace and merge
-  // it in, keeping registry built-ins authoritative on name collisions.
+  // Palette display and submission share one command list. A changed source
+  // invalidates the previous snapshot during render, before effects run.
   const dynamicCommandsCwd =
     props.session.cwd ??
     props.session.sessionConfiguration?.cwd ??
     process.cwd();
   const dynamicCommandPluginStorageRoot =
     props.session.services.runtimeOptions?.pluginStorageRoot;
-  const [dynamicTuiCommands, setDynamicTuiCommands] = useState<
-    readonly Command[]
-  >([]);
+  const dynamicCommandSource = useMemo(
+    () => ({
+      cwd: dynamicCommandsCwd,
+      pluginStorageRoot: dynamicCommandPluginStorageRoot,
+      skillsManager: props.session.services.skillsManager,
+      config,
+    }),
+    [
+      dynamicCommandsCwd,
+      dynamicCommandPluginStorageRoot,
+      props.session.services.skillsManager,
+      config,
+    ],
+  );
+  const [dynamicCommandSnapshot, setDynamicCommandSnapshot] = useState<{
+    readonly source: typeof dynamicCommandSource | null;
+    readonly status: "loading" | "ready" | "failed";
+    readonly commands: readonly Command[];
+    readonly error?: string;
+  }>({ source: null, status: "loading", commands: [] });
   useEffect(() => {
-    if (dynamicCommandPluginStorageRoot === undefined) {
-      setDynamicTuiCommands([]);
+    const source = dynamicCommandSource;
+    let cancelled = false;
+    setDynamicCommandSnapshot({ source, status: "loading", commands: [] });
+    if (source.pluginStorageRoot === undefined) {
+      const error = "This session cannot load skills and plugins";
+      setDynamicCommandSnapshot({
+        source,
+        status: "failed",
+        commands: [],
+        error,
+      });
       logForDebugging(
         "dynamic TUI command load skipped: session is missing captured plugin storage authority",
         { level: "warn" },
       );
       return;
     }
-    let cancelled = false;
     void getCommands(
-      dynamicCommandsCwd,
+      source.cwd,
       {
-        pluginStorageRoot: dynamicCommandPluginStorageRoot,
-        ...(props.session.services.skillsManager !== undefined
-          ? { skillsManager: props.session.services.skillsManager }
+        pluginStorageRoot: source.pluginStorageRoot,
+        ...(source.skillsManager !== undefined
+          ? { skillsManager: source.skillsManager }
           : {}),
       },
-      config,
+      source.config,
     )
       .then((all) => {
         if (cancelled) return;
-        setDynamicTuiCommands(
-          all.filter(
+        setDynamicCommandSnapshot({
+          source,
+          status: "ready",
+          commands: all.filter(
             (cmd) =>
               cmd.userInvocable !== false &&
               cmd.isHidden !== true &&
               isCommandEnabled(cmd),
           ),
-        );
+        });
       })
       .catch((error) => {
-        // Palette degrades to built-ins only on load failure — never silently:
-        // a rejected load leaves every dynamic command (skills, rails,
-        // plugins) reporting "Unknown command" on submit.
+        if (cancelled) return;
+        setDynamicCommandSnapshot({
+          source,
+          status: "failed",
+          commands: [],
+          error: error instanceof Error ? error.message : String(error),
+        });
         logForDebugging(
           `dynamic TUI command load failed; palette degraded to built-ins: ${
             error instanceof Error
@@ -4730,21 +4758,27 @@ function AgenCTuiShell(props: AgenCTuiShellProps): React.ReactElement {
     return () => {
       cancelled = true;
     };
-  }, [
-    dynamicCommandPluginStorageRoot,
-    dynamicCommandsCwd,
-    config,
-    props.session.services.skillsManager,
-  ]);
+  }, [dynamicCommandSource]);
+  const dynamicCommandLoadError =
+    dynamicCommandSnapshot.source === dynamicCommandSource &&
+    dynamicCommandSnapshot.status === "failed"
+      ? dynamicCommandSnapshot.error
+      : undefined;
   const commands = useMemo(() => {
     const seen = new Set(
       builtinTuiCommands.map((cmd) => cmd.name.toLowerCase()),
     );
-    const extras = dynamicTuiCommands.filter(
-      (cmd) => !seen.has(cmd.name.toLowerCase()),
-    );
-    return [...builtinTuiCommands, ...extras];
-  }, [builtinTuiCommands, dynamicTuiCommands]);
+    const dynamic =
+      dynamicCommandSnapshot.source === dynamicCommandSource &&
+      dynamicCommandSnapshot.status === "ready"
+        ? dynamicCommandSnapshot.commands
+        : [];
+    return [
+      ...builtinTuiCommands,
+      ...dynamic.filter((cmd) => !seen.has(cmd.name.toLowerCase())),
+    ];
+  }, [builtinTuiCommands, dynamicCommandSource, dynamicCommandSnapshot]);
+
   const agents = useAppState((state) => state.agentDefinitions.activeAgents);
   const appTasks = useAppState((s) => s.tasks);
   const hasActiveLocalAgents = getActiveLocalAgentTasks(appTasks).length > 0;
@@ -5598,6 +5632,85 @@ function AgenCTuiShell(props: AgenCTuiShellProps): React.ReactElement {
         }
         return null;
       };
+      const submitPromptCommand = async (
+        parsedCommand: NonNullable<ReturnType<typeof parseDollarSkillCommand>>,
+        command: Extract<Command, { type: "prompt" }>,
+        displayText: string,
+      ): Promise<void> => {
+        let admissionLease: {
+          commit(): void;
+          rollback(): boolean;
+        } | null = null;
+        let workbenchLease: { settle(admitted: boolean): void } | null = null;
+        let submitted = false;
+        try {
+          try {
+            setComposerPastedContentsForView(submissionWorkspaceView, {});
+            const loaded = await loadDollarSkillCommandForTurn(
+              parsedCommand,
+              command,
+              getToolUseContext(
+                transcriptMessagesRef.current as any[],
+                [],
+                new AbortController(),
+              ) as PromptInputContext,
+            );
+            const admissionToken = admitPendingInputs([
+              ...(attachmentsMessage !== null ? [attachmentsMessage] : []),
+              loaded.metadata,
+              { content: loaded.blocks },
+            ]);
+            admissionLease = {
+              commit: () => {
+                if (admissionToken !== null) {
+                  props.session.commitIdleInputAdmission?.(admissionToken);
+                }
+              },
+              rollback: () =>
+                admissionToken !== null &&
+                props.session.rollbackIdleInputAdmission?.(admissionToken) ===
+                  true,
+            };
+            startPendingSubmission();
+            const workbenchAdmission = armWorkbenchAttachmentAdmission();
+            workbenchLease = {
+              settle: (admitted) =>
+                settleWorkbenchAttachmentAdmission(workbenchAdmission, admitted),
+            };
+            await submitToSession("", { displayUserMessage: displayText });
+            submitted = true;
+          } finally {
+            try {
+              if (submitted) {
+                admissionLease?.commit();
+              } else if (admissionLease === null || admissionLease.rollback()) {
+                restoreComposerDraftForView(submissionWorkspaceView, {
+                  input: draftRestoreValue,
+                  pastedContents: activePastedContents,
+                });
+              }
+            } finally {
+              workbenchLease?.settle(submitted);
+            }
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          showTransientResult(message, { display: "error" });
+          addNotification({
+            key: "prompt-submit-failed",
+            text: submitted
+              ? `Message sent, but cleanup failed: ${message}`
+              : `Message not sent: ${message}`,
+            color: "error",
+            priority: "immediate",
+            timeoutMs: 10_000,
+            wrap: true,
+          });
+          if (options?.rethrowSubmitError) throw error;
+        } finally {
+          if (!submitted) setPendingSubmission(false);
+        }
+      };
       // Slash-command interception. The daemon-backed TUI does not have
       // any server-side slash-command dispatch — every / input would
       // otherwise be forwarded to the model as plain text and the model
@@ -5625,69 +5738,14 @@ function AgenCTuiShell(props: AgenCTuiShellProps): React.ReactElement {
           slashPromptCommand.userInvocable !== false &&
           isCommandEnabled(slashPromptCommand)
         ) {
-          let inputsAdmitted = false;
-          let admissionToken: string | null = null;
-          let workbenchAdmission: PendingWorkbenchAttachmentAdmission | null =
-            null;
-          try {
-            const loaded = await loadDollarSkillCommandForTurn(
-              {
-                commandName: parsedSlashCommand.name,
-                args: parsedSlashCommand.argsRaw,
-              },
-              slashPromptCommand,
-              getToolUseContext(
-                transcriptMessagesRef.current as any[],
-                [],
-                new AbortController(),
-              ) as PromptInputContext,
-            );
-            const pendingInputs = [
-              ...(attachmentsMessage !== null ? [attachmentsMessage] : []),
-              loaded.metadata,
-              { content: loaded.blocks },
-            ];
-            admissionToken = admitPendingInputs(pendingInputs);
-            inputsAdmitted = true;
-            setComposerPastedContentsForView(submissionWorkspaceView, {});
-            startPendingSubmission();
-            workbenchAdmission = armWorkbenchAttachmentAdmission();
-            await submitToSession("", { displayUserMessage: text_0 });
-            if (admissionToken !== null) {
-              props.session.commitIdleInputAdmission?.(admissionToken);
-            }
-            settleWorkbenchAttachmentAdmission(workbenchAdmission, true);
-          } catch (err_slash_prompt) {
-            settleWorkbenchAttachmentAdmission(workbenchAdmission, false);
-            const message_slash_prompt =
-              err_slash_prompt instanceof Error
-                ? err_slash_prompt.message
-                : String(err_slash_prompt);
-            showTransientResult(message_slash_prompt, { display: "error" });
-            addNotification({
-              key: "prompt-submit-failed",
-              text: `Message not sent: ${message_slash_prompt}`,
-              color: "error",
-              priority: "immediate",
-              timeoutMs: 10_000,
-              // The remediation lives at the tail of these messages
-              // (sandbox setup commands, failing paths); truncating to one
-              // line hides exactly the part the user needs.
-              wrap: true,
-            });
-            setPendingSubmission(false);
-            const rolledBack =
-              admissionToken !== null &&
-              props.session.rollbackIdleInputAdmission?.(admissionToken) ===
-                true;
-            if (!inputsAdmitted || rolledBack) {
-              restoreComposerDraftForView(submissionWorkspaceView, {
-                input: draftRestoreValue,
-                pastedContents: activePastedContents,
-              });
-            }
-            if (options?.rethrowSubmitError) throw err_slash_prompt;
-          }
+          await submitPromptCommand(
+            {
+              commandName: parsedSlashCommand.name,
+              args: parsedSlashCommand.argsRaw,
+            },
+            slashPromptCommand,
+            text_0,
+          );
           return;
         }
         try {
@@ -5823,66 +5881,7 @@ function AgenCTuiShell(props: AgenCTuiShellProps): React.ReactElement {
           commands as unknown as Command[],
         );
         if (isDollarSkillCommand(command)) {
-          let inputsAdmitted = false;
-          let admissionToken: string | null = null;
-          let workbenchAdmission: PendingWorkbenchAttachmentAdmission | null =
-            null;
-          try {
-            const loaded = await loadDollarSkillCommandForTurn(
-              parsedDollarSkill,
-              command,
-              getToolUseContext(
-                transcriptMessagesRef.current as any[],
-                [],
-                new AbortController(),
-              ) as PromptInputContext,
-            );
-            const pendingInputs = [
-              ...(attachmentsMessage !== null ? [attachmentsMessage] : []),
-              loaded.metadata,
-              { content: loaded.blocks },
-            ];
-            admissionToken = admitPendingInputs(pendingInputs);
-            inputsAdmitted = true;
-            setComposerPastedContentsForView(submissionWorkspaceView, {});
-            startPendingSubmission();
-            workbenchAdmission = armWorkbenchAttachmentAdmission();
-            await submitToSession("", { displayUserMessage: text_0 });
-            if (admissionToken !== null) {
-              props.session.commitIdleInputAdmission?.(admissionToken);
-            }
-            settleWorkbenchAttachmentAdmission(workbenchAdmission, true);
-          } catch (err_1) {
-            settleWorkbenchAttachmentAdmission(workbenchAdmission, false);
-            const message_0 =
-              err_1 instanceof Error ? err_1.message : String(err_1);
-            showTransientResult(message_0, {
-              display: "error",
-            });
-            addNotification({
-              key: "prompt-submit-failed",
-              text: `Message not sent: ${message_0}`,
-              color: "error",
-              priority: "immediate",
-              timeoutMs: 10_000,
-              // The remediation lives at the tail of these messages
-              // (sandbox setup commands, failing paths); truncating to one
-              // line hides exactly the part the user needs.
-              wrap: true,
-            });
-            setPendingSubmission(false);
-            const rolledBack =
-              admissionToken !== null &&
-              props.session.rollbackIdleInputAdmission?.(admissionToken) ===
-                true;
-            if (!inputsAdmitted || rolledBack) {
-              restoreComposerDraftForView(submissionWorkspaceView, {
-                input: draftRestoreValue,
-                pastedContents: activePastedContents,
-              });
-            }
-            if (options?.rethrowSubmitError) throw err_1;
-          }
+          await submitPromptCommand(parsedDollarSkill, command, text_0);
           return;
         }
         if (command?.type === "local") {
@@ -7229,6 +7228,12 @@ function AgenCTuiShell(props: AgenCTuiShellProps): React.ReactElement {
   ) : null;
   const bottomContent = (
     <Box flexDirection="column" flexGrow={1}>
+      {dynamicCommandLoadError !== undefined ? (
+        <Text color="warning" wrap="wrap">
+          Dynamic commands unavailable: {dynamicCommandLoadError}. Built-in
+          commands remain available.
+        </Text>
+      ) : null}
       {backpressureWarning !== null ? (
         <Text color="warning" wrap="truncate">
           {backpressureWarning}

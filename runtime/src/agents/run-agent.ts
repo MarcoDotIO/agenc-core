@@ -19,6 +19,7 @@
 
 import { normalize } from "node:path";
 import { LRUCache } from "lru-cache";
+import { createInertMcpManager } from "../mcp-client/inert-manager.js";
 import { createChildAbortController } from "../utils/abortController.js";
 import type {
   LLMChatOptions,
@@ -27,7 +28,6 @@ import type {
   LLMProvider,
   LLMProviderStartupPrewarmHandle,
   LLMProviderStartupPrewarmParams,
-  LLMTool,
   LLMUsage,
 } from "../llm/types.js";
 import { validateAgentInvocationMessageSequence } from "../contracts/agent-invocation-envelope.js";
@@ -43,6 +43,10 @@ import {
 } from "../llm/provider.js";
 import { createEmptyToolPermissionContext } from "../permissions/types.js";
 import { DEFAULT_MAX_RESULT_SIZE_CHARS } from "../constants/toolLimits.js";
+import {
+  toRuntimeTools,
+  type RuntimeTool as AgentRuntimeTool,
+} from "../llm/runtime-tool-projection.js";
 import type {
   ToolRegistry,
   ToolDispatchResult,
@@ -656,14 +660,6 @@ interface AgentRunContext {
   readonly cwd?: string;
 }
 
-type AgentRuntimeTool = LLMTool & {
-  readonly name: string;
-  readonly description: string;
-  readonly inputJSONSchema: Record<string, unknown>;
-  readonly isMcp: boolean;
-  readonly maxResultSizeChars: number;
-};
-
 interface AgentModelContext {
   readonly model: string;
   readonly contextWindowTokens: number;
@@ -733,7 +729,10 @@ function buildAgentRunContext(
     sessionId: session.conversationId,
     options: {
       mainLoopModel: model.model,
-      tools: toAgentRuntimeTools(session.services.registry.toLLMTools()),
+      tools: toRuntimeTools(
+        session.services.registry.toLLMTools(),
+        DEFAULT_MAX_RESULT_SIZE_CHARS,
+      ),
       mcpClients: Array.isArray(surface.mcpClients) ? surface.mcpClients : [],
       contextWindowTokens: model.contextWindowTokens,
       ...(model.maxOutputTokens !== undefined
@@ -805,20 +804,6 @@ function toAgentModelContext(ctx: TurnContext): AgentModelContext {
       ? { maxOutputTokens: ctx.modelInfo.maxOutputTokens }
       : {}),
   };
-}
-
-function toAgentRuntimeTools(tools: readonly LLMTool[]): AgentRuntimeTool[] {
-  return tools.map((tool) => {
-    const name = tool.function.name;
-    return {
-      ...tool,
-      name,
-      description: tool.function.description,
-      inputJSONSchema: tool.function.parameters,
-      isMcp: name.startsWith("mcp__"),
-      maxResultSizeChars: DEFAULT_MAX_RESULT_SIZE_CHARS,
-    };
-  });
 }
 
 function firstNonEmpty(
@@ -1591,6 +1576,11 @@ function requestParentFollowupTurn(params: {
   readonly parent: Session;
 }): void {
   const parent = params.parent;
+  // The user stopped this session's last turn and has not spoken since: hold
+  // the receipt in the mailbox for the next user turn instead of starting a
+  // turn of our own, which would resume the very work the user stopped
+  // (#2236: an interrupted verifier's receipt restarted an 18-minute turn).
+  if (parent.stoppedByUserSinceLastPrompt === true) return;
   // Coalesce bursts of subagent completions into ONE parent turn. Each
   // completion notifies the parent's mailbox and then requests a follow-up
   // turn; without coalescing, N near-simultaneous completions queue N
@@ -1620,6 +1610,11 @@ function requestParentFollowupTurn(params: {
   const schedule = (delayMs = PARENT_FOLLOWUP_COALESCE_MS): void => {
     state.timer = setTimeout(() => {
       state.timer = null;
+      // A stop that landed inside the coalescing window holds the burst too.
+      if (parent.stoppedByUserSinceLastPrompt === true) {
+        followupTurnStateByParent.delete(parent);
+        return;
+      }
       state.submitInFlight = true;
       let transientSubmitFailure = false;
       void parent
@@ -2883,18 +2878,6 @@ function terminalResultForLiveAgent(live: LiveAgent): ChildRunTerminalResult {
   }
 }
 
-function createInertChildMcpManager(): Session["services"]["mcpManager"] {
-  return {
-    effectiveServers: async () => new Map(),
-    toolPluginProvenance: async () => null,
-    getTools: () => [],
-    getToolsByServer: () => [],
-    getConfiguredServers: () => [],
-    getConnectedServers: () => [],
-    isConnected: () => false,
-  };
-}
-
 function prepareChildSessionAuthority(
   params: RunAgentParams,
 ): ChildSessionAuthority {
@@ -3017,7 +3000,7 @@ function buildChildSession(
       // A child has no independently owned MCP transport in this path. Never
       // retain the parent's manager or its live tool closures under a forked
       // sandbox authority; refresh is deliberately inert and local.
-      mcpManager: createInertChildMcpManager(),
+      mcpManager: createInertMcpManager(),
       lspManager: undefined,
       ...(sandboxExecutionBroker !== undefined
         ? { sandboxExecutionBroker }

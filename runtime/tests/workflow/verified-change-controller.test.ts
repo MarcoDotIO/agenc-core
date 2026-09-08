@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  resolveWorkflowPermissionMode,
   VerifiedChangeWorkflowController,
   WorkflowIntakeError,
   type WorkflowAgentSpawner,
@@ -33,7 +34,10 @@ import {
   openStateDatabases,
   type StateSqliteDriver,
 } from "../../src/state/sqlite-driver.js";
-import type { ReviewerInvoker } from "../../src/workflow/independent-review.js";
+import {
+  ReviewInvocationError,
+  type ReviewerInvoker,
+} from "../../src/workflow/independent-review.js";
 import type {
   WorkflowCommandResult,
   WorkflowCommandRunner,
@@ -437,6 +441,8 @@ class FakeReviewer implements ReviewerInvoker {
   readonly responses: string[] = [];
   /** Simulate a daemon death mid-review (before the reviewer settled). */
   onInvoke?: () => void;
+  /** Errors to throw instead of answering, in order (soak F76). */
+  readonly errors: Error[] = [];
 
   async invoke(input: {
     reviewerModel: string;
@@ -447,6 +453,8 @@ class FakeReviewer implements ReviewerInvoker {
       userMessage: input.userMessage,
     });
     this.onInvoke?.();
+    const error = this.errors.shift();
+    if (error !== undefined) throw error;
     return this.responses.shift() ?? APPROVING_REVIEW;
   }
 }
@@ -493,7 +501,9 @@ interface Harness {
 
 const RUN_ID = "run-wf-1";
 
-function makeHarness(): Harness {
+function makeHarness(
+  options: { readonly defaultReviewerModel?: () => string | undefined } = {},
+): Harness {
   const home = mkdtempSync(join(tmpdir(), "agenc-m5-controller-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "agenc-m5-controller-cwd-"));
   mkdirSync(join(cwd, ".git"));
@@ -526,6 +536,9 @@ function makeHarness(): Harness {
     commands,
     spawner,
     reviewer,
+    ...(options.defaultReviewerModel !== undefined
+      ? { defaultReviewerModel: options.defaultReviewerModel }
+      : {}),
     evidenceLedger: async (spec) => {
       let ledger = ledgers.get(spec.runId);
       if (ledger === undefined) {
@@ -586,6 +599,104 @@ let harness: Harness;
 
 beforeEach(() => {
   harness = makeHarness();
+});
+
+describe("verifier prompt", () => {
+  it("tells the verifier where scratch files may go", async () => {
+    // Soak F65: a verifier wrote fixtures to /tmp and the sandbox refused them.
+    await runToTerminal(harness);
+    const verify = harness.spawner.spawns.find((spawn) => spawn.kind === "verify_agent");
+    expect(verify?.prompt).toContain("under `tmp/` inside the worktree");
+    expect(verify?.prompt).toContain("refuses writes outside the workspace");
+  });
+});
+
+describe("retry prompts", () => {
+  it("carry the verifier's report into the re-implement and re-verify prompts", async () => {
+    // Soak F73: the implementer saw only `Agent verdict: FAIL` and changed
+    // nothing, and the second verifier re-derived the same defects from
+    // scratch. Attempt 1 fails on the agent's verdict alone.
+    const report =
+      "### Check: undo after a merge with duplicate ids\n" +
+      "undo restored one of two rows\n" +
+      "VERDICT: FAIL";
+    harness.spawner.queue("verify_agent", {
+      status: "completed",
+      finalMessage: report,
+      usage: DEFAULT_USAGE,
+    });
+    await runToTerminal(harness);
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)?.status).toBe(
+      "completed",
+    );
+    const implementSpawns = harness.spawner.spawns.filter(
+      (spawn) => spawn.kind === "implement",
+    );
+    const verifySpawns = harness.spawner.spawns.filter(
+      (spawn) => spawn.kind === "verify_agent",
+    );
+    expect(implementSpawns).toHaveLength(2);
+    expect(verifySpawns).toHaveLength(2);
+    // A first attempt carries nothing: there is no report yet.
+    expect(implementSpawns[0].prompt).not.toContain("Verifier's report");
+    expect(verifySpawns[0].prompt).not.toContain("Previous verification attempt");
+    // The retry names the failures to fix.
+    expect(implementSpawns[1].prompt).toContain("Agent verdict: FAIL");
+    expect(implementSpawns[1].prompt).toContain("undo restored one of two rows");
+    expect(implementSpawns[1].prompt).toContain(
+      "Fix every failure reported above, then stop.",
+    );
+    // The second verifier re-checks the reported failures first.
+    expect(verifySpawns[1].prompt).toContain(
+      "## Previous verification attempt 1 (verdict FAIL)",
+    );
+    expect(verifySpawns[1].prompt).toContain("undo restored one of two rows");
+    expect(verifySpawns[1].prompt).toContain("Re-check every");
+  });
+});
+
+describe("permission mode at start", () => {
+  // Desktop soak F63: a goal started from the app in default mode planned, then
+  // both implement attempts died because no approver existed for the headless
+  // children and every Edit, Write and command was refused.
+  it("runs a default-mode or unset request under the workflow's own default", () => {
+    expect(resolveWorkflowPermissionMode("default")).toBe("acceptEdits");
+    expect(resolveWorkflowPermissionMode(undefined)).toBe("acceptEdits");
+    expect(resolveWorkflowPermissionMode("plan")).toBe("plan");
+    expect(resolveWorkflowPermissionMode("bypassPermissions")).toBe("bypassPermissions");
+  });
+
+  it("warns once when a run asked for default mode, and still completes", async () => {
+    await runToTerminal(harness, { permissionMode: "default" });
+    expect(harness.warnings.filter((w) => /default permission mode/.test(w))).toHaveLength(1);
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)).toMatchObject({ status: "completed" });
+  });
+});
+
+describe("reviewer model resolution at start", () => {
+  // Desktop soak, 2026-09-06: with neither `reviewerModel` nor `model` the
+  // spec froze the placeholder "default-reviewer", the provider answered 404,
+  // and a goal whose other stages had all committed ended unknown_outcome.
+  it("pins the daemon's default model when the caller names none", async () => {
+    const own = makeHarness({ defaultReviewerModel: () => "grok-4.6" });
+    await runToTerminal(own, { model: undefined, reviewerModel: undefined });
+    expect(own.reviewer.invocations[0]?.reviewerModel).toBe("grok-4.6");
+  });
+
+  it("prefers the caller's model over the daemon's default", async () => {
+    const own = makeHarness({ defaultReviewerModel: () => "grok-4.6" });
+    await runToTerminal(own, { model: "grok-4", reviewerModel: undefined });
+    expect(own.reviewer.invocations[0]?.reviewerModel).toBe("grok-4");
+  });
+
+  it("refuses a start that can name no reviewer model", async () => {
+    const own = makeHarness();
+    await expect(
+      own.controller.start(
+        startParams(own, { model: undefined, reviewerModel: undefined }),
+      ),
+    ).rejects.toThrow(/no reviewer model/);
+  });
 });
 
 afterEach(() => {
@@ -714,6 +825,9 @@ describe("VerifiedChangeWorkflowController — stop reasons", () => {
     );
     expect(implementSpawns).toHaveLength(2);
     expect(implementSpawns[1].prompt).toContain("Previous verification failure");
+    // The verifier's own report travels too, whatever its verdict was.
+    expect(implementSpawns[1].prompt).toContain("### Verifier's report");
+    expect(implementSpawns[1].prompt).toContain("checked everything");
   });
 
   it("review_rejected on blocking findings, with the review durably committed", async () => {
@@ -1170,6 +1284,53 @@ describe("VerifiedChangeWorkflowController — review-child adoption (A1 for the
     );
     // Attempt 1: the reply and its repair turn. Attempt 2: one verdict.
     expect(harness.reviewer.invocations).toHaveLength(3);
+  });
+});
+
+describe("VerifiedChangeWorkflowController — reviewer that never answered", () => {
+  // Soak F76: the reviewer's single model call got a 403 on a stale OAuth
+  // bearer; the error was rethrown untyped and the run died as
+  // unknown_outcome with an operator review pending. A read-only reviewer
+  // that settled without output is a known failure with a bounded retry.
+  it("a failed review invocation is a known failure that retries once", async () => {
+    harness.reviewer.errors.push(
+      new ReviewInvocationError("grok authentication failed (HTTP 403)"),
+    );
+    await runToTerminal(harness);
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)?.status).toBe(
+      "completed",
+    );
+    const first = harness.repo.getEffect(RUN_ID, "workflow.review");
+    expect(first?.outcome).toBe("failed");
+    expect(
+      harness.repo.getEffect(RUN_ID, "workflow.review#2")?.outcome,
+    ).toBe("committed");
+    // The failed attempt is durable as a FAILED review child terminal that
+    // names the cause, never as a pending unknown outcome.
+    expect(
+      harness.repo.getCurrentTerminalResult(`${RUN_ID}:review#1`),
+    ).toMatchObject({
+      status: "failed",
+      finalMessage: expect.stringContaining(
+        "grok authentication failed (HTTP 403)",
+      ),
+    });
+    expect(harness.reviewer.invocations).toHaveLength(2);
+  });
+
+  it("two failed invocations end the run failed, not unknown_outcome", async () => {
+    harness.reviewer.errors.push(
+      new ReviewInvocationError("grok authentication failed (HTTP 403)"),
+      new ReviewInvocationError("grok authentication failed (HTTP 403)"),
+    );
+    await runToTerminal(harness);
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)).toMatchObject({
+      status: "failed",
+      stopReason: "step_retries_exhausted",
+    });
+    expect(
+      harness.repo.listEffects(RUN_ID).filter((e) => e.outcome === "unknown_outcome"),
+    ).toHaveLength(0);
   });
 });
 

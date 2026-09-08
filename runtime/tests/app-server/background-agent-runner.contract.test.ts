@@ -578,6 +578,7 @@ function makeTopLevelRunner(opts: {
   const rolloutStore = {
     rolloutPath: `/tmp/${opts.conversationId}.jsonl`,
     readAll: () => [...rolloutItems],
+    liveHistoryBlockedReason: vi.fn((): string | undefined => undefined),
     assertRunSuspendable: vi.fn(() => {}),
     recordRunSuspensionEvent: vi.fn(() => {}),
     recordRunStartupActivationEvent: vi.fn(() => {}),
@@ -736,6 +737,9 @@ function makeTopLevelRunner(opts: {
   };
   let nextInternalSubId = 0;
   const sessionAbortController = new AbortController();
+  // The real Session latches a client Stop until the next user message; the
+  // stub carries the same state so tests can read it, not just the calls.
+  let stoppedByUserSinceLastPrompt = false;
   const session = {
     abortController: sessionAbortController,
     abortTerminal: vi.fn((reason: string) => {
@@ -744,6 +748,7 @@ function makeTopLevelRunner(opts: {
       }
     }),
     conversationId: opts.conversationId,
+    modelInfo: { slug: "base-model", contextWindow: 65_536 },
     providerService,
     permissionModeRegistry,
     get sessionConfiguration() {
@@ -805,6 +810,15 @@ function makeTopLevelRunner(opts: {
       unsafePeek: () => sessionState,
     },
     abortAllTasks: vi.fn(async () => {}),
+    markStoppedByUser: vi.fn(() => {
+      stoppedByUserSinceLastPrompt = true;
+    }),
+    clearUserStop: vi.fn(() => {
+      stoppedByUserSinceLastPrompt = false;
+    }),
+    get stoppedByUserSinceLastPrompt() {
+      return stoppedByUserSinceLastPrompt;
+    },
     trackDurableOperation: <T>(operation: Promise<T>): Promise<T> => {
       durableOperations.add(operation);
       void operation.then(
@@ -945,6 +959,7 @@ function makeTopLevelRunner(opts: {
   };
   const bootstrap = vi.fn(async () => ({
     workspaceRoot,
+    modelInfo: { slug: "base-model", contextWindow: 65_536 },
     configStore,
     get configuredExecutionAuthority() {
       return configuredExecutionAuthority;
@@ -2311,6 +2326,81 @@ describe("AgenC delegate background-agent runner", () => {
     expect(runtimeEnvironment).not.toHaveProperty("AGENC_CREDENTIAL_DOCS_MCP");
   });
 
+  it.each([30_000, 50])("bounds a hung stop at %i ms, aborts execution, and retires the generation", async (timeoutMs) => {
+    const release = Promise.withResolvers<void>();
+    const h = makeTopLevelRunner({
+      conversationId: "session-stop-deadline",
+      additionalRunnerOptions: { agentStopTimeoutMs: timeoutMs },
+      bootstrapShutdown: vi.fn(() => release.promise),
+    });
+    const abortController = new AbortController();
+    const beginShutdown = vi.fn();
+    Object.assign(h.session, {
+      abortController, beginShutdown,
+      abortAllTasks: vi.fn(() => release.promise),
+    });
+    await h.runner.startAgent({
+      objective: "bounded stop", initialContent: [],
+      unattendedAllow: [], unattendedDeny: [],
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let settled = false;
+    const stopping = h.runner.stopAgent("session-stop-deadline").catch((error: unknown) => {
+      settled = true;
+      return error;
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(timeoutMs);
+      expect(abortController.signal.aborted).toBe(true);
+      expect(beginShutdown).toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(settled).toBe(true);
+      expect(await stopping).toMatchObject({
+        name: "DaemonOperationTimeoutError", code: "DAEMON_OPERATION_TIMEOUT",
+      });
+      expect(await h.runner.getAgentSnapshot("session-stop-deadline")).toBeNull();
+    } finally {
+      release.resolve();
+      await stopping;
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds restore waiting for a previous generation without starting another bootstrap", async () => {
+    const release = Promise.withResolvers<void>();
+    const h = makeTopLevelRunner({
+      conversationId: "session-restore-deadline",
+      bootstrapShutdown: vi.fn(() => release.promise),
+    });
+    Object.assign(h.session, {
+      abortController: new AbortController(),
+      abortAllTasks: vi.fn(() => release.promise),
+    });
+    await h.runner.startAgent({
+      objective: "bounded restore", initialContent: [],
+      unattendedAllow: [], unattendedDeny: [],
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    h.stub.pushStatus({ status: "completed", turnId: "old-turn", endedAtMs: 2, lastMessage: "done" });
+    await vi.advanceTimersByTimeAsync(0);
+    let settled = false;
+    const restoring = h.runner.restoreAgent({
+      agentId: "session-restore-deadline", objective: "bounded restore",
+      reopenTerminalRun: true,
+    }).catch((error: unknown) => { settled = true; return error; });
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(settled).toBe(true);
+      expect(await restoring).toMatchObject({ name: "DaemonOperationTimeoutError" });
+      expect(h.bootstrap).toHaveBeenCalledOnce();
+    } finally {
+      release.resolve();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await restoring;
+      vi.useRealTimers();
+    }
+  });
+
   it("waits for the exact terminal generation cleanup before explicit restore", async () => {
     let releaseShutdown!: () => void;
     const shutdownBlocked = new Promise<void>((resolve) => {
@@ -2361,6 +2451,36 @@ describe("AgenC delegate background-agent runner", () => {
     await expect(
       runner.getAgentSnapshot("session-generation-race"),
     ).resolves.not.toBeNull();
+  });
+
+  it("reports a cold-restored agent idle until a turn starts", async () => {
+    // A hydrated thread reports pending_init, which maps to "running"; with
+    // nothing to resume the restored agent must read idle until its next
+    // prompt, not sit in every agent list as a working agent.
+    const harness = makeTopLevelRunner({
+      conversationId: "session-restored-idle",
+      threadInitialStatus: { status: "pending_init" },
+    });
+    await expect(
+      harness.runner.restoreAgent({
+        agentId: "session-restored-idle",
+        objective: "retained objective",
+        explicitColdResume: true,
+        initialMessages: [{ role: "user" as const, content: "retained" }],
+      }),
+    ).resolves.toBe(true);
+    const restored = await harness.runner.getAgentSnapshot("session-restored-idle");
+    expect(restored?.status).toBe("idle");
+
+    harness.stub.pushStatus({
+      status: "running",
+      turnId: "turn-after-restart",
+      startedAtMs: 3,
+    });
+    await vi.waitFor(async () => {
+      const snapshot = await harness.runner.getAgentSnapshot("session-restored-idle");
+      expect(snapshot?.status).toBe("running");
+    });
   });
 
   it("retires a failed restore generation so an exact retry can proceed", async () => {
@@ -2989,6 +3109,77 @@ describe("AgenC delegate background-agent runner", () => {
       }),
     ).rejects.toThrow(/disabled by managed policy/u);
     expect(harness.stateRepository.reload).toHaveBeenCalled();
+  });
+
+  it("restores matching snapshot fields without comparing durable metadata", async () => {
+    const runId = "session-settings-comparison-metadata";
+    const baseline = canonicalRuntimeSettings();
+    const rolloutItems = [runtimeSettingsRolloutItem(runId, baseline)];
+    const harness = makeTopLevelRunner({
+      conversationId: runId,
+      rolloutItems,
+      canonicalRuntimeSettings: true,
+    });
+    const projection = {
+      ...baseline,
+      eventId: `runtime-settings:${runId}:initial`,
+      epoch: 1,
+    };
+
+    await expect(
+      harness.runner.restoreAgent({
+        agentId: runId,
+        objective: "compare canonical settings fields",
+        explicitColdResume: true,
+        runtimeSettings: projection,
+      }),
+    ).resolves.toBe(true);
+
+    expect(recordedRuntimeSettingsEvents(rolloutItems)).toHaveLength(1);
+    expect((await harness.runner.getAgentSnapshot(runId))?.runtimeSettings)
+      .toEqual(baseline);
+  });
+
+  it.each(["missing", "conflicting", "serialization-hook"])(
+    "rejects a %s canonical settings projection during restore",
+    async (scenario) => {
+      const runId = `session-settings-comparison-${scenario}`;
+      const baseline = canonicalRuntimeSettings();
+      const rolloutItems = scenario === "missing"
+        ? []
+        : [runtimeSettingsRolloutItem(runId, baseline)];
+      const harness = makeTopLevelRunner({
+        conversationId: runId,
+        rolloutItems,
+        canonicalRuntimeSettings: true,
+      });
+      const serialize = vi.fn(() => baseline);
+      const projection = {
+        ...baseline,
+        hooksDisabled: true,
+        ...(scenario === "serialization-hook" ? { toJSON: serialize } : {}),
+      };
+
+      await expect(
+        harness.runner.restoreAgent({
+          agentId: runId,
+          objective: "reject inconsistent settings evidence",
+          explicitColdResume: true,
+          runtimeSettings: projection,
+        }),
+      ).rejects.toThrow("runtime settings disagree with canonical run");
+
+      expect(serialize).not.toHaveBeenCalled();
+      expect(await harness.runner.getAgentSnapshot(runId)).toBeNull();
+      expect(recordedRuntimeSettingsEvents(rolloutItems))
+        .toHaveLength(scenario === "missing" ? 0 : 1);
+    },
+  );
+
+  it("uses field comparison throughout runner restore and configuration", () => {
+    const source = readFileSync(backgroundAgentRunnerSourcePath, "utf8");
+    expect(source.includes("stableStringify")).toBe(false);
+    expect(source).toContain("runtimeSettingsEqual");
   });
 
   it("durably applies explicit restore overrides after the canonical settings baseline", async () => {
@@ -4218,6 +4409,24 @@ describe("AgenC delegate background-agent runner", () => {
     });
   });
 
+  it.each(["completed", "error", "max_turns", "cancelled"] as const)("finalizes a routine's %s phase as the matching canonical outcome", async (stopReason) => {
+    const agentId = "session-routine-finalize";
+    const { runner, rolloutItems, control, session } = makeTopLevelRunner({ conversationId: agentId });
+    await runner.startAgent({ objective: "one routine", deferInitialTurn: true, unattendedAllow: [], unattendedDeny: [] });
+    control.sendInput.mockImplementationOnce(async () => { session.emitPhaseEvent({ type: "turn_complete", content: "done", stopReason, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } }); });
+    await runner.submitAgentMessage(agentId, { sessionId: agentId, content: "inspect", originalContent: "inspect", messageId: "routine-message", streamId: "routine-stream", acceptedAt: "2026-05-09T00:00:00.000Z" });
+    await expect(runner.finishAgentRun(agentId, "unrelated-message")).rejects.toThrow("unknown routine message");
+    const status = stopReason === "completed" ? "completed" : stopReason === "cancelled" ? "cancelled" : "failed";
+    expect(await runner.finishAgentRun(agentId, "routine-message")).toBe(status);
+    const terminal = rolloutItems.flatMap((item) => {
+      const event = (item as { payload?: { msg?: { type?: string; payload?: unknown } } }).payload?.msg;
+      return event?.type === "run_terminal" ? [event.payload] : [];
+    });
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]).toMatchObject({ status, exitCode: status === "completed" ? 0 : status === "cancelled" ? 130 : 1, stopReason: `routine_${status}` });
+    await expect(runner.getAgentSnapshot(agentId)).resolves.toBeNull();
+  });
+
   it("suspends a daemon-shutdown idle run without poisoning it terminal", async () => {
     let clock = "2026-05-09T00:00:00.000Z";
     const { runner, rolloutItems, rolloutStore } = makeTopLevelRunner({
@@ -5369,6 +5578,34 @@ describe("AgenC delegate background-agent runner", () => {
     expect(recordedRuntimeSettingsEvents(rolloutItems)).toHaveLength(
       beforeEvents,
     );
+  });
+
+  it.each([undefined, null])("normalizes absent optional runtime settings from %s", async (absent) => {
+    const agentId = `normalized-runtime-settings-${String(absent)}`;
+    const { runner, sessionState, rolloutItems } = makeTopLevelRunner({
+      conversationId: agentId,
+      canonicalRuntimeSettings: true,
+    });
+    Object.assign(sessionState.sessionConfiguration.collaborationMode, {
+      reasoningEffort: absent,
+    });
+    Object.assign(sessionState.sessionConfiguration, {
+      modelVerbosity: absent,
+      serviceTier: absent,
+    });
+    await runner.startAgent({ objective: "work", cwd: process.cwd() });
+
+    const canonicalAbsent = {
+      prePlanMode: null,
+      bypassPermissionsWorkspace: null,
+      bypassPermissionsConsentWorkspace: null,
+      profile: null,
+      reasoningEffort: null,
+      modelVerbosity: null,
+      serviceTier: null,
+    };
+    expect((await runner.getAgentSnapshot(agentId))?.runtimeSettings).toMatchObject(canonicalAbsent);
+    expect(recordedRuntimeSettingsEvents(rolloutItems).at(-1)?.msg?.payload).toMatchObject(canonicalAbsent);
   });
 
   it("keeps canonical runtime settings detached from mutable in-process snapshots", async () => {
@@ -8779,6 +9016,34 @@ describe("AgenC delegate background-agent runner", () => {
     expect(control.sendInput).toHaveBeenCalledOnce();
   });
 
+  it("refuses a message once the session's live history is blocked", async () => {
+    const { runner, rolloutStore } = makeTopLevelRunner({
+      conversationId: "session-history-blocked",
+    });
+    await runner.startAgent({
+      objective: "history closes after this",
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    const reason =
+      'tool-pair history rejected during live append: tool result repeats "call-22" (44 UTF-8 bytes)';
+    rolloutStore.liveHistoryBlockedReason.mockReturnValue(reason);
+
+    await expect(
+      runner.submitAgentMessage("session-history-blocked", {
+        sessionId: "session_1",
+        content: "another prompt",
+        originalContent: "another prompt",
+        messageId: "blocked-message",
+        streamId: "blocked-message",
+        acceptedAt: "2026-08-17T00:00:00.000Z",
+      }),
+    ).rejects.toMatchObject({
+      code: "SESSION_HISTORY_BLOCKED",
+      message: expect.stringContaining(reason),
+    });
+  });
+
   it("[managed-thread] rejects opt-in admission during the initial turn without changing legacy FIFO", async () => {
     const initialSubmissionStarted = Promise.withResolvers<void>();
     const releaseInitialSubmission = Promise.withResolvers<void>();
@@ -8828,6 +9093,82 @@ describe("AgenC delegate background-agent runner", () => {
       "legacy queued turn",
       expect.objectContaining({ displayUserMessage: "legacy queued turn" }),
     );
+  });
+
+  it("[managed-thread] a prompt refused while a stop unwinds keeps the stop latched and names it", async () => {
+    const initialSubmissionStarted = Promise.withResolvers<void>();
+    const releaseInitialSubmission = Promise.withResolvers<void>();
+    const { runner, session, control, stub } = makeTopLevelRunner({
+      conversationId: "session-stop-refusal",
+      threadInitialStatus: { status: "pending_init" } as AgentStatus,
+    });
+    stub.thread.submit.mockImplementationOnce(async () => {
+      initialSubmissionStarted.resolve();
+      await releaseInitialSubmission.promise;
+      return "session-stop-refusal";
+    });
+    await runner.startAgent({
+      objective: "fan the work out to a swarm",
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    await initialSubmissionStarted.promise;
+    const child = (name: string, depth: number) =>
+      [name, { agentId: name, agentPath: `/root/${name}`, depth }] as const;
+    control.openThreadSpawnChildren.mockReturnValue([child("worker-1", 1)]);
+    control.liveThreadSpawnChildren.mockReturnValue(
+      new Map<string, ReadonlyArray<readonly [string, unknown]>>([
+        ["session-stop-refusal", [child("worker-1", 1), child("worker-2", 1)]],
+        ["worker-1", [child("worker-1/helper", 2)]],
+      ]),
+    );
+
+    expect(
+      await runner.interruptAgentTurn("session-stop-refusal", "user_cancel"),
+    ).toBe(true);
+    expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+
+    // #2201: the stopped turn is still unwinding, so the next prompt is
+    // refused. The refusal must say the session is stopping, and must not
+    // spend the stop latch — the user's words never entered the session, so
+    // a child receipt arriving next would restart the stopped work (#2236).
+    const refusal = await runner
+      .submitAgentMessage("session-stop-refusal", {
+        sessionId: "session_1",
+        content: "never mind, do something else",
+        originalContent: "never mind, do something else",
+        messageId: "refused-after-stop",
+        streamId: "refused-after-stop",
+        acceptedAt: "2026-09-07T00:00:00.000Z",
+        ifBusy: "reject",
+      })
+      .then(
+        (result) => result as unknown,
+        (error: unknown) => error,
+      );
+    expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+    expect(refusal).toBeInstanceOf(Error);
+    expect(refusal).toMatchObject({
+      code: "TURN_IN_PROGRESS",
+      // Names the stop, and counts the whole subtree still unwinding under it.
+      message: expect.stringContaining(
+        "is still stopping the turn you interrupted (3 agents still stopping)",
+      ),
+    });
+
+    // A prompt the daemon does admit still releases the latch.
+    releaseInitialSubmission.resolve();
+    await expect(
+      runner.submitAgentMessage("session-stop-refusal", {
+        sessionId: "session_1",
+        content: "do something else",
+        originalContent: "do something else",
+        messageId: "admitted-after-stop",
+        streamId: "admitted-after-stop",
+        acceptedAt: "2026-09-07T00:00:01.000Z",
+      }),
+    ).resolves.toMatchObject({ disposition: "started" });
+    expect(session.stoppedByUserSinceLastPrompt).toBe(false);
   });
 
   it("[managed-thread] accepts the first opt-in-admission message on a deferred spawn still in pending_init", async () => {
@@ -9019,6 +9360,77 @@ describe("AgenC delegate background-agent runner", () => {
       terminal: { code: 0, message: "done" },
     });
     expect(control.sendInput).not.toHaveBeenCalled();
+  });
+
+  it.each(["completed", "errored"] as const)(
+    "[managed-thread] agrees on live and replayed %s turns after diagnostics",
+    async (outcome) => {
+      const conversationId = `session-explicit-${outcome}`;
+      const { runner, session, control, rolloutItems } = makeTopLevelRunner({ conversationId });
+      const notifications: unknown[] = [];
+      await runner.startAgent({ objective: "passive", initialContent: [], unattendedAllow: [], unattendedDeny: [] });
+      await runner.attachAgentSessionEvents(conversationId, {
+        sessionId: "session_1",
+        emit: (notification) => { notifications.push(notification); },
+      });
+      control.sendInput.mockImplementationOnce(async () => {
+        session.emit({ id: "start", msg: { type: "turn_started", payload: { turnId: "turn-1" } } });
+        session.emit({ id: "diagnostic", msg: { type: "error", payload: { turnId: "turn-1", cause: "stop_hook_threw", message: "hook failed" } } });
+        session.emit({ id: "stale", msg: { type: "turn_failed", payload: { turnId: "old-turn", code: "provider_error", message: "stale failure" } } });
+        session.emit({ id: "answer", msg: { type: "agent_message", payload: { message: "full answer" } } });
+        session.emit({ id: "tokens", msg: { type: "token_count", payload: { promptTokens: 4, completionTokens: 3, totalTokens: 7 } } });
+        session.emit({ id: "terminal", msg: outcome === "errored"
+          ? { type: "turn_failed", payload: { turnId: "turn-1", code: "provider_error", message: "provider failed" } }
+          : { type: "turn_complete", payload: { turnId: "turn-1", lastAgentMessage: "full answer" } },
+        });
+      });
+      const request = {
+        sessionId: "session_1", content: "retry me", originalContent: "retry me",
+        messageId: "explicit-message", streamId: "explicit-message",
+        acceptedAt: "2026-08-17T00:00:00.000Z",
+      };
+      const terminal = outcome === "errored"
+        ? { code: 1, message: "provider failed" }
+        : { code: 0, message: "full answer" };
+      await expect(runner.submitAgentMessage(conversationId, request)).resolves.toMatchObject({ terminal, turnId: "turn-1" });
+      await expect(runner.submitAgentMessage(conversationId, request)).resolves.toMatchObject({ disposition: "duplicate", duplicateState: "completed", terminal });
+      expect(control.sendInput).toHaveBeenCalledOnce();
+      await expect(runner.getAgentSnapshot(conversationId)).resolves.toMatchObject({ status: "idle" });
+      await expect(runner.getAgentSessionTranscriptV2(conversationId, { sessionId: "session_1" })).resolves.toMatchObject({
+        turnResults: [{ turnId: "turn-1", outcome, inputTokens: 4, outputTokens: 3, totalTokens: 7 }],
+        messages: [expect.objectContaining({ text: "retry me" }), expect.objectContaining({ text: "full answer" })],
+      });
+      if (outcome === "errored") {
+        expect(notifications).toContainEqual(expect.objectContaining({
+          method: "event.session_event",
+          params: expect.objectContaining({ event: expect.objectContaining({ type: "turn_failed", payload: expect.objectContaining({ turnId: "turn-1" }) }) }),
+        }));
+      }
+      const restored = makeTopLevelRunner({ conversationId, rolloutItems: [...rolloutItems] });
+      await restored.runner.startAgent({ objective: "restored", initialContent: [], unattendedAllow: [], unattendedDeny: [] });
+      await expect(restored.runner.submitAgentMessage(conversationId, request)).resolves.toMatchObject({ disposition: "duplicate", duplicateState: "completed", terminal });
+      expect(restored.control.sendInput).not.toHaveBeenCalled();
+      await expect(runner.submitAgentMessage(conversationId, { ...request, content: "next", originalContent: "next", messageId: "next-message", streamId: "next-message" })).resolves.toMatchObject({ disposition: "started" });
+    },
+  );
+
+  it.each([false, true])("[managed-thread] journals one failed terminal before run failure (already closed: %s)", async (alreadyClosed) => {
+    const conversationId = `session-terminal-once-${alreadyClosed}`;
+    const { runner, session, stub, rolloutItems, shutdown } = makeTopLevelRunner({ conversationId });
+    await runner.startAgent({ objective: "passive", initialContent: [], unattendedAllow: [], unattendedDeny: [] });
+    session.emit({ id: "started", msg: { type: "turn_started", payload: { turnId: "failed-turn" } } });
+    if (alreadyClosed) {
+      session.emit({ id: "failed", msg: { type: "turn_failed", payload: { turnId: "failed-turn", code: "turn_execution_failed", message: "failed" } } });
+    }
+    stub.pushStatus({ status: "errored", turnId: "failed-turn", error: "failed", endedAtMs: 1_500 });
+    await vi.waitFor(() => expect(shutdown).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(rolloutItems).toContainEqual(expect.objectContaining({ payload: expect.objectContaining({ msg: expect.objectContaining({ type: "run_terminal" }) }) })));
+    const events = rolloutItems.flatMap((item) => {
+      const candidate = item as { type: string; payload: { msg: { type: string } } };
+      return candidate.type === "event_msg" ? [candidate.payload.msg] : [];
+    });
+    expect(events.filter((event) => event.type === "turn_failed")).toHaveLength(1);
+    expect(events.findIndex((event) => event.type === "turn_failed")).toBeLessThan(events.findIndex((event) => event.type === "run_terminal"));
   });
 
   it("[managed-thread] never attributes a later completed turn to a crashed submission", async () => {
@@ -9606,6 +10018,128 @@ describe("AgenC delegate background-agent runner", () => {
     ).resolves.toMatchObject({ status: "idle" });
   });
 
+  it("[managed-thread] snapshots the live model window, prompt, and per-model cost authority", async () => {
+    const { runner, session, sessionState } = makeTopLevelRunner({
+      conversationId: "session-context-accounting",
+      totalTokenUsage: () => ({
+        inputTokens: 2_000,
+        outputTokens: 100,
+        totalTokens: 2_100,
+      }),
+    });
+    const hasUnknownModelCost = vi.fn(() => false);
+    const getTotalCostUsd = vi.fn(() => 1.2345);
+    const getSessionTotals = vi.fn(() => ({
+      inputTokens: 2_000,
+      outputTokens: 100,
+      totalTokens: 2_100,
+    }));
+    Object.assign(session.services, {
+      costSidecar: {
+        getTotalCostUsd,
+        getSessionTotals,
+        hasUnknownModelCost,
+      },
+    });
+
+    await runner.startAgent({
+      objective: "inspect live context accounting",
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+
+    // Model switching updates the live Session, not bootstrap.modelInfo.
+    // Keep the bootstrap fixture at 65,536 to catch stale-window reads.
+    Object.assign(session, {
+      modelInfo: { slug: "kimi-k2.6", contextWindow: 262_144 },
+    });
+    sessionState.sessionConfiguration = {
+      ...sessionState.sessionConfiguration,
+      provider: { slug: "kimi" },
+      collaborationMode: { model: "kimi-k2.6" },
+      baseInstructions:
+        "These are the active session base instructions after the model switch.",
+    };
+
+    const snapshot = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+
+    expect(snapshot.tokenUsage).toEqual({
+      inputTokens: 2_000,
+      outputTokens: 100,
+      totalTokens: 2_100,
+      costUsd: 1.2345,
+      costKnown: true,
+    });
+    expect(snapshot.contextBreakdown).toMatchObject({
+      provider: "kimi",
+      model: "kimi-k2.6",
+      estimated: true,
+      windowTokens: 262_144,
+      systemPromptTokens: expect.any(Number),
+    });
+    expect(snapshot.contextBreakdown?.systemPromptTokens).toBeGreaterThan(0);
+    expect(getTotalCostUsd).toHaveBeenCalled();
+    expect(getSessionTotals).toHaveBeenCalled();
+    expect(hasUnknownModelCost).toHaveBeenCalled();
+
+    hasUnknownModelCost.mockReturnValue(true);
+    const partiallyKnown = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+    expect(partiallyKnown.tokenUsage).toMatchObject({
+      costUsd: 1.2345,
+      costKnown: false,
+    });
+
+    hasUnknownModelCost.mockReturnValue(false);
+    sessionState.initialTokenUsage = {
+      promptTokens: 1_500,
+      completionTokens: 50,
+      totalTokens: 1_550,
+    };
+    const resumedWithoutRestoredCosts = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+    expect(resumedWithoutRestoredCosts.tokenUsage).toMatchObject({
+      costUsd: 1.2345,
+      costKnown: false,
+    });
+
+    delete sessionState.initialTokenUsage;
+    getSessionTotals.mockReturnValue({
+      inputTokens: 1_999,
+      outputTokens: 100,
+      totalTokens: 2_099,
+    });
+    const incompleteSidecar = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+    expect(incompleteSidecar.tokenUsage).toMatchObject({
+      costUsd: 1.2345,
+      costKnown: false,
+    });
+
+    delete (
+      session.services as typeof session.services & {
+        costSidecar?: unknown;
+      }
+    ).costSidecar;
+    const withoutSidecar = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+    expect(withoutSidecar.tokenUsage).toMatchObject({
+      costUsd: 0,
+      costKnown: false,
+    });
+  });
+
   it("[managed-thread] interruptAgentTurn aborts the active session and submits interrupt op on managed thread", async () => {
     const { runner, session, stub } = makeTopLevelRunner({
       conversationId: "session-interrupt",
@@ -9626,6 +10160,8 @@ describe("AgenC delegate background-agent runner", () => {
 
     expect(interrupted).toBe(true);
     expect(session.abortAllTasks).toHaveBeenCalledWith("interrupted");
+    // #2236: the stop is latched so child receipts do not restart the turn.
+    expect(session.markStoppedByUser).toHaveBeenCalledTimes(1);
     expect(stub.thread.submit).toHaveBeenCalledWith({
       type: "interrupt",
       reason: "user_cancel",

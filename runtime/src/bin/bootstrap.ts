@@ -65,6 +65,8 @@ import {
   type BootstrapSessionConfiguredPayload,
 } from "../session/bootstrap.js";
 import { SidecarManager, type Sidecar } from "../session/sidecar.js";
+import { withTimeout } from "../utils/sleep.js";
+import { DaemonOperationScope, DAEMON_AGENT_CREATE_TIMEOUT_MS } from "../app-server/operation-deadline.js";
 import { FileHistory, FileHistorySidecar } from "../session/file-history.js";
 import { ErrorLogSidecar } from "../session/error-log.js";
 import { CostSidecar } from "../session/cost.js";
@@ -80,6 +82,7 @@ import { AgentControl } from "../agents/control.js";
 import { AgentRoleCatalog } from "../agents/role-catalog.js";
 import { ThreadManager } from "../agents/thread-manager.js";
 import { ConversationThreadManager } from "../conversation/thread-manager.js";
+import type { DurableResumeAttempt } from "../conversation/thread-manager.js";
 import { AgentRegistry } from "../agents/registry.js";
 import { createAgentRoleWorkspace } from "../agents/role.js";
 import { loadFreshAgentDefinitions } from "../tools/AgentTool/loadAgentsDir.js";
@@ -380,6 +383,7 @@ const TRANSCRIPT_BOOT_EVENT_TYPES = new Set<string>([
   "turn_started",
   "turn_complete",
   "turn_aborted",
+  "turn_failed",
   "user_message",
   "token_count",
   "agent_message",
@@ -586,6 +590,7 @@ function createMemoryAutoSaveSidecar(): Sidecar {
 }
 
 export interface BootstrapLocalRuntimeSessionOptions {
+  readonly signal?: AbortSignal;
   readonly apiKey?: string;
   readonly authBackend?: AuthBackend;
   readonly fetchImpl?: typeof fetch;
@@ -636,6 +641,19 @@ export interface BootstrapLocalRuntimeSessionOptions {
    * prewarm until the first non-Editor submit.
    */
   readonly deferAgentStartupSideEffects?: boolean;
+  /**
+   * Do not resume-continue an orphaned in-flight turn from inside bootstrap;
+   * hand that one step to the caller through
+   * `LocalRuntimeBootstrap.runDeferredDurableTurnResume`.
+   *
+   * The startup prewarm otherwise runs unchanged (fresh default turn,
+   * provider warm-up, agent-task registration). Daemon-owned sessions set
+   * this because the resumed turn is driven to completion inside bootstrap,
+   * i.e. before the daemon can install `services.approvalResolver` and
+   * register the agent — so every tool needing approval in that turn is
+   * refused with no prompt reaching the user (#2239).
+   */
+  readonly deferDurableTurnResume?: boolean;
   /** Stable calendar-budget identity; daemon agents default to their run id. */
   readonly executionAdmissionBudgetIdentity?: string;
 }
@@ -672,6 +690,20 @@ export interface LocalRuntimeBootstrap {
   readonly memoryMdPath: string;
   readonly shutdown: () => Promise<void>;
   readonly autonomousModeEnabled: boolean;
+  /**
+   * Drive the durable-turn resume that `deferDurableTurnResume` withheld from
+   * the startup prewarm. Call it once the caller can answer approvals for
+   * this session — for the daemon, after the approval bridge is installed and
+   * the agent is registered (#2239).
+   *
+   * Resolves to the neutral no-op outcome when nothing was deferred. Never
+   * throws: a resume failure is recorded on the conversation thread record,
+   * exactly as it is when the prewarm drives the resume inline.
+   *
+   * Optional so the many test doubles that stand in for a bootstrap keep
+   * compiling; `bootstrapLocalRuntimeSession` always provides it.
+   */
+  readonly runDeferredDurableTurnResume?: () => Promise<DurableResumeAttempt>;
 }
 
 export interface PreparedConfiguredExecutionAuthority {
@@ -680,25 +712,12 @@ export interface PreparedConfiguredExecutionAuthority {
   rollback(): void;
 }
 
-async function waitForPartialMcpDisposal(task: Promise<void>): Promise<void> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(
-      () =>
-        reject(
-          new Error(
-            `partial MCP disposal exceeded ${SESSION_LIFECYCLE_SHUTDOWN_BUDGET_MS}ms`,
-          ),
-        ),
-      SESSION_LIFECYCLE_SHUTDOWN_BUDGET_MS,
-    );
-    timer.unref?.();
-  });
-  try {
-    await Promise.race([task, timeout]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
+function waitForPartialMcpDisposal(task: Promise<void>): Promise<void> {
+  return withTimeout(
+    task,
+    SESSION_LIFECYCLE_SHUTDOWN_BUDGET_MS,
+    `partial MCP disposal exceeded ${SESSION_LIFECYCLE_SHUTDOWN_BUDGET_MS}ms`,
+  );
 }
 
 function parsePositiveFileIdentity(value: string, label: string): bigint {
@@ -773,6 +792,7 @@ function snapshotGrokAcpChildEnvironment(
 export async function bootstrapLocalRuntimeSession(
   options: BootstrapLocalRuntimeSessionOptions,
 ): Promise<LocalRuntimeBootstrap> {
+  options.signal?.throwIfAborted();
   const env = { ...(options.env ?? process.env) };
   const providerEnvironment = snapshotProviderEnvironment(env);
   const mcpRequestEnvironment = snapshotMcpRequestEnvironment(env);
@@ -786,6 +806,7 @@ export async function bootstrapLocalRuntimeSession(
         cli.dangerouslyBypassApprovalsAndSandbox === true,
     });
   const commandShellPath = await findSuitableShell(parsedRuntimeOptions, env);
+  options.signal?.throwIfAborted();
   const commandExecutionAuthority = resolveCommandExecutionAuthority(
     parsedRuntimeOptions,
     commandShellPath,
@@ -1495,6 +1516,7 @@ async function bootstrapLocalRuntimeSessionScoped(
       services: {
         runtimeOptions,
         sandboxExecutionBroker,
+        providerEnvironment,
       },
     },
     ctx: promptContext,
@@ -1571,6 +1593,8 @@ async function bootstrapLocalRuntimeSessionScoped(
   let agentControlForShutdown: AgentControl | null = null;
   let rolloutStoreForReturn: RolloutStore | null = null;
   let ctxForReturn: TurnContext | null = null;
+  let conversationThreadManagerForReturn: ConversationThreadManager | null =
+    null;
   const mcpService = createSessionMcpService(mcpManager, {
     authority: configStore,
     environment: sessionMcpRequestEnvironment,
@@ -1716,7 +1740,13 @@ async function bootstrapLocalRuntimeSessionScoped(
     return task;
   };
 
+  const abortStartup = (): void => {
+    sessionForShutdown?.beginShutdown();
+    sessionForShutdown?.abortController.abort(options.signal?.reason);
+  };
+  options.signal?.addEventListener("abort", abortStartup, { once: true });
   try {
+    options.signal?.throwIfAborted();
     // Construct the session through `bootstrapSession` so shell
     // discovery, SessionConfigured emit, startup prewarm, and
     // resume-history recording all flow through the shared entry
@@ -1729,6 +1759,7 @@ async function bootstrapLocalRuntimeSessionScoped(
     // (session.rs:856-908); the `onAfterSessionConfigured` hook does
     // that work instead.
     const session = await bootstrapSession({
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
       conversationId,
       roleWorkspace,
       agentDefinitions,
@@ -1782,7 +1813,11 @@ async function bootstrapLocalRuntimeSessionScoped(
         });
         const conversationThreadManager = new ConversationThreadManager({
           threadManager,
+          ...(options.deferDurableTurnResume === true
+            ? { deferDurableTurnResume: true }
+            : {}),
         });
+        conversationThreadManagerForReturn = conversationThreadManager;
         // `bootstrapSession` runs the canonical startup prewarm after
         // SessionConfigured; registration only claims the root thread here.
         await conversationThreadManager.registerConversationRootSession(s, {
@@ -2085,9 +2120,16 @@ async function bootstrapLocalRuntimeSessionScoped(
           // daemon session this additionally waits for ordinary Agent
           // authority, because configured stdio servers are processes.
           assertStartupActive();
-          await s.startMcpManager(mcpManager, {
-            signal: startupSignal,
-          });
+          try {
+            await withTimeout(
+              s.startMcpManager(mcpManager, { signal: startupSignal }),
+              60_000,
+              "MCP startup exceeded 60000ms",
+            );
+          } catch (error) {
+            s.services.mcpStartupCancellationToken.cancel();
+            throw error;
+          }
           assertStartupActive();
 
           // Re-arm persisted cron jobs across restarts only once ordinary
@@ -2159,7 +2201,20 @@ async function bootstrapLocalRuntimeSessionScoped(
               );
             }
             assertStartupActive();
-            await activeConversationManager.runStartupPrewarm(s);
+            const prewarm = new DaemonOperationScope(
+              "session startup prewarm", DAEMON_AGENT_CREATE_TIMEOUT_MS, options.signal,
+            );
+            const abortPrewarm = (): void => {
+              s.beginShutdown();
+              s.abortController.abort(prewarm.signal.reason);
+            };
+            prewarm.signal.addEventListener("abort", abortPrewarm, { once: true });
+            try {
+              await prewarm.wait(() => activeConversationManager.runStartupPrewarm(s));
+            } finally {
+              prewarm.signal.removeEventListener("abort", abortPrewarm);
+              prewarm.dispose();
+            }
             assertStartupActive();
           }
         };
@@ -2210,10 +2265,16 @@ async function bootstrapLocalRuntimeSessionScoped(
       memoryMdPath,
       shutdown,
       autonomousModeEnabled,
+      runDeferredDurableTurnResume: async (): Promise<DurableResumeAttempt> => {
+        const manager = conversationThreadManagerForReturn;
+        if (manager === null) return { resumed: false };
+        return manager.runDeferredDurableTurnResume(session);
+      },
     };
   } catch (err) {
     try {
-      await shutdown();
+      await withTimeout(shutdown(), SESSION_LIFECYCLE_SHUTDOWN_BUDGET_MS,
+        "failed bootstrap cleanup exceeded its shutdown budget");
     } catch (shutdownError) {
       throw new AggregateError(
         [err, shutdownError],
@@ -2228,6 +2289,8 @@ async function bootstrapLocalRuntimeSessionScoped(
       throw err;
     }
     throw err;
+  } finally {
+    options.signal?.removeEventListener("abort", abortStartup);
   }
   });
 }

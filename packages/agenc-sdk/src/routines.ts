@@ -1,0 +1,20 @@
+/** Standalone aliases of the daemon-owned routine wire contract. */
+export type {
+  RoutineSchedule,
+  RoutineRunStatus,
+  RoutineRun,
+  RoutineCreateParams,
+  Routine,
+  RoutineIdParams,
+  RoutineUpdateParams,
+  RoutineDeleteParams,
+  RoutineRunsParams,
+  RoutineCancelParams,
+  RoutineCapabilities,
+  RoutineResult,
+  RoutineRunResult,
+  RoutineListResult,
+  RoutineRunsResult,
+  RoutineDeleteResult,
+  RoutineUpdatedEvent,
+} from "./protocol-wire.generated.js";

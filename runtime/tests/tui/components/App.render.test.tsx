@@ -51,6 +51,7 @@ let mockWorktreeSession: unknown = null;
 let mockGlobalConfig: Record<string, unknown> = {};
 const mockTuiCommandList = vi.hoisted(() => [] as Array<Record<string, any>>);
 const commandDiscoveryProbe = vi.hoisted(() => vi.fn());
+const commandDebugProbe = vi.hoisted(() => vi.fn());
 const roleDefinitionProbe = vi.hoisted(() =>
   vi.fn((_cwd: string) => [
     {
@@ -143,7 +144,7 @@ vi.mock("bun:bundle", () => ({
 }));
 
 vi.mock("src/utils/debug.js", () => ({
-  logForDebugging: () => {},
+  logForDebugging: commandDebugProbe,
 }));
 
 vi.mock("src/utils/envUtils.js", () => ({
@@ -478,8 +479,7 @@ vi.mock("../../commands.js", () => ({
       (command) => command.name === name || command.aliases?.includes(name),
     ) ?? null,
   getCommands: async (...args: unknown[]) => {
-    commandDiscoveryProbe(...args);
-    return mockTuiCommandList;
+    return commandDiscoveryProbe(...args) ?? mockTuiCommandList;
   },
   isCommandEnabled: () => true,
   listTuiCommandList: () => mockTuiCommandList,
@@ -865,7 +865,8 @@ function resetShellSurfaceProbe(): void {
   ledgerStatusProbe.refresh.mockClear();
   dismissLedgerVerification();
   mockTuiCommandList.length = 0;
-  commandDiscoveryProbe.mockClear();
+  commandDiscoveryProbe.mockReset();
+  commandDebugProbe.mockClear();
   mockTotalCost = 0;
   mockHasConsoleBillingAccess = false;
   mockWorktreeSession = null;
@@ -1025,9 +1026,9 @@ function createSession(
       ? { agentDefinitions: opts.agentDefinitions }
       : {}),
     services: {
-      ...(opts.runtimeOptions !== undefined
-        ? { runtimeOptions: opts.runtimeOptions }
-        : {}),
+      runtimeOptions: opts.runtimeOptions ?? {
+        pluginStorageRoot: join(tmpdir(), "agenc-app-render-plugins"),
+      } as never,
       configStore: opts.configStore ?? testConfigStore,
       providerEnvironment: TEST_REMOTE_AUTH_SESSION_CONTEXT.environment,
       permissionModeRegistry: {
@@ -1387,6 +1388,185 @@ describeWithVitestMocks("AgenCTuiApp render smoke", () => {
         for (const call of commandDiscoveryProbe.mock.calls) {
           expect(call[1]).toMatchObject({ pluginStorageRoot });
         }
+      },
+    );
+  });
+
+  test.each(["failure", "pending", "removed"] as const)(
+    "invalidates dynamic command display and execution after a %s reload",
+    async (outcome) => {
+      const { AgenCTuiApp } = await import("./App.js");
+      resetShellSurfaceProbe();
+      mockTuiCommandList.push({ name: "help", type: "local", load: vi.fn() });
+      const getPromptForCommand = vi.fn(async () => [
+        { type: "text", text: "obsolete expansion" },
+      ]);
+      const dynamic = {
+        name: "reloadable",
+        type: "prompt",
+        loadedFrom: "skills",
+        progressMessage: "Loading",
+        contentLength: 1,
+        getPromptForCommand,
+      };
+      const configStore = createAppConfigStore();
+      const session = createSession({
+        configStore,
+        runtimeOptions: { pluginStorageRoot: "/tmp/command-reload" } as never,
+      });
+      commandDiscoveryProbe.mockResolvedValue([dynamic]);
+      const commands = () =>
+        providerProbe.promptProps.at(-1)?.commands as Array<{ name: string }>;
+      await withRenderedApp(
+        <AgenCTuiApp session={session} isInteractive={false} />,
+        async ({ output }) => {
+          await vi.waitFor(() =>
+            expect(commands().map((command) => command.name)).toContain(
+              "reloadable",
+            ),
+          );
+          await providerProbe.promptSubmits.at(-1)!("$reloadable", {
+            clearBuffer: vi.fn(),
+            resetHistory: vi.fn(),
+            setCursorOffset: vi.fn(),
+          });
+          expect(getPromptForCommand).toHaveBeenCalledTimes(1);
+          const pending = Promise.withResolvers<unknown[]>();
+          if (outcome === "failure")
+            commandDiscoveryProbe.mockRejectedValue(
+              new Error("command source removed"),
+            );
+          else if (outcome === "pending")
+            commandDiscoveryProbe.mockReturnValue(pending.promise);
+          else commandDiscoveryProbe.mockResolvedValue([]);
+          const calls = commandDiscoveryProbe.mock.calls.length;
+          await configStore.reload();
+          await vi.waitFor(() =>
+            expect(commandDiscoveryProbe.mock.calls.length).toBeGreaterThan(
+              calls,
+            ),
+          );
+          if (outcome === "failure") {
+            await vi.waitFor(() =>
+              expect(
+                commandDebugProbe.mock.calls.some(([message]) =>
+                  String(message).includes("command source removed"),
+                ),
+              ).toBe(true),
+            );
+          }
+          await vi.waitFor(() =>
+            expect(commands().map((command) => command.name)).toEqual(["help"]),
+          );
+          await providerProbe.promptSubmits.at(-1)!("$reloadable", {
+            clearBuffer: vi.fn(),
+            resetHistory: vi.fn(),
+            setCursorOffset: vi.fn(),
+          });
+          expect(getPromptForCommand).toHaveBeenCalledTimes(1);
+          if (outcome === "failure")
+            expect(stripAnsi(output()).replace(/\s+/gu, "")).toContain(
+              "Dynamiccommandsunavailable",
+            );
+          pending.resolve([]);
+        },
+      );
+    },
+  );
+
+  test.each(["success", "failure"] as const)(
+    "ignores an older command generation's late %s",
+    async (outcome) => {
+      const { AgenCTuiApp } = await import("./App.js");
+      resetShellSurfaceProbe();
+      const configStore = createAppConfigStore();
+      const session = createSession({
+        configStore,
+        runtimeOptions: { pluginStorageRoot: "/tmp/command-race" } as never,
+      });
+      const old = Promise.withResolvers<unknown[]>();
+      commandDiscoveryProbe.mockReturnValue(old.promise);
+      await withRenderedApp(
+        <AgenCTuiApp session={session} isInteractive={false} />,
+        async () => {
+          await vi.waitFor(() =>
+            expect(commandDiscoveryProbe).toHaveBeenCalled(),
+          );
+          commandDiscoveryProbe.mockResolvedValue([
+            { name: "current-command", type: "prompt" },
+          ]);
+          await configStore.reload();
+          const names = () =>
+            (
+              providerProbe.promptProps.at(-1)?.commands as Array<{
+                name: string;
+              }>
+            ).map((command) => command.name);
+          await vi.waitFor(() => expect(names()).toEqual(["current-command"]));
+          commandDebugProbe.mockClear();
+          if (outcome === "success")
+            old.resolve([{ name: "obsolete-command", type: "prompt" }]);
+          else old.reject(new Error("obsolete command failure"));
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          expect(names()).toEqual(["current-command"]);
+          expect(
+            commandDebugProbe.mock.calls.some(([message]) =>
+              String(message).includes("obsolete command failure"),
+            ),
+          ).toBe(false);
+        },
+      );
+    },
+  );
+
+  test("removes commands when their authority disappears and clears the notice after recovery", async () => {
+    const { AgenCTuiApp } = await import("./App.js");
+    resetShellSurfaceProbe();
+    fullscreenProbe.fullscreen = true;
+    const session = createSession();
+    const runtimeOptions = session.services.runtimeOptions;
+    commandDiscoveryProbe.mockResolvedValue([
+      { name: "before-removal", type: "prompt" },
+    ]);
+    const names = () =>
+      (
+        providerProbe.promptProps.at(-1)?.commands as Array<{ name: string }>
+      ).map((command) => command.name);
+    const textIn = (node: React.ReactNode): string => {
+      if (typeof node === "string" || typeof node === "number")
+        return String(node);
+      if (Array.isArray(node)) return node.map(textIn).join("");
+      if (!React.isValidElement(node)) return "";
+      return textIn((node.props as { children?: React.ReactNode }).children);
+    };
+    const notice = () =>
+      textIn(
+        providerProbe.workbenchLayoutProps.at(-1)?.composer ??
+          providerProbe.fullscreenLayoutProps.at(-1)?.bottom,
+      );
+    await withRenderedApp(
+      <AgenCTuiApp session={session} isInteractive={false} />,
+      async ({ render }) => {
+        await vi.waitFor(() => expect(names()).toEqual(["before-removal"]));
+        const calls = commandDiscoveryProbe.mock.calls.length;
+        Object.assign(session.services, { runtimeOptions: undefined });
+        await render(
+          <AgenCTuiApp session={{ ...session }} isInteractive={false} />,
+        );
+        await vi.waitFor(() => expect(names()).toEqual([]));
+        expect(commandDiscoveryProbe.mock.calls.length).toBe(calls);
+        await vi.waitFor(() =>
+          expect(notice()).toContain("Dynamic commands unavailable"),
+        );
+        commandDiscoveryProbe.mockResolvedValue([
+          { name: "after-recovery", type: "prompt" },
+        ]);
+        Object.assign(session.services, { runtimeOptions });
+        await render(
+          <AgenCTuiApp session={{ ...session }} isInteractive={false} />,
+        );
+        await vi.waitFor(() => expect(names()).toEqual(["after-recovery"]));
+        expect(notice()).not.toContain("Dynamic commands unavailable");
       },
     );
   });
@@ -4414,6 +4594,284 @@ describeWithVitestMocks("AgenCTuiApp render smoke", () => {
           "owned-local-startup",
         );
         expect(commitIdleInputAdmission).not.toHaveBeenCalled();
+      },
+    );
+  });
+
+  describe.each(["/", "$"])("%s prompt submission transaction", (prefix) => {
+    test.each([
+      "success",
+      "load rejection",
+      "admission rejection",
+      "submit rejection",
+      "cancellation",
+      "late failure",
+      "rollback failure",
+      "commit failure",
+      "acknowledgement failure",
+    ])("settles %s", async (outcome) => {
+      const { AgenCTuiApp } = await import("./App.js");
+      resetShellSurfaceProbe();
+      const input = `${prefix}reviewer audit this`;
+      const events: string[] = [];
+      const subscribers = new Set<(event: unknown) => void>();
+      const failure = new Error(outcome);
+      if (outcome === "cancellation") failure.name = "AbortError";
+      const emitCompletion = () => {
+        for (const subscriber of subscribers) {
+          subscriber({
+            type: "turn_started",
+            payload: { turnId: "prompt-turn" },
+          });
+          subscriber({
+            type: "turn_complete",
+            payload: { turnId: "prompt-turn", lastAgentMessage: "Done" },
+          });
+        }
+      };
+      const getPromptForCommand = vi.fn(async () => {
+        events.push("load");
+        if (outcome === "load rejection") throw failure;
+        return [{ type: "text", text: "expanded reviewer prompt" }];
+      });
+      mockTuiCommandList.push({
+        name: "reviewer",
+        type: "prompt",
+        loadedFrom: "skills",
+        progressMessage: "Loading reviewer",
+        contentLength: 1,
+        getPromptForCommand,
+      });
+      const session = {
+        ...createSession(),
+        enqueueIdleInputBatchOwned: vi.fn(() => {
+          events.push("admit");
+          if (outcome === "admission rejection") throw failure;
+          return {
+            token: "prompt-admission",
+            firstSequence: 1,
+            lastSequence: 3,
+            count: 3,
+          };
+        }),
+        commitIdleInputAdmission: vi.fn(() => {
+          events.push("commit");
+          if (outcome === "commit failure") throw failure;
+          return true;
+        }),
+        rollbackIdleInputAdmission: vi.fn(() => {
+          events.push("rollback");
+          if (outcome === "rollback failure") throw failure;
+          return outcome !== "late failure";
+        }),
+        submit: vi.fn(async () => {
+          events.push("submit");
+          if (outcome === "late failure") emitCompletion();
+          if (
+            outcome === "submit rejection" ||
+            outcome === "cancellation" ||
+            outcome === "late failure" ||
+            outcome === "rollback failure"
+          ) {
+            throw failure;
+          }
+        }),
+        subscribeToEvents: (subscriber: (event: unknown) => void) => {
+          subscribers.add(subscriber);
+          return () => {
+            subscribers.delete(subscriber);
+          };
+        },
+      } satisfies AgenCBridgeSession;
+      const acknowledgeWorkbenchAttachments = vi.fn(() => {
+        events.push("acknowledge");
+        if (outcome === "acknowledgement failure") throw failure;
+      });
+      const helpers = {
+        clearBuffer: vi.fn(),
+        resetHistory: vi.fn(),
+        setCursorOffset: vi.fn(),
+      };
+      const pastedContents = {
+        0: {
+          id: 0,
+          type: "image",
+          content: "base64-image",
+          mediaType: "image/png",
+          filename: "prompt.png",
+        },
+      };
+      await withRenderedApp(
+        <AgenCTuiApp session={session} isInteractive={false} />,
+        async () => {
+          const promptProps = providerProbe.promptProps.at(-1)!;
+          (promptProps.onInputChange as (value: string) => void)(input);
+          (promptProps.setPastedContents as (value: unknown) => void)(
+            pastedContents,
+          );
+          await vi.waitFor(() => {
+            expect(providerProbe.promptProps.at(-1)?.input).toBe(input);
+          });
+          const onSubmit = providerProbe.promptProps.at(-1)?.onSubmit as (
+            input: string,
+            helpers: typeof helpers,
+            speculation: undefined,
+            options: { readonly onWorkbenchAttachmentsAdmitted: () => void },
+          ) => Promise<void>;
+          await expect(
+            onSubmit(input, helpers, undefined, {
+              onWorkbenchAttachmentsAdmitted: acknowledgeWorkbenchAttachments,
+            }),
+          ).resolves.toBeUndefined();
+
+          const accepted = [
+            "success",
+            "commit failure",
+            "acknowledgement failure",
+          ].includes(outcome);
+          const admitted =
+            outcome !== "load rejection" && outcome !== "admission rejection";
+          const restored =
+            !accepted &&
+            outcome !== "late failure" &&
+            outcome !== "rollback failure";
+          expect(getPromptForCommand).toHaveBeenCalledOnce();
+          expect(session.submit).toHaveBeenCalledTimes(admitted ? 1 : 0);
+          if (admitted) {
+            expect(session.enqueueIdleInputBatchOwned).toHaveBeenCalledWith(
+              [
+                expect.objectContaining({ content: expect.any(Array) }),
+                expect.stringContaining("<command-name>$reviewer</command-name>"),
+                { content: [{ type: "text", text: "expanded reviewer prompt" }] },
+              ],
+              { workspaceView: "agent" },
+            );
+            expect(session.submit).toHaveBeenCalledWith("", {
+              displayUserMessage: input,
+            });
+          }
+          expect(session.commitIdleInputAdmission).toHaveBeenCalledTimes(
+            accepted ? 1 : 0,
+          );
+          expect(session.rollbackIdleInputAdmission).toHaveBeenCalledTimes(
+            admitted && !accepted ? 1 : 0,
+          );
+          expect(acknowledgeWorkbenchAttachments).toHaveBeenCalledTimes(
+            accepted || outcome === "late failure" ? 1 : 0,
+          );
+          if (accepted) {
+            expect(events.indexOf("commit")).toBeGreaterThan(
+              events.indexOf("submit"),
+            );
+            expect(events.indexOf("acknowledge")).toBeGreaterThan(
+              events.indexOf("commit"),
+            );
+          }
+          if (outcome !== "success") {
+            await vi.waitFor(() => {
+              expect(
+                JSON.stringify(providerProbe.currentAppState?.notifications),
+              ).toContain(outcome);
+              expect(providerProbe.promptProps.at(-1)).toMatchObject({
+                input: restored ? input : "",
+                pastedContents: restored ? pastedContents : {},
+                ...(!accepted ? { isLoading: false } : {}),
+              });
+            });
+          }
+          emitCompletion();
+          await vi.waitFor(() => {
+            expect(providerProbe.promptProps.at(-1)).toMatchObject({
+              input: restored ? input : "",
+              pastedContents: restored ? pastedContents : {},
+              isLoading: false,
+            });
+          });
+          expect(acknowledgeWorkbenchAttachments).toHaveBeenCalledTimes(
+            accepted || outcome === "late failure" ? 1 : 0,
+          );
+        },
+      );
+    });
+
+    test.each(["success", "failure"])(
+      "preserves a newer draft across delayed load %s",
+      async (outcome) => {
+        const { AgenCTuiApp } = await import("./App.js");
+        resetShellSurfaceProbe();
+        const loaded = Promise.withResolvers<unknown[]>();
+        const getPromptForCommand = vi.fn(() => loaded.promise);
+        mockTuiCommandList.push({
+          name: "reviewer",
+          type: "prompt",
+          loadedFrom: "skills",
+          progressMessage: "Loading reviewer",
+          contentLength: 1,
+          getPromptForCommand,
+        });
+        const session = {
+          ...createSession(),
+          enqueueIdleInput: vi.fn(() => 1),
+          submit: vi.fn(async () => {}),
+        } satisfies AgenCBridgeSession;
+        const helpers = {
+          clearBuffer: vi.fn(),
+          resetHistory: vi.fn(),
+          setCursorOffset: vi.fn(),
+        };
+        const originalAttachment = {
+          0: { id: 0, type: "text", content: "original attachment" },
+        };
+        const nextAttachment = {
+          1: { id: 1, type: "text", content: "new attachment" },
+        };
+        await withRenderedApp(
+          <AgenCTuiApp session={session} isInteractive={false} />,
+          async () => {
+            (providerProbe.promptProps.at(-1)?.setPastedContents as (
+              value: unknown,
+            ) => void)(originalAttachment);
+            await vi.waitFor(() => {
+              expect(providerProbe.promptProps.at(-1)?.pastedContents).toEqual(
+                originalAttachment,
+              );
+            });
+            const pending = providerProbe.promptSubmits.at(-1)!(
+              `${prefix}reviewer audit this`,
+              helpers,
+            );
+            await vi.waitFor(() => {
+              expect(getPromptForCommand).toHaveBeenCalledOnce();
+              expect(providerProbe.promptProps.at(-1)).toMatchObject({
+                input: "",
+                pastedContents: {},
+              });
+            });
+            (providerProbe.promptProps.at(-1)?.onInputChange as (
+              value: string,
+            ) => void)("new draft");
+            (providerProbe.promptProps.at(-1)?.setPastedContents as (
+              value: unknown,
+            ) => void)(nextAttachment);
+            await vi.waitFor(() => {
+              expect(providerProbe.promptProps.at(-1)?.input).toBe("new draft");
+            });
+            if (outcome === "success") {
+              loaded.resolve([{ type: "text", text: "expanded prompt" }]);
+            } else {
+              loaded.reject(new Error("prompt load rejected"));
+            }
+            await pending;
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            expect(providerProbe.promptProps.at(-1)).toMatchObject({
+              input: "new draft",
+              pastedContents: nextAttachment,
+            });
+            expect(session.submit).toHaveBeenCalledTimes(
+              outcome === "success" ? 1 : 0,
+            );
+          },
+        );
       },
     );
   });

@@ -31,9 +31,18 @@ import {
   validateAndDedupeAdditionalWorkingDirectoryInputs,
 } from "../contracts/additional-working-directories.js";
 import type { RunRuntimeSettingsSnapshot } from "../contracts/run-contracts.js";
-import { cloneFrozenRuntimeSettingsSnapshot } from "../state/runtime-settings-snapshot.js";
+import {
+  cloneFrozenRuntimeSettingsSnapshot,
+  runtimeSettingsEqual,
+} from "../state/runtime-settings-snapshot.js";
 
 import { AsyncLock } from "../utils/async-lock.js";
+import { withTimeout } from "../utils/sleep.js";
+import {
+  DaemonOperationScope,
+  DAEMON_AGENT_CREATE_TIMEOUT_MS,
+  DAEMON_AGENT_STOP_TIMEOUT_MS,
+} from "./operation-deadline.js";
 import { openStateDatabases } from "../state/sqlite-driver.js";
 import {
   createOperatorEffectReviewResolution,
@@ -212,7 +221,8 @@ export type AgenCDaemonAgentLifecycleErrorCode =
   | "RUN_CANCEL_UNAVAILABLE"
   | "TURN_IN_PROGRESS"
   | "CLIENT_MESSAGE_ID_CONFLICT"
-  | "PROMPT_BLOCKED";
+  | "PROMPT_BLOCKED"
+  | "SESSION_HISTORY_BLOCKED";
 
 export class AgenCDaemonAgentLifecycleError extends Error {
   readonly code: AgenCDaemonAgentLifecycleErrorCode;
@@ -463,6 +473,8 @@ function isEvidenceToolCallResolution(
   return Object.prototype.hasOwnProperty.call(params, "disposition");
 }
 
+const AGENT_LIFECYCLE_OPERATION_TIMEOUT_MS = 30_000;
+
 export class AgenCDaemonAgentManager {
   readonly #agencHome: string;
   readonly #now: () => string;
@@ -513,6 +525,7 @@ export class AgenCDaemonAgentManager {
   #shuttingDown = false;
   #shutdownDisposition: "cancel" | "suspend_idle" = "cancel";
   #activeCreates = 0;
+  readonly #activeCreateScopes = new Set<DaemonOperationScope>();
   readonly #createWaiters = new Set<() => void>();
   readonly #pendingResumeCreates = new Map<
     string,
@@ -557,12 +570,13 @@ export class AgenCDaemonAgentManager {
     this.#voidBudgetHoldsForAgents = options.voidBudgetHoldsForAgents;
   }
 
-  createAgent(params: AgentCreateParams): Promise<AgentCreateResult> {
+  createAgent(
+    params: AgentCreateParams,
+    options: { readonly signal?: AbortSignal } = {},
+  ): Promise<AgentCreateResult> {
     const resumeSessionId = normalizeNonEmpty(params.resumeSessionId);
-    if (resumeSessionId === undefined) {
-      return this.#createAgentOnce(params);
-    }
-    const pending = this.#pendingResumeCreates.get(resumeSessionId);
+    const pending = resumeSessionId === undefined
+      ? undefined : this.#pendingResumeCreates.get(resumeSessionId);
     if (pending !== undefined) {
       if (!isDeepStrictEqual(pending.params, params)) {
         return Promise.reject(
@@ -572,23 +586,38 @@ export class AgenCDaemonAgentManager {
           ),
         );
       }
-      return pending.result;
+      if (options.signal === undefined) return pending.result;
+      const waiter = new DaemonOperationScope(
+        "agent.create resume waiter", DAEMON_AGENT_CREATE_TIMEOUT_MS, options.signal,
+      );
+      return waiter.wait(() => pending.result).finally(() => waiter.dispose());
     }
 
-    const result = this.#createAgentOnce(params);
+    const scope = new DaemonOperationScope(
+      "agent.create", DAEMON_AGENT_CREATE_TIMEOUT_MS, options.signal,
+    );
+    this.#activeCreateScopes.add(scope);
+    const work = this.#createAgentOnce(params, scope.signal);
+    const result = scope.wait(() => work).finally(() => scope.dispose());
     const reservation = {
       params: structuredClone(params),
       result,
     };
-    this.#pendingResumeCreates.set(resumeSessionId, reservation);
-    void result.then(
+    if (resumeSessionId !== undefined) {
+      this.#pendingResumeCreates.set(resumeSessionId, reservation);
+    }
+    // Retain the resume reservation until actual rollback finishes, even when
+    // the caller has already received its cancellation or timeout error.
+    void work.then(
       () => {
-        if (this.#pendingResumeCreates.get(resumeSessionId) === reservation) {
+        this.#activeCreateScopes.delete(scope);
+        if (resumeSessionId !== undefined && this.#pendingResumeCreates.get(resumeSessionId) === reservation) {
           this.#pendingResumeCreates.delete(resumeSessionId);
         }
       },
       () => {
-        if (this.#pendingResumeCreates.get(resumeSessionId) === reservation) {
+        this.#activeCreateScopes.delete(scope);
+        if (resumeSessionId !== undefined && this.#pendingResumeCreates.get(resumeSessionId) === reservation) {
           this.#pendingResumeCreates.delete(resumeSessionId);
         }
       },
@@ -598,6 +627,7 @@ export class AgenCDaemonAgentManager {
 
   async #createAgentOnce(
     params: AgentCreateParams,
+    signal: AbortSignal,
   ): Promise<AgentCreateResult> {
     const finishCreate = this.#beginCreate();
     let resumeProof: ResumeSourceProof | undefined;
@@ -611,6 +641,7 @@ export class AgenCDaemonAgentManager {
       );
     }
     try {
+      signal.throwIfAborted();
       const resumeSessionId = normalizeNonEmpty(params.resumeSessionId);
       const resumeRolloutPath = normalizeNonEmpty(params.resumeRolloutPath);
       const resumeSourceProof = params.resumeSourceProof;
@@ -917,9 +948,11 @@ export class AgenCDaemonAgentManager {
       };
       const resumeRestoreAttemptId =
         resumeSessionId === undefined ? undefined : randomUUID();
+      signal.throwIfAborted();
       const started =
         resumeSessionId === undefined
           ? await startNewBackgroundAgent(this.#runner, {
+              signal,
               objective,
               cwd,
               ...(model !== undefined ? { model } : {}),
@@ -953,6 +986,7 @@ export class AgenCDaemonAgentManager {
                 : {}),
             })
           : await this.#resumeTerminalAgent({
+              signal,
               agentId: resumeSessionId,
               resumeRolloutPath: resumeRolloutPath!,
               resumeCwdIdentity: resumeProof!.cwdIdentity,
@@ -1045,7 +1079,28 @@ export class AgenCDaemonAgentManager {
       };
 
       let createdLifecycleSessionId: string | undefined;
+      let runnerCleanup: Promise<void> | undefined;
+      const cleanupRunner = (): Promise<void> => {
+        runnerCleanup ??= (async () => {
+          if (resumeSessionId !== undefined) {
+            if (resumeRestoreAttemptId === undefined || this.#runner?.rollbackRestoredAgent === undefined) {
+              throw new Error("background runner cannot safely roll back the unpublished restored generation");
+            }
+            await this.#runner.rollbackRestoredAgent(agent.agentId, resumeRestoreAttemptId);
+          } else {
+            await this.#runner?.stopAgent?.(agent.agentId, "agent.create rollback after lifecycle failure");
+          }
+        })();
+        return runnerCleanup;
+      };
+      const abortUnpublishedAgent = (): void => {
+        // A projection or persistence callback may ignore cancellation. Revoke
+        // execution now; the normal rollback cleans up its late result.
+        void cleanupRunner().catch(() => undefined);
+      };
+      signal.addEventListener("abort", abortUnpublishedAgent, { once: true });
       try {
+        signal.throwIfAborted();
         if (this.#sessionManager !== undefined) {
           const session = await this.#sessionManager.createSession({
             agentId: agent.agentId,
@@ -1061,11 +1116,14 @@ export class AgenCDaemonAgentManager {
             },
           });
           createdLifecycleSessionId = session.sessionId;
+          signal.throwIfAborted();
           agent.sessionIds.push(session.sessionId);
           agent.logSessionIds.push(session.sessionId);
           await this.#registerSnapshotSessionRoute(session.sessionId, agent);
+          signal.throwIfAborted();
         }
         await this.#recordAgentRunSnapshot(agent, { required: true });
+        signal.throwIfAborted();
         await this.#recordAgentStatusSnapshots(
           agent.sessionIds,
           agent.agentId,
@@ -1076,6 +1134,7 @@ export class AgenCDaemonAgentManager {
         );
         if (this.#sessionManager !== undefined) {
           for (const sessionId of agent.sessionIds) {
+            signal.throwIfAborted();
             await this.#runner.attachAgentSessionEvents?.(agent.agentId, {
               sessionId,
               emit: (event) => this.#broadcastSessionEvent?.(sessionId, event),
@@ -1085,6 +1144,7 @@ export class AgenCDaemonAgentManager {
 
         const { result, pendingTermination } = await this.#state.with(
           (state) => {
+            signal.throwIfAborted();
             state.agents.set(agent.agentId, agent);
             const pending = this.#pendingRunnerTerminations.get(agent.agentId);
             let pendingTermination: RunnerTerminationTarget | null = null;
@@ -1111,37 +1171,17 @@ export class AgenCDaemonAgentManager {
         }
         return result;
       } catch (error) {
+        await this.#state.with((state) => {
+          if (state.agents.get(agent.agentId) !== agent) return;
+          if (retainedAgent !== undefined) state.agents.set(agent.agentId, retainedAgent);
+          else state.agents.delete(agent.agentId);
+        });
         this.#pendingRunnerTerminations.delete(agent.agentId);
         const cleanupErrors: unknown[] = [];
-        if (resumeSessionId !== undefined) {
-          if (
-            resumeRestoreAttemptId === undefined ||
-            this.#runner.rollbackRestoredAgent === undefined
-          ) {
-            cleanupErrors.push(
-              new Error(
-                "background runner cannot safely roll back the unpublished restored generation",
-              ),
-            );
-          } else {
-            try {
-              await this.#runner.rollbackRestoredAgent(
-                agent.agentId,
-                resumeRestoreAttemptId,
-              );
-            } catch (cleanupError) {
-              cleanupErrors.push(cleanupError);
-            }
-          }
-        } else {
-          try {
-            await this.#runner.stopAgent?.(
-              agent.agentId,
-              "agent.create rollback after lifecycle failure",
-            );
-          } catch (cleanupError) {
-            cleanupErrors.push(cleanupError);
-          }
+        try {
+          await cleanupRunner();
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
         }
         if (
           createdLifecycleSessionId !== undefined &&
@@ -1181,6 +1221,8 @@ export class AgenCDaemonAgentManager {
           );
         }
         throw error;
+      } finally {
+        signal.removeEventListener("abort", abortUnpublishedAgent);
       }
     } catch (error) {
       createFailed = true;
@@ -1225,6 +1267,7 @@ export class AgenCDaemonAgentManager {
   }
 
   async #resumeTerminalAgent(params: {
+    readonly signal: AbortSignal;
     readonly agentId: string;
     readonly resumeRolloutPath: string;
     readonly resumeCwdIdentity: { readonly dev: string; readonly ino: string };
@@ -1263,6 +1306,7 @@ export class AgenCDaemonAgentManager {
       );
     }
     const restored = await this.#runner.restoreAgent({
+      signal: params.signal,
       agentId: params.agentId,
       objective: params.objective,
       cwd: params.cwd,
@@ -1445,15 +1489,23 @@ export class AgenCDaemonAgentManager {
 
   async #waitForActiveCreates(): Promise<void> {
     if (this.#activeCreates === 0) return;
-    await new Promise<void>((resolve) => {
-      this.#createWaiters.add(resolve);
-    });
+    const scope = new DaemonOperationScope(
+      "daemon shutdown active creates", DAEMON_AGENT_STOP_TIMEOUT_MS,
+    );
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => { resolveSettled = resolve; });
+    this.#createWaiters.add(resolveSettled);
+    try {
+      await scope.wait(() => settled);
+    } finally {
+      this.#createWaiters.delete(resolveSettled);
+      scope.dispose();
+    }
   }
 
   async listAgents(params: AgentListParams = {}): Promise<AgentListResult> {
-    return this.#state.with(async (state) => {
-      await this.#refreshAgentsFromRunner(state);
-      await this.#reconcileSessionBackedAgents(state);
+    await this.#refreshAgentsFromRunner(true);
+    return this.#state.with((state) => {
       const cursor = normalizeCursor(params.cursor);
       const limit = normalizeLimit(params.limit);
       const agents = [...state.agents.values()]
@@ -1618,11 +1670,8 @@ export class AgenCDaemonAgentManager {
   }
 
   async getAgent(agentId: string): Promise<AgentSummary | null> {
-    return this.#state.with(async (state) => {
-      const agent = state.agents.get(agentId);
-      if (agent !== undefined) {
-        await this.#refreshAgentFromRunner(state, agent);
-      }
+    await this.#refreshAgentFromRunner(agentId);
+    return this.#state.with((state) => {
       const refreshed = state.agents.get(agentId);
       if (refreshed !== undefined) {
         return toAgentSummary(refreshed);
@@ -1636,12 +1685,8 @@ export class AgenCDaemonAgentManager {
 
   async getAgentLogs(params: AgentLogsParams): Promise<AgentLogsResult> {
     const agentId = normalizeRequiredAgentId(params.agentId, "agent.logs");
-    const target = await this.#state.with(async (state) => {
-      const agent = state.agents.get(agentId);
-      if (agent !== undefined) {
-        await this.#refreshAgentFromRunner(state, agent);
-        await this.#reconcileAgentSessions(agent);
-      }
+    await this.#refreshAgentFromRunner(agentId, true);
+    const target = await this.#state.with((state) => {
       const refreshed = state.agents.get(agentId);
       if (refreshed !== undefined) {
         return {
@@ -1724,17 +1769,24 @@ export class AgenCDaemonAgentManager {
     return sessions;
   }
 
+  /** Internal routine owner seam; this is deliberately not a standalone RPC. */
+  async finishRoutineRun(agentId: string, messageId: string): Promise<"completed" | "failed" | "cancelled" | undefined> {
+    if (this.#runner?.finishAgentRun === undefined) {
+      throw new AgenCDaemonAgentLifecycleError("BACKGROUND_RUNNER_UNAVAILABLE", "Routine finalization requires the owning Core runner.");
+    }
+    return await this.#runner.finishAgentRun(agentId, messageId);
+  }
+
   async stopAgent(params: AgentStopParams): Promise<AgentStopResult> {
     const agentId = normalizeRequiredAgentId(params.agentId, "agent.stop");
     const reason = normalizeNonEmpty(params.reason) ?? "agent.stop";
     const runner = this.#runner;
     const stopRunner = runner?.stopAgent?.bind(runner);
     let transitionAt: string | undefined;
-    const target = await this.#state.with(async (state) => {
-      const agent = state.agents.get(agentId);
-      if (agent !== undefined) {
-        await this.#refreshAgentFromRunner(state, agent);
-      }
+    // Snapshot availability cannot veto teardown. A failed refresh leaves the
+    // last known state available for selecting and stopping this runner.
+    await this.#refreshAgentFromRunner(agentId).catch(() => {});
+    const target = await this.#state.with((state) => {
       const refreshed = state.agents.get(agentId);
       if (refreshed === undefined) {
         const persisted = this.#listPersistedAgents(state).find(
@@ -2167,9 +2219,20 @@ export class AgenCDaemonAgentManager {
   ): Promise<number> {
     this.#shuttingDown = true;
     this.#shutdownDisposition = options.disposition ?? "cancel";
-    await this.#waitForActiveCreates();
-    const targets = await this.#state.with(async (state) => {
-      await this.#refreshAgentsFromRunner(state);
+    for (const scope of this.#activeCreateScopes) {
+      scope.abort(new AgenCDaemonAgentLifecycleError(
+        "INVALID_ARGUMENT", "agent.start cancelled because the daemon is shutting down",
+      ));
+    }
+    let createDrainFailure: unknown;
+    try {
+      await this.#waitForActiveCreates();
+    } catch (error) {
+      createDrainFailure = error;
+    }
+    // Shutdown must reach every retained runner even when a status read fails.
+    await this.#refreshAgentsFromRunner().catch(() => {});
+    const targets = await this.#state.with((state) => {
       return [...state.agents.values()].filter(isActiveAgent).map((agent) => ({
         agentId: agent.agentId,
         sessionIds: [...agent.sessionIds],
@@ -2180,6 +2243,9 @@ export class AgenCDaemonAgentManager {
       readonly agentId: string;
       readonly error: unknown;
     }> = [];
+    if (createDrainFailure !== undefined) {
+      failures.push({ agentId: "pending agent.create", error: createDrainFailure });
+    }
     let stopped = 0;
     for (const target of targets) {
       const stopRunner = this.#runner?.stopAgent?.bind(this.#runner);
@@ -2273,8 +2339,8 @@ export class AgenCDaemonAgentManager {
     options: { readonly reason?: string } = {},
   ): Promise<readonly string[]> {
     const reason = options.reason ?? "stale_runner";
-    const candidates = await this.#state.with(async (state) => {
-      await this.#refreshAgentsFromRunner(state);
+    await this.#refreshAgentsFromRunner();
+    const candidates = await this.#state.with((state) => {
       return [...state.agents.values()].filter((agent) => isStaleAgent(agent));
     });
     if (candidates.length === 0) return [];
@@ -2633,11 +2699,8 @@ export class AgenCDaemonAgentManager {
     if (session === null || !isActiveSession(session)) {
       return { sessionId: params.sessionId, cancelled: false, reason };
     }
-    const canCancel = await this.#state.with(async (state) => {
-      const agent = state.agents.get(session.agentId);
-      if (agent !== undefined) {
-        await this.#refreshAgentFromRunner(state, agent);
-      }
+    await this.#refreshAgentFromRunner(session.agentId);
+    const canCancel = await this.#state.with((state) => {
       const refreshed = state.agents.get(session.agentId);
       return (
         refreshed !== undefined &&
@@ -3574,11 +3637,8 @@ export class AgenCDaemonAgentManager {
     // Resume only becomes safe once that terminal process has exited (its lock
     // is released and reclaimable as stale). Read-only history is still served
     // via getSessionTranscript's thread-store fallback. Keep the throw.
-    const messageTarget = await this.#state.with(async (state) => {
-      const agent = state.agents.get(session.agentId);
-      if (agent !== undefined) {
-        await this.#refreshAgentFromRunner(state, agent);
-      }
+    await this.#refreshAgentFromRunner(session.agentId);
+    const messageTarget = await this.#state.with((state) => {
       const refreshed = state.agents.get(session.agentId);
       if (refreshed === undefined || !isActiveAgent(refreshed)) {
         throw new AgenCDaemonAgentLifecycleError(
@@ -3640,9 +3700,10 @@ export class AgenCDaemonAgentManager {
     return submission;
   }
 
-  async #refreshAgentsFromRunner(state: AgentLifecycleState): Promise<void> {
-    for (const agent of [...state.agents.values()]) {
-      await this.#refreshAgentFromRunner(state, agent);
+  async #refreshAgentsFromRunner(reconcileSessions = false): Promise<void> {
+    const agentIds = await this.#state.with((state) => [...state.agents.keys()]);
+    for (const agentId of agentIds) {
+      await this.#refreshAgentFromRunner(agentId, reconcileSessions);
     }
   }
 
@@ -3860,11 +3921,8 @@ export class AgenCDaemonAgentManager {
         `AgenC daemon session not found or closed: ${sessionId}`,
       );
     }
-    await this.#state.with(async (state) => {
-      const agent = state.agents.get(session.agentId);
-      if (agent !== undefined) {
-        await this.#refreshAgentFromRunner(state, agent);
-      }
+    await this.#refreshAgentFromRunner(session.agentId);
+    await this.#state.with((state) => {
       const refreshed = state.agents.get(session.agentId);
       if (refreshed === undefined || !isActiveAgent(refreshed)) {
         throw new AgenCDaemonAgentLifecycleError(
@@ -3929,12 +3987,8 @@ export class AgenCDaemonAgentManager {
         "permission.list requires agentId or sessionId",
       );
     }
-    await this.#state.with(async (state) => {
-      const agent = state.agents.get(agentId);
-      if (agent !== undefined) {
-        await this.#refreshAgentFromRunner(state, agent);
-        await this.#reconcileAgentSessions(agent);
-      }
+    await this.#refreshAgentFromRunner(agentId, true);
+    await this.#state.with((state) => {
       const refreshed = state.agents.get(agentId);
       if (refreshed === undefined || !isActiveAgent(refreshed)) {
         throw new AgenCDaemonAgentLifecycleError(
@@ -3953,78 +4007,103 @@ export class AgenCDaemonAgentManager {
   }
 
   async #refreshAgentFromRunner(
-    _state: AgentLifecycleState,
-    agent: MutableAgent,
+    agentId: string,
+    reconcileSessions = false,
   ): Promise<void> {
-    if (!isActiveAgent(agent)) return;
-    const snapshot = await this.#runner?.getAgentSnapshot?.(agent.agentId);
-    if (snapshot === undefined) return;
-    if (snapshot === null) {
-      // The runner returned null — agent isn't in its #active map. This
-      // SHOULD only happen after an explicit stop or daemon-shutdown
-      // cleanup, not on a transient race after a turn completes. The
-      // earlier eviction here was the second symptom of the
-      // GAP-DMN-AGENT-NOT-FOUND class: the runner's getAgentSnapshot
-      // would briefly return null for completed-status agents (now
-      // fixed in background-agent-runner), and the lifecycle would
-      // evict before the snapshot stabilized, dooming the next user
-      // turn's message.stream. Defense in depth: only delete if the
-      // runner has explicitly removed the agent from its registry AND
-      // we have an authoritative terminal-state signal (via
-      // recordAgentStatusSnapshots / stopAgent). Without that signal,
-      // a null snapshot is a no-op refresh — leave state.agents alone.
-      if (agent.recovered === true) return;
-      // Mark the runner as unavailable but keep the agent record so
-      // the next message.stream finds it. The next refresh that
-      // returns a real snapshot (or an explicit stop event) will
-      // reconcile.
-      agent.runtimeAvailable = false;
-      agent.runtimeUnavailableSince ??= this.#now();
-      return;
+    const candidate = await this.#state.with((state) => {
+      const agent = state.agents.get(agentId);
+      return agent === undefined
+        ? undefined
+        : { owner: agent, expected: structuredClone(agent) };
+    });
+    if (candidate === undefined) return;
+    const { owner, expected } = candidate;
+    const snapshot = isActiveAgent(expected)
+      ? await withTimeout(
+          Promise.resolve(this.#runner?.getAgentSnapshot?.(agentId)),
+          AGENT_LIFECYCLE_OPERATION_TIMEOUT_MS,
+          `agent ${agentId} runner snapshot timed out`,
+        )
+      : undefined;
+    const sessionManager = this.#sessionManager;
+    let activeSessionIds: ReadonlySet<string> | undefined;
+    if (reconcileSessions && sessionManager !== undefined) {
+      const sessions = await withTimeout(
+        Promise.all(expected.sessionIds.map(async (sessionId) => {
+          const session = await sessionManager.getSession(sessionId);
+          return session !== null && isActiveSession(session) ? sessionId : null;
+        })),
+        AGENT_LIFECYCLE_OPERATION_TIMEOUT_MS,
+        `agent ${agentId} session reconciliation timed out`,
+      );
+      activeSessionIds = new Set(sessions.filter((id) => id !== null));
     }
-    const previousStatus = agent.status;
-    const sessionIds = [...agent.sessionIds];
-    agent.recovered = false;
-    agent.runtimeAvailable = true;
-    agent.runtimeUnavailableSince = undefined;
-    applyAgentSnapshot(agent, snapshot);
-    if (agent.status !== previousStatus) {
-      await this.#recordAgentStatusSnapshots(
-        sessionIds,
-        agent.agentId,
-        agent.status,
-        agent.lastActiveAt,
-        undefined,
-        snapshotRouteForAgent(agent),
-        snapshot.metadata,
+    const change = await this.#state.with((state) => {
+      const agent = state.agents.get(agentId);
+      // A stop, attachment, or restore can commit while the reads are pending.
+      // Apply only to the generation and state that initiated those reads.
+      if (agent !== owner || !isDeepStrictEqual(agent, expected)) return undefined;
+      const previousStatus = agent.status;
+      if (snapshot === null && agent.recovered !== true) {
+        // Retain the record through transient runner misses. The reaper needs
+        // an unavailable interval before it can make a terminal transition.
+        agent.runtimeAvailable = false;
+        agent.runtimeUnavailableSince ??= this.#now();
+      } else if (snapshot !== undefined && snapshot !== null) {
+        agent.recovered = false;
+        agent.runtimeAvailable = true;
+        agent.runtimeUnavailableSince = undefined;
+        applyAgentSnapshot(agent, snapshot);
+      }
+      const stopAgentId = activeSessionIds === undefined
+        ? undefined
+        : this.#reconcileAgentSessions(agent, activeSessionIds);
+      return {
+        stopAgentId,
+        transition: agent.status === previousStatus ? undefined : {
+          status: agent.status,
+          lastActiveAt: agent.lastActiveAt,
+          route: snapshotRouteForAgent(agent),
+          metadata: snapshot?.metadata,
+        },
+      };
+    });
+    if (change?.stopAgentId !== undefined) {
+      this.#scheduleReconcileRunnerStop(change.stopAgentId);
+    }
+    if (change?.transition !== undefined) {
+      const transition = change.transition;
+      await withTimeout(
+        this.#recordAgentStatusSnapshots(
+          expected.sessionIds,
+          agentId,
+          transition.status,
+          transition.lastActiveAt,
+          undefined,
+          transition.route,
+          transition.metadata,
+        ),
+        AGENT_LIFECYCLE_OPERATION_TIMEOUT_MS,
+        `agent ${agentId} status persistence timed out`,
       );
     }
   }
 
-  async #reconcileSessionBackedAgents(
-    state: AgentLifecycleState,
-  ): Promise<void> {
-    if (this.#sessionManager === undefined) return;
-    for (const agent of state.agents.values()) {
-      await this.#reconcileAgentSessions(agent);
-    }
-  }
-
-  async #reconcileAgentSessions(agent: MutableAgent): Promise<void> {
-    if (this.#sessionManager === undefined || agent.sessionIds.length === 0) {
-      return;
-    }
+  #reconcileAgentSessions(
+    agent: MutableAgent,
+    activeSessions: ReadonlySet<string>,
+  ): string | undefined {
+    if (agent.sessionIds.length === 0) return undefined;
     const activeSessionIds: string[] = [];
     const inactiveSessionIds: string[] = [];
     for (const sessionId of agent.sessionIds) {
-      const session = await this.#sessionManager.getSession(sessionId);
-      if (session !== null && isActiveSession(session)) {
+      if (activeSessions.has(sessionId)) {
         activeSessionIds.push(sessionId);
       } else {
         inactiveSessionIds.push(sessionId);
       }
     }
-    if (inactiveSessionIds.length === 0) return;
+    if (inactiveSessionIds.length === 0) return undefined;
     agent.logSessionIds = uniqueNonEmptyStrings([
       ...agent.logSessionIds,
       ...inactiveSessionIds,
@@ -4035,14 +4114,10 @@ export class AgenCDaemonAgentManager {
       agent.status = "stopped";
       agent.lastActiveAt = this.#now();
       agent.runtimeAvailable = false;
-      // The runner stop must NOT be awaited here: every reconcile caller
-      // holds the #state lock, and stopAgent's termination path re-acquires
-      // it (handleRunnerTerminated), so an in-lock await self-deadlocks the
-      // whole daemon the moment a zombie agent exists. The state mutation
-      // above is the observable outcome; the runtime teardown runs after
-      // the lock is released, matching the public stopAgent path.
-      if (stoppable) this.#scheduleReconcileRunnerStop(agent.agentId);
+      // The caller starts teardown after releasing the lifecycle lock.
+      if (stoppable) return agent.agentId;
     }
+    return undefined;
   }
 
   /** Deduplicates deferred session_terminated runner stops per agent. */
@@ -4078,12 +4153,8 @@ export class AgenCDaemonAgentManager {
   async #resolveAttachmentTarget(
     agentId: string,
   ): Promise<AgentAttachmentTarget> {
-    return this.#state.with(async (state) => {
-      const agent = state.agents.get(agentId);
-      if (agent !== undefined) {
-        await this.#refreshAgentFromRunner(state, agent);
-        await this.#reconcileAgentSessions(agent);
-      }
+    await this.#refreshAgentFromRunner(agentId, true);
+    return this.#state.with((state) => {
       const refreshed = state.agents.get(agentId);
       if (refreshed === undefined || !isActiveAgent(refreshed)) {
         const persisted = this.#listPersistedAgents(state).find(
@@ -4303,37 +4374,13 @@ export function assertCanonicalRuntimeSettingsProjection(
     proof.runtimeSettings === undefined ||
     proof.runtimeSettingsEventId === undefined ||
     projected.eventId !== proof.runtimeSettingsEventId ||
-    !runtimeSettingsSnapshotsEqual(projected, proof.runtimeSettings)
+    !runtimeSettingsEqual(projected, proof.runtimeSettings)
   ) {
     throw new AgenCDaemonAgentLifecycleError(
       "INVALID_ARGUMENT",
       `canonical session ${runId} runtime settings projection is ahead of or disagrees with the rollout`,
     );
   }
-}
-
-function runtimeSettingsSnapshotsEqual(
-  left: RunRuntimeSettingsSnapshot,
-  right: RunRuntimeSettingsSnapshot,
-): boolean {
-  return (
-    left.permissionMode === right.permissionMode &&
-    left.prePlanMode === right.prePlanMode &&
-    left.autoModeActive === right.autoModeActive &&
-    left.autoModeAvailable === right.autoModeAvailable &&
-    left.bypassPermissionsModeAvailable ===
-      right.bypassPermissionsModeAvailable &&
-    left.bypassPermissionsWorkspace === right.bypassPermissionsWorkspace &&
-    left.bypassPermissionsConsentWorkspace ===
-      right.bypassPermissionsConsentWorkspace &&
-    left.model === right.model &&
-    left.provider === right.provider &&
-    left.profile === right.profile &&
-    left.reasoningEffort === right.reasoningEffort &&
-    left.modelVerbosity === right.modelVerbosity &&
-    left.serviceTier === right.serviceTier &&
-    left.hooksDisabled === right.hooksDisabled
-  );
 }
 
 const MAX_RESUME_ROLLOUT_FILES_PER_SESSION = 256;
@@ -5420,6 +5467,7 @@ function formatEventMessageForLog(
       delta.flushAssistantDelta();
       return formatTranscriptLine("warning", msg.payload.message);
     case "error":
+    case "turn_failed":
     case "stream_error":
       delta.flushAssistantDelta();
       return formatTranscriptLine("error", msg.payload.message);

@@ -36,6 +36,7 @@ import { isAbsolute, resolve } from "node:path";
 import { cwd as processCwd } from "node:process";
 import { isDeepStrictEqual } from "node:util";
 import { VERSION } from "../index.js";
+import { classifyTurnTerminal } from "../contracts/turn-terminal.js";
 import { applyBestEffortPreMainProcessHardening } from "../sandbox/hardening/index.js";
 import {
   classifyCLI,
@@ -128,6 +129,7 @@ import {
   parseAgenCRemoteCliArgs,
   runAgenCRemoteCli,
 } from "./remote-cli.js";
+import { parseAgenCDaemonProxyCliArgs, runAgenCDaemonProxyCli } from "./daemon-proxy-cli.js";
 import {
   AgenCDaemonResponseError,
   collectDaemonClientEnvOverrides,
@@ -187,6 +189,11 @@ import {
   parseOpenAiModelsCliArgs,
   runOpenAiModelsCli,
 } from "./openai-models-cli.js";
+import {
+  formatKimiModelsCliHelpText,
+  parseKimiModelsCliArgs,
+  runKimiModelsCli,
+} from "./kimi-models-cli.js";
 import {
   formatAgenCMcpCliHelpText,
   parseAgenCMcpCliArgs,
@@ -387,6 +394,7 @@ export function formatCliHelpText(): string {
     "       agenc <openai-login|openai-logout|openai-auth-status> [--json]",
     "       agenc <grok-login|grok-logout|grok-auth-status> [--json]",
     "       agenc openai-models [--json]",
+    "       agenc kimi-models [--json]",
     "       agenc providers [--json] [--no-local-check]",
     "       agenc config <command> [args]",
     "       agenc plugin <command> [options]",
@@ -419,6 +427,7 @@ export function formatCliHelpText(): string {
     "  grok-login | grok-logout                  Manage X / xAI subscription sign-in",
     "  grok-auth-status                          Inspect X / xAI sign-in",
     "  openai-models                             List models the OpenAI credential can reach",
+    "  kimi-models                               List native Kimi models the credential can reach",
     "  providers                               Check provider readiness and local health",
     "  config                                  Show, mutate, validate, or edit config.toml",
     "  plugin                                  Manage local plugins and marketplaces",
@@ -501,6 +510,8 @@ export function formatCliHelpTopicText(topic: string): string | null {
       return formatGrokAuthCliHelpText();
     case "openai-models":
       return formatOpenAiModelsCliHelpText();
+    case "kimi-models":
+      return formatKimiModelsCliHelpText();
     case "daemon":
       return formatAgenCDaemonCliHelpText();
     case "remote":
@@ -1659,11 +1670,27 @@ const ONE_SHOT_TOOL_DENIED_MARKER =
   "tool call and gave up. Re-run with --permission-mode or " +
   "--dangerously-bypass-approvals-and-sandbox to allow tools.";
 
+function daemonOneShotStartedTurnId(event: unknown): string | undefined {
+  if (!isJsonRecord(event)) return undefined;
+  const params = daemonEventParams(event);
+  if (
+    event.method === "event.agent_status" &&
+    (params?.status === "running" || params?.runStatus === "running") &&
+    typeof params.turnId === "string"
+  ) return params.turnId;
+  const transcriptEvent = daemonNestedTranscriptEvent(event);
+  if (transcriptEvent?.type !== "turn_started" || !isJsonRecord(transcriptEvent.payload)) return undefined;
+  return typeof transcriptEvent.payload.turnId === "string" ? transcriptEvent.payload.turnId : undefined;
+}
+
 function daemonOneShotFinalStatus(
   event: unknown,
+  expectedTurnId?: string,
 ): DaemonOneShotFinalStatus | null {
   if (!isJsonRecord(event)) return null;
   const params = daemonEventParams(event);
+  const notificationTurnId = typeof params?.turnId === "string" ? params.turnId : undefined;
+  if (expectedTurnId !== undefined && notificationTurnId !== undefined && notificationTurnId !== expectedTurnId) return null;
   if (event.method === "event.agent_status" && params !== null) {
     const runStatus =
       typeof params.runStatus === "string" ? params.runStatus : undefined;
@@ -1682,25 +1709,18 @@ function daemonOneShotFinalStatus(
     }
   }
   const transcriptEvent = daemonNestedTranscriptEvent(event);
-  if (transcriptEvent === null) return null;
-  const payload = isJsonRecord(transcriptEvent.payload)
-    ? transcriptEvent.payload
-    : null;
-  if (transcriptEvent.type === "turn_complete") {
-    const message =
-      payload !== null && typeof payload.lastAgentMessage === "string"
-        ? payload.lastAgentMessage
-        : undefined;
-    return { code: 0, ...(message !== undefined ? { message } : {}) };
-  }
-  if (transcriptEvent.type === "error") {
-    const message =
-      payload !== null && typeof payload.message === "string"
-        ? payload.message
-        : undefined;
-    return { code: 1, ...(message !== undefined ? { message } : {}) };
-  }
-  return null;
+  if (transcriptEvent === null || typeof transcriptEvent.type !== "string") return null;
+  const terminal = classifyTurnTerminal({
+    type: transcriptEvent.type,
+    payload: transcriptEvent.payload,
+    turnId: transcriptEvent.turnId ?? notificationTurnId,
+  }, {
+    expectedTurnId: expectedTurnId ?? notificationTurnId,
+  });
+  return terminal === undefined ? null : {
+    code: terminal.code,
+    ...(terminal.message !== undefined ? { message: terminal.message } : {}),
+  };
 }
 
 async function runDaemonOneShotPrompt(params: {
@@ -1736,6 +1756,7 @@ async function runDaemonOneShotPrompt(params: {
   let cancelled = false;
   let printedAssistantOutput = false;
   let assistantOutput = "";
+  let activeTurnId: string | undefined;
   let lastPrintedChar = "";
   const outputFormat = params.outputFormat ?? "text";
   const collectedEvents: unknown[] = [];
@@ -1924,7 +1945,8 @@ async function runDaemonOneShotPrompt(params: {
             lastPrintedChar = chunk.at(-1) ?? lastPrintedChar;
           }
 
-          const finalStatus = daemonOneShotFinalStatus(event);
+          activeTurnId ??= daemonOneShotStartedTurnId(event);
+          const finalStatus = daemonOneShotFinalStatus(event, activeTurnId);
           if (finalStatus === null) return;
           if (finalizing) return;
           finalizing = true;
@@ -5514,6 +5536,8 @@ export async function main(): Promise<number> {
   if (initCommand !== null) {
     return runAgenCInitCli(initCommand);
   }
+  const proxyCommand = parseAgenCDaemonProxyCliArgs(argv);
+  if (proxyCommand !== null) return runAgenCDaemonProxyCli(proxyCommand);
   const daemonCommand = parseAgenCDaemonCliArgs(argv);
   if (daemonCommand !== null) {
     if (
@@ -5600,7 +5624,10 @@ export async function main(): Promise<number> {
   const grokAuthCommand = parseGrokAuthCliArgs(argv);
   if (grokAuthCommand !== null) {
     const ingress = captureSecureStorageIngress(process.env);
-    return runGrokAuthCli(grokAuthCommand, { home: ingress.home });
+    return runGrokAuthCli(grokAuthCommand, {
+      home: ingress.home,
+      environment: snapshotProviderEnvironment(ingress.environment),
+    });
   }
   const openAiModelsCommand = parseOpenAiModelsCliArgs(argv);
   if (openAiModelsCommand !== null) {
@@ -5608,6 +5635,18 @@ export async function main(): Promise<number> {
     return runOpenAiModelsCli(openAiModelsCommand, {
       home: ingress.home,
       environment: snapshotProviderEnvironment(ingress.environment),
+    });
+  }
+  const kimiModelsCommand = parseKimiModelsCliArgs(argv);
+  if (kimiModelsCommand !== null) {
+    const ingress = captureSecureStorageIngress(process.env);
+    const moonshotApiKey = ingress.environment.MOONSHOT_API_KEY;
+    return runKimiModelsCli(kimiModelsCommand, {
+      environment: snapshotProviderEnvironment(
+        moonshotApiKey === undefined
+          ? {}
+          : { MOONSHOT_API_KEY: moonshotApiKey },
+      ),
     });
   }
   const authCommand = parseAgenCAuthCliArgs(argv);

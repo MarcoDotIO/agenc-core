@@ -11,6 +11,7 @@ import type {
   PermissionDefaultMode,
   PerToolConfig,
 } from "../config/schema.js";
+import type { McpOAuthConfig } from "../config/mcp-oauth.js";
 import type { Tool } from "./_deps/tools-types.js";
 
 /** Runtime-only metadata injected after canonical config validation. */
@@ -54,6 +55,7 @@ export interface MCPServerOrigin {
  *   - `"websocket"`: connect to a remote WebSocket endpoint.
  */
 export interface MCPServerConfig {
+  readonly oauth?: McpOAuthConfig;
   /** Human-readable server name (used for tool namespacing) */
   readonly name: string;
   /** Transport kind. Default: "stdio". */

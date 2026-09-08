@@ -220,14 +220,22 @@ export function createWaitAgentTool(opts: MultiAgentV2Options): Tool {
         callId: waitCallId,
       },
     });
-    // Read the turn before the wait, not after it: `waitForMailboxChange`
-    // takes no abort signal, so an interrupt can replace the turn while this
-    // wait is still sleeping. Charging the result to whatever turn is active
-    // on resume would bill the new turn for time it never spent.
+    // Read the turn before the wait, not after it: an interrupt can replace the
+    // turn while this wait is still sleeping, and charging the result to
+    // whatever turn is active on resume would bill the new turn for time it
+    // never spent.
     const turnId = currentTurnId(sessionOrError);
+    // The executor injects the turn's abort signal; a stopped swarm used to
+    // hold its parent turn open until this wait's deadline (#2201).
+    const abortSignal = (args as { readonly __abortSignal?: AbortSignal })
+      .__abortSignal;
     let mailboxChanged = false;
     try {
-      mailboxChanged = await sessionOrError.waitForMailboxChange(timeoutMs);
+      mailboxChanged = await sessionOrError.waitForMailboxChange(
+        timeoutMs,
+        undefined,
+        abortSignal,
+      );
     } catch (error) {
       emit(sessionOrError, {
         type: "collab_waiting_end",
@@ -256,6 +264,16 @@ export function createWaitAgentTool(opts: MultiAgentV2Options): Tool {
         ...(updates.length > 0 ? { mailboxUpdates: updates } : {}),
       },
     });
+    if (timedOut && abortSignal?.aborted === true) {
+      // The turn was stopped while waiting: return now so the stop lands now,
+      // not at the deadline, and start no timeout streak over it.
+      waitTimeoutStreaks.delete(sessionOrError);
+      return json({
+        message: "Wait interrupted: the turn was stopped.",
+        interrupted: true,
+        timed_out: false,
+      });
+    }
     if (!timedOut) {
       waitTimeoutStreaks.delete(sessionOrError);
       return json({

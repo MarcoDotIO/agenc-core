@@ -12,6 +12,7 @@
 // unknown top-level keys before normalization.
 
 import { isAbsolute } from "node:path";
+import { assertMcpOAuthHttpsUrl, validateMcpOAuthConfig, type McpOAuthConfig } from "./mcp-oauth.js";
 import {
   MarketplaceSourceSchema,
   type MarketplaceSource,
@@ -203,12 +204,10 @@ export interface AgentRunRetentionConfig {
   readonly snapshot_days?: number;
   readonly snapshot_max_count?: number;
   readonly snapshot_max_bytes?: number;
-  // Rollout/session disk retention window (days). Lights up the reserved
-  // `agent.retention.rollout_days` retention intent: when set, the daemon's
-  // throttled sweep deletes session dirs + their rollout JSONL + the
-  // thread_rollout_items mirror rows once their newest rollout is older than
-  // this many days. Unset → DISABLED (no pruning; the conservative default,
-  // since this deletes user data).
+  // Rollout/session disk retention window (days). The daemon's throttled
+  // sweep deletes session dirs + their rollout JSONL + the thread_rollout_items
+  // mirror rows once their newest rollout is older than this many days.
+  // Default 30 (#2228); 0 disables the sweep and keeps every session forever.
   readonly rollout_days?: number;
 }
 
@@ -284,6 +283,7 @@ export type HookEventName = (typeof HOOK_EVENT_NAMES)[number];
 export type McpTransport = "stdio" | "sse" | "http" | "websocket";
 
 export interface McpServerConfig {
+  readonly oauth?: McpOAuthConfig;
   readonly command?: string;
   readonly args?: readonly string[];
   readonly env?: Readonly<Record<string, string>>;
@@ -357,6 +357,7 @@ export type ProtocolConfig =
 
 export interface DaemonConfig {
   readonly autostart?: boolean;
+  readonly agent_stop_timeout_ms?: number;
 }
 
 export type GatewayDmPolicy = "pairing" | "allowlist" | "open" | "disabled";
@@ -900,6 +901,8 @@ export interface AgenCConfig {
   readonly agent?: AgentConfig;
   readonly durableTurns?: DurableTurnsConfig;
   readonly stream_watchdog_timeout_ms?: number;
+  readonly provider_outage_wait_ms?: number;
+  readonly provider_outage_retry_ms?: number;
   readonly max_output_tokens?: number;
   readonly capped_default_max_output_tokens?: boolean;
   readonly max_turns?: number;
@@ -1038,6 +1041,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = Object.freeze([
   "pluginTrustMessage",
   "agent",
   "stream_watchdog_timeout_ms",
+  "provider_outage_wait_ms",
+  "provider_outage_retry_ms",
   "max_output_tokens",
   "capped_default_max_output_tokens",
   "max_turns",
@@ -1061,6 +1066,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = Object.freeze([
  * set `stream_watchdog_timeout_ms = 0` to disable it.
  */
 export const DEFAULT_STREAM_WATCHDOG_TIMEOUT_MS = 600_000;
+/** Total time a turn keeps waiting for a provider outage to end (30 min). */
+export const DEFAULT_PROVIDER_OUTAGE_WAIT_MS = 1_800_000;
+/** First slow-retry delay after the reconnect ladder is spent (30 s). */
+export const DEFAULT_PROVIDER_OUTAGE_RETRY_MS = 30_000;
 
 export function defaultConfig(): AgenCConfig {
   return Object.freeze({
@@ -1115,6 +1124,12 @@ export function defaultConfig(): AgenCConfig {
     // provider stream otherwise hangs the turn until the user cancels;
     // `0` disables the deadline for operators who need unbounded silence.
     stream_watchdog_timeout_ms: DEFAULT_STREAM_WATCHDOG_TIMEOUT_MS,
+    // A provider that is down for minutes is not the turn's fault (#2212).
+    // Once the fast reconnect ladder is spent, the turn waits with a slow
+    // backoff (30 s doubling to 5 min) and tries again for up to this long;
+    // `0` ends the turn as soon as the ladder is exhausted.
+    provider_outage_wait_ms: DEFAULT_PROVIDER_OUTAGE_WAIT_MS,
+    provider_outage_retry_ms: DEFAULT_PROVIDER_OUTAGE_RETRY_MS,
     // No default turn cap. Interactive / long-running agents stop on the
     // model’s own stop signal (or explicit cancel / budget). Operators who
     // want a runaway-loop backstop can set `max_turns` (or its documented env
@@ -1173,6 +1188,10 @@ export function defaultConfig(): AgenCConfig {
         snapshot_days: 3,
         snapshot_max_count: 10_000,
         snapshot_max_bytes: 67_108_864,
+        // Sessions untouched for a month are pruned with their rollout files
+        // and mirror rows; without a window a project's state database grows
+        // without bound (693 MB in two days of soak, #2228). 0 keeps forever.
+        rollout_days: 30,
       }) as AgentRunRetentionConfig,
     }) as AgentConfig,
   } satisfies AgenCConfig);
@@ -2391,6 +2410,7 @@ export function validateProtocolConfig(
 }
 
 const EXTERNAL_MCP_SERVER_KEYS: ReadonlySet<string> = new Set([
+  "oauth",
   "command",
   "args",
   "env",
@@ -2500,6 +2520,12 @@ function validateExternalMcpServerConfig(
       );
     }
     out.transport = record.transport;
+  }
+  if (record.oauth !== undefined) {
+    out.oauth = validateMcpOAuthConfig(record.oauth);
+    if (out.transport !== "http" && out.transport !== "sse") throw makeError(`${serverName}.oauth`, "OAuth requires HTTP or SSE transport");
+    assertMcpOAuthHttpsUrl(out.endpoint ?? "");
+    if (Object.keys(out.headers ?? {}).some((key) => key.toLowerCase() === "authorization")) throw makeError(`${serverName}.oauth`, "OAuth cannot be combined with an Authorization header");
   }
   for (const key of ["enabled", "required"] as const) {
     const value = optionalBoolean(record[key], `${serverName}.${key}`, makeError);

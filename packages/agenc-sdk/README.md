@@ -2,7 +2,8 @@
 
 **0.3.0** — typed, zero-dependency embedding SDK for the AgenC daemon protocol.
 
-Node **>=26.5 <27** · ESM only · plain `tsc` build · no runtime dependencies.
+Node **>=26.5 <27**, ESM only, TypeScript build with generated-contract checks,
+and no external runtime dependencies.
 
 ## Surfaces
 
@@ -12,7 +13,7 @@ Node **>=26.5 <27** · ESM only · plain `tsc` build · no runtime dependencies.
 | `promptViaSubprocess()`                                                      | Same event-iterable interface over `agenc -p --output-format stream-json` with no daemon socket access from your process.                                                                                              |
 | `client.runStatus` / `runResult` / `replayRun` / `runEvidence` / `cancelRun` | Read durable run/admission state, replay or hash canonical journal evidence, or cancel a run tree.                                                                                                                     |
 | `client.reattachRun({ runId, afterSequence })`                               | Catch up from a durable cursor, suppress and report duplicate delivery, stop on any explicit replay gap, and fetch the durable terminal result after reconnect.                                                        |
-| `client.request(method, params)`                                             | Raw typed JSON-RPC for all **53** public daemon methods (mirrored in `./protocol`).                                                                                                                                    |
+| `client.request(method, params)`                                             | Raw typed JSON-RPC for all **89** public daemon methods, generated from the daemon protocol. Required wire payloads must be supplied.                                                                                   |
 | `client.listCsvJobReviews` / `showCsvJobReview` / `resolveCsvJobReview`      | Typed CSV unknown-outcome review helpers (`csvJob.review.*`).                                                                                                                                                          |
 
 Errors: `AgencRpcError`, `AgencMalformedResponseError`,
@@ -45,6 +46,12 @@ those guarantees are unavailable.
 Protocol 1.9 adds a Core-only admitted shell method; it is not exposed by the
 SDK request union.
 
+`createSession()`, `spawnAgent()`, and the CSV review helpers supply an omitted
+`cwd`. Direct `request()` calls require the daemon's complete payload, including
+`cwd` for those methods. The SDK generation check compiles exact request and
+result parity for every public method. See [protocol generation](../../docs/sdk.md#protocol-mirror--drift-guard)
+for regeneration and compatibility adapters.
+
 ```js
 import { connect, promptViaSubprocess } from "@tetsuo-ai/agenc-sdk";
 
@@ -70,7 +77,7 @@ await client.close();
 - Local endpoint: `${AGENC_HOME:-~/.agenc}/daemon.sock` on Unix; a stable per-home named pipe on Windows
 - Cookie: `${AGENC_HOME:-~/.agenc}/daemon.cookie` (first message must be `initialize` with `authCookie`; `connect()` handles this)
 - Plugin storage: `createSession()` requires an exact absolute `pluginStorageRoot` of at most 4096 UTF-8 bytes, with no surrounding whitespace. `AgencClient` does not reread `AGENC_PLUGIN_CACHE_DIR`, derive a root from `AGENC_HOME`, or accept `agentId`; use `attachAgent()` for an existing agent.
-- Autostart: runs `agenc daemon start` when the socket is down (disable with `autostart: false`)
+- Autostart: runs `agenc daemon start` when the socket is down (disable with `autostart: false`); when that start fails, the error carries the CLI's exit code and its last stderr lines
 - Hook authority: `createSession()` sends `allowUntrustedHooks: false`. A caller using `spawnAgent()` must send complete runtime options and may set the field to `true` only after vetting the workspace. It permits command effects only and cannot override `simpleMode` hook suppression.
 - Home authority: `AGENC_HOME` must be absolute and is canonicalized before daemon paths are derived. Explicit socket and cookie paths do not bypass home-authority validation.
 
@@ -104,6 +111,13 @@ then check it with
 Workflow-result types in `src/workflow-result.generated.ts` are marker-checked
 by the same command, not an exact file compare
 (see [`docs/sdk.md`](../../docs/sdk.md#workflow-result-generated-mirror)).
+Workflow-handoff types, constants, and structural validator data in
+`src/workflow-handoff.generated.ts` are generated from the versioned runtime
+JSON schema and checked against the runtime schema and named constants.
+The same `--write` command refreshes the complete file. SDK build and typecheck
+run the read-only generated checks. Cross-field and UTF-8 validation stays in
+`src/workflow-handoff-validation.ts`, with no runtime package dependencies
+(see [`docs/sdk.md`](../../docs/sdk.md#workflow-handoff-generated-mirror)).
 
 ## Durable reconnect
 

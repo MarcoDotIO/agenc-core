@@ -8,6 +8,7 @@ import {
 import { resolveModelCapabilityHints } from "./registry/model-catalog.js";
 import { supportsGrokServerSideTools } from "./provider-native-search.js";
 import { normalizeProviderIdentity } from "../provider-identity.js";
+import { isVerifiedOpenAiReasoningModel } from "./registry/openai-reasoning-models.js";
 
 export interface ProviderModelCapabilities {
   readonly provider: string;
@@ -221,7 +222,7 @@ function matchesModelFamily(model: string, pattern: RegExp): boolean {
 }
 
 function isOpenAIReasoningModel(model: string): boolean {
-  return matchesModelFamily(
+  return isVerifiedOpenAiReasoningModel(model) || matchesModelFamily(
     model,
     // branding-scan: allow OpenAI model family identifier
     /(?:^|[/:])(?:gpt-5|o1|o3|o4|codex|chatgpt-5)(?:$|[-_.:])/,
@@ -283,6 +284,17 @@ function isZaiGlm53Model(model: string): boolean {
 
 function isZaiGlm53VisionModel(model: string): boolean {
   return matchesModelFamily(model, /(?:^|[/:])glm-5\.3-flash$/);
+}
+
+function isKimiGlobalChatModel(model: string): boolean {
+  return matchesModelFamily(
+    model,
+    /(?:^|[/:])kimi-(?:k3|k2\.7-code(?:-highspeed)?|k2\.6)$/,
+  );
+}
+
+function isKimiK3Model(model: string): boolean {
+  return matchesModelFamily(model, /(?:^|[/:])kimi-k3$/);
 }
 
 function isQwen38ThinkingModel(model: string): boolean {
@@ -489,6 +501,14 @@ const PROVIDER_CAPABILITIES: Readonly<Record<string, ProviderCapabilityDefinitio
     acceptsImageHistory: isZaiGlm53VisionModel,
     acceptsThinkingHistory: isZaiGlm53Model,
     acceptsReasoningEffort: isZaiGlm53Model,
+  },
+  kimi: {
+    ...HOSTED_CHAT_COMPATIBLE_CAPABILITIES,
+    supportsImageInput: isKimiGlobalChatModel,
+    supportsExtendedThinking: isKimiGlobalChatModel,
+    acceptsImageHistory: isKimiGlobalChatModel,
+    acceptsThinkingHistory: isKimiGlobalChatModel,
+    acceptsReasoningEffort: isKimiK3Model,
   },
   qwen: {
     ...HOSTED_CHAT_COMPATIBLE_CAPABILITIES,

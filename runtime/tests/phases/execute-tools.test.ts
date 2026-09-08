@@ -1223,6 +1223,106 @@ describe("executeTools — T7 gap #109 pipeline", () => {
     });
   });
 
+  /**
+   * A turn whose model keeps issuing one identical `Write` that keeps failing
+   * the same way. `failures(n)` seeds n earlier identical failures; the tool
+   * records how often it really ran.
+   */
+  function repeatedFailureFixture() {
+    const denial =
+      '{"error":"file_path is outside allowed directories: /root/memory/style.md"}';
+    const args = JSON.stringify({ file_path: "/root/memory/style.md", content: "x" });
+    const call: LLMToolCall = { id: "write-4", name: "Write", arguments: args };
+    let executed = 0;
+    const fixture = singleToolRun(
+      {
+        name: "Write",
+        description: "writes a file",
+        inputSchema: { type: "object" },
+        metadata: { family: "filesystem", source: "builtin", mutating: true },
+        execute: async () => {
+          executed += 1;
+          return { content: denial, isError: true };
+        },
+      },
+      call,
+    );
+    const ctx = mkCtx({ sandboxPolicy: { value: "danger_full_access" } });
+    const failures = (count: number) =>
+      Array.from({ length: count }, (_, i) => ({
+        callId: `write-${i + 1}`,
+        toolName: "Write",
+        arguments: args,
+        content: denial,
+        isError: true,
+      }));
+    const completionsFor = (callId: string) =>
+      fixture.emitted.filter(
+        (event) =>
+          event.msg.type === "tool_call_completed" &&
+          event.msg.payload?.callId === callId,
+      );
+    const streamIn = () =>
+      queueStreamingToolCall(
+        ensureStreamingToolExecutor(fixture.state, ctx, fixture.session),
+        { type: "tool_use", id: call.id, name: call.name, input: {} },
+        call,
+        fixture.session,
+        ctx,
+        fixture.state,
+      );
+    return {
+      ...fixture,
+      call,
+      ctx,
+      failures,
+      completionsFor,
+      streamIn,
+      executed: () => executed,
+      run: () => executeTools(fixture.state, ctx, fixture.session),
+    };
+  }
+
+  test("the streaming path does not dispatch a call the repeat guard is about to refuse", async () => {
+    const f = repeatedFailureFixture();
+    f.state.completedToolResults = f.failures(3);
+
+    // The fourth identical call streams in: it must not start.
+    expect(f.streamIn()).toBe(false);
+    expect(f.state.streamingToolExecutor?.getToolStates()).toHaveLength(0);
+
+    await f.run();
+
+    expect(f.executed()).toBe(0);
+    expect(
+      f.warnings.filter((cause) => cause === "repeated_failing_call_blocked"),
+    ).toHaveLength(1);
+    // One result for the call id: the refusal, recorded by the post-stream pass.
+    expect(f.completionsFor(f.call.id)).toHaveLength(1);
+    expect(f.state.messages).toHaveLength(1);
+    expect(f.state.messages[0]?.content).toContain("will not run again");
+  });
+
+  test("a call the streaming path already dispatched is not refused again by the post-stream pass", async () => {
+    const f = repeatedFailureFixture();
+    // Two identical failures so far: the guard lets the call stream in and start.
+    f.state.completedToolResults = f.failures(2);
+    expect(f.streamIn()).toBe(true);
+    f.state.streamingToolExecutor?.dispatchPending();
+    // A third identical failure lands before the post-stream pass reaches the call.
+    f.state.completedToolResults = f.failures(3);
+
+    await f.run();
+
+    // The dispatched call's own result is the only result for its id.
+    expect(f.executed()).toBe(1);
+    expect(f.warnings).not.toContain("repeated_failing_call_blocked");
+    expect(f.completionsFor(f.call.id)).toHaveLength(1);
+    expect(f.state.messages).toHaveLength(1);
+    expect(f.state.messages[0]?.content).toContain("outside allowed directories");
+    expect(f.state.messages[0]?.content).not.toContain("will not run again");
+  });
+
   test("identical calls that keep succeeding are never refused", async () => {
     let executed = 0;
     const args = JSON.stringify({ file_path: "src/app.ts" });

@@ -75,7 +75,7 @@ class PromptTransport implements AgencTransport {
     readonly response: Deferred<AgencDaemonResponse<"message.send">>;
   }> = [];
   client?: AgencClient;
-  initializeVersion = "1.9.0";
+  initializeVersion = "1.10.0";
   initializeFailures = 0;
   attachRuntimeOptions: unknown;
   attachRuntimeSettings: unknown = VALID_ATTACH_RUNTIME_SETTINGS;
@@ -118,7 +118,8 @@ class PromptTransport implements AgencTransport {
               this.initializeVersion === "1.6.0" ||
               this.initializeVersion === "1.7.0" ||
               this.initializeVersion === "1.8.0" ||
-              this.initializeVersion === "1.9.0",
+              this.initializeVersion === "1.9.0" ||
+              this.initializeVersion === "1.10.0",
           },
         },
       });
@@ -346,6 +347,7 @@ describe("agenc-sdk prompt race safety", () => {
     "1.6.0",
     "1.7.0",
     "1.8.0",
+    "1.9.0",
   ])(
     "downgrades capability discovery to an older %s daemon",
     async (version) => {
@@ -359,7 +361,7 @@ describe("agenc-sdk prompt race safety", () => {
       );
       expect(initializes).toHaveLength(2);
       expect(initializes.map((request) => request.params)).toEqual([
-        expect.objectContaining({ protocol: { version: "1.9.0" } }),
+        expect.objectContaining({ protocol: { version: "1.10.0" } }),
         expect.objectContaining({ protocol: { version } }),
       ]);
       expect(client.negotiatedProtocolVersion).toBe(version);
@@ -725,6 +727,34 @@ describe("agenc-sdk prompt race safety", () => {
     expect(
       events.filter((event) => event.type === "message_committed"),
     ).toEqual([expect.objectContaining({ text: "haha" })]);
+  });
+
+  it("keeps diagnostics and stale failures open, then returns the explicit failure", async () => {
+    const transport = new PromptTransport();
+    const client = await initializedClient(transport);
+    const run = client.runPrompt("session_1", "work", { clientMessageId: "failure-message", includeUsage: false });
+    const send = await waitForSend(transport, 0);
+    transport.emit(userMessage("failure-message"));
+    transport.emit(turnStarted("turn-failure"));
+    const emit = (id: string, type: string, payload: JsonObject, turnId = "turn-failure") => transport.emit({
+      jsonrpc: "2.0", method: "event.session_event",
+      params: { sessionId: "session_1", turnId, eventId: id, event: { id, type, payload } },
+    });
+    emit("stale", "turn_failed", { turnId: "old-turn", code: "provider_error", message: "stale failure" });
+    emit("consistent-stale", "turn_failed", { turnId: "old-turn", code: "provider_error", message: "stale failure" }, "old-turn");
+    emit("diagnostic", "error", { turnId: "turn-failure", cause: "stop_hook_threw", message: "diagnostic" });
+    transport.emit(text("turn-failure", "partial answer"));
+    emit("failed", "turn_failed", { turnId: "turn-failure", code: "provider_error", message: "provider failed" });
+    resolveSend(send, "turn-failure");
+    await expect(run.result()).resolves.toMatchObject({ stopReason: "errored", exitCode: 1, finalMessage: "provider failed" });
+    const events: AgencPromptEvent[] = [];
+    for await (const event of run) events.push(event);
+    expect(events).toContainEqual(expect.objectContaining({ type: "text", delta: "partial answer" }));
+    const next = client.runPrompt("session_1", "next", { clientMessageId: "next-message", includeUsage: false });
+    const nextSend = await waitForSend(transport, 1);
+    resolveSend(nextSend, "next-turn");
+    await expect(next.result()).resolves.toMatchObject({ exitCode: 0 });
+    await client.close();
   });
 
   it("never sends or cancels when an AbortSignal is already aborted", async () => {

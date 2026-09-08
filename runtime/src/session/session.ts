@@ -4828,6 +4828,7 @@ export class Session {
   async waitForMailboxChange(
     timeoutMs: number,
     ownership?: IdleInputOwnership,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     if (this.hasPendingInput(ownership)) {
       return true;
@@ -4835,17 +4836,25 @@ export class Session {
     if (this.mailboxSeqWatch.isClosed) {
       return false;
     }
+    // A stopped turn must not sit out the deadline: the wait ends at once and
+    // reports no change, and the caller sees the aborted signal (#2201).
+    if (signal?.aborted === true) {
+      return false;
+    }
     const startSeq = this.mailboxSeqWatch.value;
     return new Promise<boolean>((resolve) => {
       let settled = false;
       let unsubscribe: (() => void) | null = null;
+      const onAbort = (): void => finish(false);
       const finish = (value: boolean): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         unsubscribe?.();
+        signal?.removeEventListener("abort", onAbort);
         resolve(value);
       };
+      signal?.addEventListener("abort", onAbort, { once: true });
       const timer = setTimeout(() => finish(false), timeoutMs);
       const subscription = this.mailboxSeqWatch.subscribe((seq) => {
         if (seq !== startSeq && this.hasPendingInput(ownership)) {
@@ -5171,6 +5180,27 @@ export class Session {
       });
     }
     return messages;
+  }
+
+  private stoppedByUserSinceLastPromptFlag = false;
+
+  /**
+   * A user Stop holds the session quiet until the user speaks again: while
+   * this is set, a child agent's receipt does not start a parent follow-up
+   * turn (#2236). The daemon sets it on a client-initiated interrupt and
+   * clears it when the next user message is submitted; receipts that arrive
+   * meanwhile wait in the mailbox for that turn.
+   */
+  markStoppedByUser(): void {
+    this.stoppedByUserSinceLastPromptFlag = true;
+  }
+
+  clearUserStop(): void {
+    this.stoppedByUserSinceLastPromptFlag = false;
+  }
+
+  get stoppedByUserSinceLastPrompt(): boolean {
+    return this.stoppedByUserSinceLastPromptFlag;
   }
 
   hasDeferredAgentMailboxMessages(): boolean {

@@ -298,8 +298,8 @@ describe("BufferSurface", () => {
     expect(handlers["workbench:focusRail"]?.()).toBe(false);
     handlers["workbench:toggleFileRail"]?.();
     await handlers["buffer:revert"]?.();
-    await handlers["buffer:close"]?.();
-    await handlers["buffer:closeDiscard"]?.();
+    expect(handlers["buffer:close"]).toBeUndefined();
+    expect(handlers["buffer:closeDiscard"]).toBeUndefined();
     handlers["buffer:externalEditor"]?.();
     handlers["buffer:undo"]?.();
     handlers["buffer:redo"]?.();
@@ -328,13 +328,11 @@ describe("BufferSurface", () => {
     expect(dispatch).toHaveBeenCalledWith({ type: "focus", pane: "agents" });
     expect(dispatch).toHaveBeenCalledWith({ type: "focus", pane: "composer" });
     expect(store.close).not.toHaveBeenCalled();
-    expect(dispatch).toHaveBeenCalledTimes(6);
+    expect(dispatch).toHaveBeenCalledTimes(4);
     expect(dispatch).toHaveBeenNthCalledWith(4, {
       type: "moveFileToRail",
       path: "target.ts",
     });
-    expect(dispatch).toHaveBeenNthCalledWith(5, { type: "closeSurface" });
-    expect(dispatch).toHaveBeenNthCalledWith(6, { type: "closeSurface" });
     expect(store.move).toHaveBeenCalledWith("up");
     expect(store.move).toHaveBeenCalledWith("down");
     expect(store.move).toHaveBeenCalledWith("left");
@@ -387,11 +385,10 @@ describe("BufferSurface", () => {
       hasInFlightAgent: false,
       dispatch: blockedDispatch,
     });
-    await blockedHandlers["buffer:close"]?.();
-    await blockedHandlers["buffer:closeDiscard"]?.();
+    expect(blockedHandlers["buffer:close"]).toBeUndefined();
+    expect(blockedHandlers["buffer:closeDiscard"]).toBeUndefined();
     expect(blockedCloseStore.close).not.toHaveBeenCalled();
-    expect(blockedDispatch).toHaveBeenCalledTimes(2);
-    expect(blockedDispatch).toHaveBeenCalledWith({ type: "closeSurface" });
+    expect(blockedDispatch).not.toHaveBeenCalled();
 
     const panelDispatch = vi.fn();
     const panelHandlers = createBufferSurfaceKeyHandlers({
@@ -1047,22 +1044,22 @@ describe("BufferSurface", () => {
     try {
       await runWithCwdOverride(dir, async () => {
         root.render(<App retryAttempt={0} />);
-        await sleep();
-
         const store = getWorkbenchBufferStore();
-        expect(store.getSnapshot()).toMatchObject({
-          status: "error",
-          filePath: null,
+        await vi.waitFor(() => {
+          expect(store.getSnapshot()).toMatchObject({
+            status: "error",
+            filePath: null,
+          });
         });
 
         await writeFile(join(dir, "missing.ts"), "created\n", "utf8");
         root.render(<App retryAttempt={1} />);
-        await sleep();
-
-        expect(store.getSnapshot()).toMatchObject({
-          status: "ready",
-          filePath: "missing.ts",
-          dirty: false,
+        await vi.waitFor(() => {
+          expect(store.getSnapshot()).toMatchObject({
+            status: "ready",
+            filePath: "missing.ts",
+            dirty: false,
+          });
         });
         expect(store.getText()).toBe("created\n");
       });
@@ -1369,7 +1366,7 @@ describe("BufferSurface", () => {
             "",
             nativeCommandLine === null ? "" : `:${nativeCommandLine}`,
           ],
-          mode: "insert",
+          mode: nativeCommandLine === null ? "insert" : "cmdline_normal",
           cursor: { grid: 1, row: 1, column: 2 },
         },
         vimMode: "INSERT",
@@ -1454,10 +1451,12 @@ describe("BufferSurface", () => {
       );
 
       nativeCommandLine = "set number relativenumber wrapscan";
+      expect(output()).not.toContain("CMDLINE_NORMAL");
       providerListener?.();
       await sleep();
 
       expect(output()).toContain(":setnumber");
+      expect(output()).toContain("CMDLINE_NORMAL");
       expect(provider.resize).toHaveBeenCalledWith({ rows: 4, columns: 80 });
     } finally {
       root.unmount();

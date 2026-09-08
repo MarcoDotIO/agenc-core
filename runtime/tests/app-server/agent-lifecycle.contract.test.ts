@@ -2534,6 +2534,7 @@ describe("AgenC background agent lifecycle", () => {
     expect(starts).toEqual([
       {
         objective: "build the parser",
+        signal: expect.any(AbortSignal),
         cwd: process.cwd(),
         addDirs: ["../shared workspace", "/tmp/shared"],
         metadata: {
@@ -2897,6 +2898,7 @@ describe("AgenC background agent lifecycle", () => {
     expect(startAgent).not.toHaveBeenCalled();
     expect(restoreAgent).toHaveBeenCalledWith({
       agentId: "conv-retained1",
+      signal: expect.any(AbortSignal),
       resumeRolloutPath: fixture.rolloutPath,
       resumeRolloutLease: expect.objectContaining({
         rolloutPath: fixture.rolloutPath,
@@ -6042,7 +6044,7 @@ describe("AgenC background agent lifecycle", () => {
         id: "future-protocol",
         method: "initialize",
         params: {
-          protocol: { version: "1.10.0" },
+          protocol: { version: "1.11.0" },
           clientName: "contract-test",
         },
       }),
@@ -6054,8 +6056,8 @@ describe("AgenC background agent lifecycle", () => {
         message: "Unsupported protocol version",
         data: {
           code: "PROTOCOL_VERSION_UNSUPPORTED",
-          clientVersion: "1.10.0",
-          serverVersion: "1.9.0",
+          clientVersion: "1.11.0",
+          serverVersion: "1.10.0",
         },
       },
     });
@@ -6120,16 +6122,16 @@ describe("AgenC background agent lifecycle", () => {
       id: 1,
       result: {
         type: "initialized",
-        protocolVersion: "1.9.0",
-        protocol: { version: "1.9.0" },
+        protocolVersion: "1.10.0",
+        protocol: { version: "1.10.0" },
         capabilities: {},
       },
     });
-    expect(AGENC_DAEMON_PROTOCOL_VERSION).toBe("1.9.0");
+    expect(AGENC_DAEMON_PROTOCOL_VERSION).toBe("1.10.0");
     expect(connection.initializeState).toMatchObject({
-      protocol: { version: "1.9.0" },
+      protocol: { version: "1.10.0" },
       clientProtocol: { version: "1.0.0" },
-      serverProtocol: { version: "1.9.0" },
+      serverProtocol: { version: "1.10.0" },
       clientCapabilities: { experimentalApi: true },
     });
     expect(
@@ -6820,6 +6822,7 @@ describe("AgenC background agent lifecycle", () => {
     expect(starts).toEqual([
       {
         objective: "index queued work",
+        signal: expect.any(AbortSignal),
         cwd: process.cwd(),
         envOverrides: expect.any(Object),
         metadata: {

@@ -8,7 +8,15 @@
  */
 
 import { isAbsolute } from "node:path";
+import { RemoteError, REMOTE_METHODS, type RemoteMethod } from "../remote/types.js";
+import type { RemoteAccessBoundary } from "../remote/access.js";
+import type { RemoteService } from "../remote/service.js";
+import type { OwnerTelegramService } from "../gateway/owner-telegram.js";
+import { OWNER_TELEGRAM_METHODS, type OwnerTelegramMethod } from "../gateway/owner-telegram-types.js";
+import { RoutineError, type RoutineService } from "../routines/service.js";
+import type { RoutineUpdatedEvent } from "../routines/types.js";
 import { isSafeSessionIdSegment } from "../session/session-store.js";
+import { DaemonOperationTimeoutError } from "./operation-deadline.js";
 
 import {
   AgenCDaemonAgentLifecycleError,
@@ -303,6 +311,9 @@ interface AgenCDaemonServerCapabilityInputs {
   readonly realtime: AgenCRealtimeRpcHandlers;
   readonly runInspection: AgenCDaemonDispatcherOptions["runInspection"];
   readonly workflow: AgenCDaemonDispatcherOptions["workflow"];
+  readonly routines: RoutineService | undefined;
+  readonly remote: RemoteService | undefined;
+  readonly ownerTelegram: OwnerTelegramService | undefined;
   readonly csvJobReview: AgenCCsvJobReviewService | undefined;
   readonly codePrediction: AgenCDaemonDispatcherOptions["codePrediction"];
   readonly workspaceMutations: WorkspaceMutationCoordinatorRegistry | undefined;
@@ -314,6 +325,8 @@ function buildServerCapabilities(
   const agentManager = inputs.agentManager;
   const sessionManager = inputs.sessionManager;
   const methodCapabilities = {
+    ...Object.fromEntries(REMOTE_METHODS.map((method) => [method, inputs.remote !== undefined && inputs.initializeAuthenticator !== undefined])) as Record<RemoteMethod, boolean>,
+    ...Object.fromEntries(OWNER_TELEGRAM_METHODS.map((method) => [method, inputs.ownerTelegram !== undefined && inputs.initializeAuthenticator !== undefined])) as Record<OwnerTelegramMethod, boolean>,
     initialize: true,
     "request.cancel": true,
     "agent.create": hasMethod(agentManager, "createAgent"),
@@ -327,6 +340,15 @@ function buildServerCapabilities(
     "run.evidence": hasMethod(inputs.runInspection, "evidence"),
     "run.cancel": hasMethod(agentManager, "cancelRunTree"),
     "run.start": hasMethod(inputs.workflow, "startRun"),
+    "routine.capabilities": inputs.routines !== undefined,
+    "routine.list": inputs.routines !== undefined,
+    "routine.get": inputs.routines !== undefined,
+    "routine.create": inputs.routines !== undefined,
+    "routine.update": inputs.routines !== undefined,
+    "routine.delete": inputs.routines !== undefined,
+    "routine.run": inputs.routines !== undefined,
+    "routine.runs": inputs.routines !== undefined,
+    "routine.cancel": inputs.routines !== undefined,
     "csvJob.review.list": hasMethod(inputs.csvJobReview, "list"),
     "csvJob.review.show": hasMethod(inputs.csvJobReview, "show"),
     "csvJob.review.resolve": hasMethod(inputs.csvJobReview, "resolve"),
@@ -583,6 +605,9 @@ export interface AgenCDaemonDispatcherOptions {
   >;
   /** M5 verified-change workflow `run.start` seam (omit = not implemented). */
   readonly workflow?: AgenCDaemonWorkflowStartService;
+  readonly routines?: RoutineService;
+  readonly remote?: RemoteService;
+  readonly ownerTelegram?: OwnerTelegramService;
   /** Workspace-scoped CSV unknown-outcome review service. */
   readonly csvJobReview?: AgenCCsvJobReviewService;
   readonly codePrediction?: Pick<
@@ -696,6 +721,10 @@ export class AgenCDaemonJsonRpcDispatcher {
       >
     | undefined;
   readonly #workflow: AgenCDaemonWorkflowStartService | undefined;
+  readonly #routines: RoutineService | undefined;
+  readonly #remote: RemoteService | undefined;
+  readonly #ownerTelegram: OwnerTelegramService | undefined;
+  readonly #routineSubscriptions = new Map<AgenCDaemonJsonRpcConnection, () => void>();
   readonly #csvJobReview: AgenCCsvJobReviewService | undefined;
   readonly #codePrediction:
     Pick<CodePredictionService, "complete" | "cancel" | "feedback"> | undefined;
@@ -729,6 +758,9 @@ export class AgenCDaemonJsonRpcDispatcher {
     this.#realtime = options.realtime ?? new AgenCRealtimeRpcService();
     this.#runInspection = options.runInspection;
     this.#workflow = options.workflow;
+    this.#routines = options.routines;
+    this.#remote = options.remote;
+    this.#ownerTelegram = options.ownerTelegram;
     this.#csvJobReview = options.csvJobReview;
     this.#codePrediction = options.codePrediction;
     this.#workspaceMutations = options.workspaceMutations;
@@ -751,6 +783,9 @@ export class AgenCDaemonJsonRpcDispatcher {
       runInspection: this.#runInspection,
       sessionManager: this.#sessionManager,
       workflow: this.#workflow,
+      routines: this.#routines,
+      remote: this.#remote,
+      ownerTelegram: this.#ownerTelegram,
       csvJobReview: this.#csvJobReview,
       codePrediction: this.#codePrediction,
       workspaceMutations: this.#workspaceMutations,
@@ -765,6 +800,8 @@ export class AgenCDaemonJsonRpcDispatcher {
   }
 
   async close(): Promise<void> {
+    for (const unsubscribe of this.#routineSubscriptions.values()) unsubscribe();
+    this.#routineSubscriptions.clear();
     if (this.#ownsFuzzyFileSearch) await this.#fuzzyFileSearch.close?.();
   }
 
@@ -775,6 +812,8 @@ export class AgenCDaemonJsonRpcDispatcher {
   async closeConnection(
     connection: AgenCDaemonJsonRpcConnection,
   ): Promise<void> {
+    this.#routineSubscriptions.get(connection)?.();
+    this.#routineSubscriptions.delete(connection);
     connection.cancelAllInFlightRequests("connection closed");
     if (this.#clientMultiplexer !== undefined) {
       for (const clientId of connection.trackedClientIds) {
@@ -803,6 +842,17 @@ export class AgenCDaemonJsonRpcDispatcher {
     if (id === null) {
       return errorResponse(id, -32600, "missing daemon request id");
     }
+    if (connection.remoteAccess) {
+      try {
+        const params = objectParams(message.params);
+        await connection.remoteAccess.authorize(message.method, params);
+        if (message.method !== "initialize" && !connection.initialized) throw new RemoteError("CONNECTION_NOT_INITIALIZED");
+        if (message.method === "session.list") return successResponse(id, await connection.remoteAccess.sessions());
+        if (message.method === "session.create") return successResponse(id, await connection.remoteAccess.createSession(params));
+        if (message.method === "remote.pendingApprovals") return successResponse(id, connection.remoteAccess.pendingApprovals(params.sessionId as string));
+        if (message.method === "files.list" || message.method === "files.read") return successResponse(id, connection.remoteAccess.files(message.method, params));
+      } catch (error) { return mapDispatchError(id, error); }
+    }
     if (!isAgenCDaemonKnownMethod(message.method)) {
       return errorResponse(
         id,
@@ -814,7 +864,7 @@ export class AgenCDaemonJsonRpcDispatcher {
     try {
       const params = objectParams(message.params);
       if (method === "initialize") {
-        const initializeParams = validateInitializeParams(params);
+        const initializeParams = validateInitializeParams(connection.remoteAccess ? { protocol: params.protocol, capabilities: {} } : params);
         if (connection.initialized) {
           return errorResponse(id, -32000, "Already initialized", {
             code: "CONNECTION_ALREADY_INITIALIZED",
@@ -822,7 +872,10 @@ export class AgenCDaemonJsonRpcDispatcher {
         }
         const negotiated = negotiateInitializeProtocol(
           initializeParams,
-          this.#serverCapabilities,
+          connection.remoteAccess ? {
+            ...this.#serverCapabilities,
+            [AGENC_DAEMON_METHOD_CAPABILITIES_KEY]: Object.fromEntries(Object.entries(this.#serverCapabilities[AGENC_DAEMON_METHOD_CAPABILITIES_KEY]).map(([key, value]) => [key, value && connection.remoteAccess!.allowsMethod(key)])) as AgenCDaemonMethodCapabilities,
+          } : this.#serverCapabilities,
         );
         if (!negotiated.supported) {
           return errorResponse(id, -32000, "Unsupported protocol version", {
@@ -833,6 +886,7 @@ export class AgenCDaemonJsonRpcDispatcher {
         }
         if (
           this.#initializeAuthenticator !== undefined &&
+          connection.remoteAccess === undefined &&
           connection.daemonSocketIdentity === undefined
         ) {
           const authResult =
@@ -859,7 +913,8 @@ export class AgenCDaemonJsonRpcDispatcher {
           protocolVersion: negotiated.state.serverProtocol.version,
           protocol: negotiated.state.protocol,
           capabilities: negotiated.state.serverCapabilities,
-          ...(this.#daemonIdentity !== undefined
+          ...(connection.remoteAccess ? { remoteAccess: connection.remoteAccess.projection() } : {}),
+          ...(this.#daemonIdentity !== undefined && connection.remoteAccess === undefined
             ? { daemonIdentity: this.#daemonIdentity }
             : {}),
         });
@@ -868,6 +923,15 @@ export class AgenCDaemonJsonRpcDispatcher {
         return errorResponse(id, -32000, "Not initialized", {
           code: "CONNECTION_NOT_INITIALIZED",
         });
+      }
+
+      if ((REMOTE_METHODS as readonly string[]).includes(method)) {
+        if (!this.#remote || !this.#initializeAuthenticator || connection.remoteAccess) return methodNotImplementedResponse(id, method);
+        return successResponse(id, await this.#remote.handle(method as RemoteMethod, params));
+      }
+      if ((OWNER_TELEGRAM_METHODS as readonly string[]).includes(method)) {
+        if (!this.#ownerTelegram || !this.#initializeAuthenticator || connection.remoteAccess) return methodNotImplementedResponse(id, method);
+        return successResponse(id, await this.#ownerTelegram.handle(method as OwnerTelegramMethod, params));
       }
 
       if (
@@ -919,11 +983,39 @@ export class AgenCDaemonJsonRpcDispatcher {
     signal: AbortSignal,
   ): Promise<AgenCDaemonResponse> {
     switch (method) {
+      case "routine.capabilities":
+        if (this.#routines === undefined) return methodNotImplementedResponse(id, method);
+        return successResponse(id, this.#routines.capabilities(params));
+      case "routine.list":
+        if (this.#routines === undefined) return methodNotImplementedResponse(id, method);
+        return successResponse(id, this.#routines.list(params));
+      case "routine.get":
+        if (this.#routines === undefined) return methodNotImplementedResponse(id, method);
+        return successResponse(id, this.#routines.get(params));
+      case "routine.create":
+        if (this.#routines === undefined) return methodNotImplementedResponse(id, method);
+        return successResponse(id, this.#routines.create(params));
+      case "routine.update":
+        if (this.#routines === undefined) return methodNotImplementedResponse(id, method);
+        return successResponse(id, this.#routines.update(params));
+      case "routine.delete":
+        if (this.#routines === undefined) return methodNotImplementedResponse(id, method);
+        return successResponse(id, this.#routines.delete(params));
+      case "routine.run":
+        if (this.#routines === undefined) return methodNotImplementedResponse(id, method);
+        return successResponse(id, this.#routines.run(params));
+      case "routine.runs":
+        if (this.#routines === undefined) return methodNotImplementedResponse(id, method);
+        return successResponse(id, this.#routines.runs(params));
+      case "routine.cancel":
+        if (this.#routines === undefined) return methodNotImplementedResponse(id, method);
+        return successResponse(id, await this.#routines.cancel(params));
       case "agent.create":
         return successResponse(
           id,
           await this.#agentManager.createAgent(
             validateAgentCreateParams(params),
+            { signal },
           ),
         );
       case "agent.list":
@@ -1645,6 +1737,7 @@ export class AgenCDaemonJsonRpcDispatcher {
         { code: "AUTH_BACKEND_NOT_CONFIGURED" },
       );
     }
+    if (method === "auth.logout") this.#remote?.stop();
     return successResponse(
       id,
       await this.#authHandlers[method]({
@@ -1769,6 +1862,30 @@ export class AgenCDaemonJsonRpcDispatcher {
     connection: AgenCDaemonJsonRpcConnection,
     capabilities: JsonObject,
   ): Promise<void> {
+    if (capabilities["routine.updated.v1"] === true && this.#routines && connection.sendNotification && !this.#routineSubscriptions.has(connection)) {
+      // Coalesce by routine while a client is slow, keeping at most 100 invalidations.
+      const pending = new Map<string, RoutineUpdatedEvent>();
+      let sending = false;
+      let closed = false;
+      const flush = async (): Promise<void> => {
+        if (sending || closed) return;
+        sending = true;
+        try {
+          while (!closed && pending.size) {
+            const event = pending.values().next().value!;
+            pending.delete(event.id);
+            await connection.sendNotification!({ jsonrpc: JSON_RPC_VERSION, method: "routine.updated", params: event });
+          }
+        } catch { closed = true; pending.clear(); }
+        finally { sending = false; }
+      };
+      const unsubscribe = this.#routines.onUpdated((event) => {
+        if (closed) return;
+        if (!pending.has(event.id) && pending.size >= 100) pending.delete(pending.keys().next().value!);
+        pending.set(event.id, event); void flush();
+      });
+      this.#routineSubscriptions.set(connection, () => { closed = true; pending.clear(); unsubscribe(); });
+    }
     const receivesLedgerActions =
       capabilities[LEDGER_SOLANA_SIGN_CLIENT_CAPABILITY] === true;
     const receivesMobileStatus =
@@ -2002,6 +2119,8 @@ export class AgenCDaemonJsonRpcDispatcher {
 }
 
 export interface AgenCDaemonJsonRpcConnectionOptions {
+  /** In-process browser authority. No JSON-RPC field can populate this. */
+  readonly remoteAccess?: RemoteAccessBoundary;
   readonly sendNotification?: (message: JsonObject) => void | Promise<void>;
   readonly overloadLimits?: AgenCDaemonOverloadLimitOptions;
 }
@@ -2009,6 +2128,7 @@ export interface AgenCDaemonJsonRpcConnectionOptions {
 let nextConnectionId = 0;
 
 export class AgenCDaemonJsonRpcConnection {
+  readonly remoteAccess: RemoteAccessBoundary | undefined;
   readonly #dispatcher: AgenCDaemonJsonRpcDispatcher;
   readonly #sendNotification:
     ((message: JsonObject) => void | Promise<void>) | undefined;
@@ -2024,6 +2144,7 @@ export class AgenCDaemonJsonRpcConnection {
     options: AgenCDaemonJsonRpcConnectionOptions = {},
   ) {
     this.#dispatcher = dispatcher;
+    this.remoteAccess = options.remoteAccess;
     this.#sendNotification = options.sendNotification;
     this.#limiter = new AgenCDaemonConnectionLimiter(options.overloadLimits);
     nextConnectionId += 1;
@@ -2167,7 +2288,18 @@ export class AgenCDaemonJsonRpcConnection {
       return admission.response!;
     }
     try {
-      return await this.#dispatcher.dispatchForConnection(this, message);
+      const response = await this.#dispatcher.dispatchForConnection(this, message);
+      if (this.remoteAccess && "result" in response && (message.method === "tool.approve" || message.method === "tool.deny")) {
+        const params = objectParams(message.params);
+        this.remoteAccess.resolveApproval(params.sessionId as string, params.requestId as string);
+      }
+      if (this.remoteAccess && "error" in response) {
+        const data = response.error.data;
+        const candidate = data && typeof data === "object" && !Array.isArray(data) ? (data as JsonObject).code : undefined;
+        const code = typeof candidate === "string" && /^[A-Z][A-Z0-9_]{0,95}$/u.test(candidate) ? candidate : "REMOTE_REQUEST_FAILED";
+        return errorResponse(response.id, response.error.code, code, { code });
+      }
+      return response;
     } finally {
       admission.release();
     }
@@ -2206,6 +2338,7 @@ function methodSupportsRequestCancellation(
   method: AgenCDaemonKnownMethod,
 ): boolean {
   return (
+    method === "agent.create" ||
     method === "fs.fuzzy_search" ||
     method === "commandExec.start" ||
     method === "csvJob.review.list" ||
@@ -5515,6 +5648,13 @@ function mapDispatchError(
   id: RequestId | null,
   error: unknown,
 ): AgenCDaemonResponse {
+  if (error instanceof RemoteError) return errorResponse(id, -32000, error.code, { code: error.code });
+  if (error instanceof RoutineError) return errorResponse(id, -32602, error.message, { code: error.code });
+  if (error instanceof DaemonOperationTimeoutError) {
+    return errorResponse(id, -32000, error.message, {
+      code: error.code, operation: error.operation, timeoutMs: error.timeoutMs,
+    });
+  }
   if (error instanceof PermissionRuleMutationPrecommitError) {
     return errorResponse(id, -32602, error.message, {
       code: "PERMISSION_RULE_MUTATION_REJECTED",

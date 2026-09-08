@@ -2,8 +2,9 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 
-import { encode } from "@msgpack/msgpack";
+import { decode, encode } from "@msgpack/msgpack";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -16,6 +17,7 @@ import {
 import {
   NeovimRpcError,
   NeovimRpcRequestTimeoutError,
+  NeovimRpcTransport,
 } from "../../../src/tui/workbench/buffer/neovim/NeovimRpc.js";
 import {
   cleanupTrackedNeovimProcesses,
@@ -40,6 +42,38 @@ afterEach(async () => {
 });
 
 describe("embedded Neovim lifecycle", () => {
+  it("probes actual mode until buffered input is consumed without sending more input", async () => {
+    const responses = [{ mode: "n", blocking: false }, { mode: "c", blocking: true }, { mode: "c", blocking: false }];
+    const { session, rpc } = createInputModeProbeSession(async () => responses.shift());
+    const modes: string[] = [];
+    await expect(session.inspectInputModeForTesting("c", (mode) => modes.push(mode))).resolves.toBe("c");
+    expect(modes).toEqual(["n", "c", "c"]);
+    expect(rpc.request).toHaveBeenCalledTimes(3);
+    for (const args of rpc.request.mock.calls) expect(args.slice(0, 2)).toEqual(["nvim_get_mode", []]);
+    await session.cleanup();
+  });
+
+  it("bounds an ambiguous mode probe without poisoning or replaying input", async () => {
+    vi.useFakeTimers();
+    try {
+      const { session, rpc } = createInputModeProbeSession(async () => ({ mode: "n", blocking: false }));
+      const outcome = expect(session.inspectInputModeForTesting("c", () => {})).rejects.toThrow(/5000ms/u);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await outcome;
+      expect(rpc.close).not.toHaveBeenCalled();
+      for (const args of rpc.request.mock.calls) expect(args[0]).toBe("nvim_get_mode");
+      await session.cleanup();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([null, { mode: 1, blocking: false }, { mode: "c" }])("rejects malformed mode-probe results: %j", async (value) => {
+    const { session } = createInputModeProbeSession(async () => value);
+    await expect(session.inspectInputModeForTesting(null, () => {})).rejects.toThrow("invalid input mode");
+    await session.cleanup();
+  });
+
   it("covers process cleanup branches without spawning real Neovim", async () => {
     mockMissingProcessGroups();
     const killedChild = fakeChild({
@@ -965,16 +999,26 @@ describe("embedded Neovim lifecycle", () => {
       onFatalError,
     );
 
-    await expect(session.input("i")).rejects.toBeInstanceOf(
-      NeovimRpcRequestTimeoutError,
-    );
-    await vi.waitFor(() => {
+    vi.useFakeTimers();
+    try {
+      const inputFailure = expect(session.input("i")).rejects.toBeInstanceOf(
+        NeovimRpcRequestTimeoutError,
+      );
+      await vi.advanceTimersByTimeAsync(5);
+      await inputFailure;
+      expect(onFatalError).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(onFatalError).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
       expect(onFatalError).toHaveBeenCalledTimes(2);
-    });
-    expect(child.kill).not.toHaveBeenCalled();
-    expect(handle.kill).not.toHaveBeenCalled();
-    expect(rpc.close).not.toHaveBeenCalled();
-    await expect(session.save(false)).resolves.toBe(false);
+      expect(child.kill).not.toHaveBeenCalled();
+      expect(handle.kill).not.toHaveBeenCalled();
+      expect(rpc.close).not.toHaveBeenCalled();
+      await expect(session.save(false)).resolves.toBe(false);
+    } finally {
+      rpc.close();
+      vi.useRealTimers();
+    }
   });
 
   it("poisons ambiguous Discard All and safe-close timeouts instead of applying them late", async () => {
@@ -1097,7 +1141,7 @@ describe("embedded Neovim lifecycle", () => {
     expect(rpc.request).toHaveBeenCalledWith(
       "nvim_exec_lua",
       [expect.stringContaining("silent preserve"), []],
-      { timeoutMs: 5 },
+      { timeoutMs: 10_000 },
     );
     expect(rpc.request).not.toHaveBeenCalledWith("nvim_command", ["qa!"]);
     expect(child.stdin.end).not.toHaveBeenCalled();
@@ -1107,6 +1151,92 @@ describe("embedded Neovim lifecycle", () => {
     expect(rpc.request.mock.invocationCallOrder[0]).toBeLessThan(
       handle.kill.mock.invocationCallOrder[0]!,
     );
+  });
+
+  it("accepts a delayed preservation acknowledgement without extending the process exit deadline", async () => {
+    vi.useFakeTimers();
+    const context = createRecoveryTransportSession();
+    try {
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(context.settled).toBe(false);
+      expect(context.handle.kill).not.toHaveBeenCalled();
+      expect(context.child.kill).not.toHaveBeenCalled();
+      expect(context.endInput).not.toHaveBeenCalled();
+      expect(context.closeRpc).not.toHaveBeenCalled();
+      expect(context.session.recoveryPreservationProven).toBe(false);
+
+      context.output.write(encode([1, 1, null, context.manifest]));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(context.session.recoveryPreservationProven).toBe(true);
+      expect(context.handle.kill).toHaveBeenCalledWith("SIGKILL");
+      expect(context.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(context.child.kill).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await context.cleanup).toBeNull();
+      expect(context.child.kill).toHaveBeenCalledWith("SIGTERM");
+      expect(context.closeRpc).toHaveBeenCalledWith("abnormal session cleanup");
+      expect(context.endInput).not.toHaveBeenCalled();
+      expect(context.input.read()).toBeNull();
+    } finally {
+      context.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("retains the child and ignores a late acknowledgement after the preservation deadline", async () => {
+    vi.useFakeTimers();
+    const context = createRecoveryTransportSession();
+    try {
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(context.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await context.cleanup).toMatchObject({
+        message: expect.stringContaining("exact recovery preservation was not confirmed"),
+        cause: expect.objectContaining({
+          name: "NeovimRpcRequestTimeoutError",
+          timeoutMs: 10_000,
+        }),
+      });
+
+      context.output.write(encode([1, 1, null, context.manifest]));
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(context.session.recoveryPreservationProven).toBe(false);
+      expect(context.handle.kill).not.toHaveBeenCalled();
+      expect(context.child.kill).not.toHaveBeenCalled();
+      expect(context.endInput).not.toHaveBeenCalled();
+      expect(context.closeRpc).not.toHaveBeenCalled();
+      expect(context.input.read()).toBeNull();
+
+      const probe = context.rpc.request("nvim_get_mode", [], { timeoutMs: 100 });
+      expect(decode(context.input.read())).toEqual([0, 2, "nvim_get_mode", []]);
+      context.output.write(encode([1, 2, null, { mode: "n" }]));
+      await expect(probe).resolves.toEqual({ mode: "n" });
+    } finally {
+      context.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("retains the child when a delayed preservation acknowledgement has an invalid manifest", async () => {
+    vi.useFakeTimers();
+    const context = createRecoveryTransportSession();
+    try {
+      await vi.advanceTimersByTimeAsync(1_500);
+      context.output.write(encode([1, 1, null, [{ ...context.manifest[0], size: 0 }]]));
+      expect(await context.cleanup).toMatchObject({
+        message: expect.stringContaining("invalid abnormal-exit recovery manifest"),
+      });
+      expect(context.session.recoveryPreservationProven).toBe(false);
+      expect(context.handle.kill).not.toHaveBeenCalled();
+      expect(context.child.kill).not.toHaveBeenCalled();
+      expect(context.endInput).not.toHaveBeenCalled();
+      expect(context.closeRpc).not.toHaveBeenCalled();
+      expect(context.input.read()).toBeNull();
+    } finally {
+      context.dispose();
+      vi.useRealTimers();
+    }
   });
 
   it("leaves the live process intact when abnormal recovery preservation is unproven", async () => {
@@ -1859,6 +1989,58 @@ function controlled<T>() {
   return { promise, resolve };
 }
 
+function createRecoveryTransportSession() {
+  mockMissingProcessGroups();
+  const child = fakeChild({ pid: syntheticNeovimPid(7843) });
+  const input = new PassThrough();
+  const output = new PassThrough();
+  child.stdin = input;
+  child.stdout = output;
+  const endInput = vi.spyOn(input, "end");
+  const handle = { child, pid: child.pid, kill: vi.fn() };
+  const rpc = new NeovimRpcTransport(output, input);
+  const closeRpc = vi.spyOn(rpc, "close");
+  rpc.start();
+  const session = new EmbeddedNeovimSession(
+    handle as any,
+    rpc,
+    { dispose: vi.fn() } as any,
+    1_000,
+  );
+  const manifest = [{
+    handle: 1,
+    changedtick: 7,
+    end_of_line: true,
+    swap: join(dir, "recovery.swp"),
+    size: 4096,
+  }];
+  let settled = false;
+  const cleanup = session.cleanup({ preserveRecovery: true }).then(
+    () => {
+      settled = true;
+      return null;
+    },
+    (error: unknown) => {
+      settled = true;
+      return error;
+    },
+  );
+  expect(decode(input.read())).toEqual([
+    0, 1, "nvim_exec_lua", [expect.stringContaining("silent preserve"), []],
+  ]);
+  return {
+    child, input, output, endInput, handle, rpc, closeRpc, session, manifest, cleanup,
+    get settled() {
+      return settled;
+    },
+    dispose() {
+      rpc.close("test cleanup");
+      output.end();
+      input.end();
+    },
+  };
+}
+
 function createDeadlineRpcHarness() {
   type RequestOptions = {
     readonly timeoutMs?: number;
@@ -1962,6 +2144,21 @@ async function waitForPidFile(path: string): Promise<number> {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`timed out waiting for pid file ${path}`);
+}
+
+function createInputModeProbeSession(response: () => Promise<unknown>) {
+  const child = fakeChild({ exitCode: 0, pid: syntheticNeovimPid(779) });
+  const rpc = {
+    request: vi.fn(async (_method: string, _params: readonly unknown[]) => response()),
+    close: vi.fn(),
+  };
+  const session = new EmbeddedNeovimSession(
+    { child, pid: child.pid, kill: vi.fn() } as any,
+    rpc as any,
+    { dispose: vi.fn() } as any,
+    5,
+  );
+  return { session, rpc };
 }
 
 function mockMissingProcessGroups(): void {

@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
   mkdirSync,
@@ -102,6 +103,7 @@ describe("schema: defaultConfig", () => {
       snapshot_days: 3,
       snapshot_max_count: 10_000,
       snapshot_max_bytes: 67_108_864,
+      rollout_days: 30,
     });
     expect(Object.isFrozen(cfg)).toBe(true);
   });
@@ -1535,7 +1537,14 @@ describe("env: resolvers", () => {
   });
 
   test("resolveAgencHome falls back to $HOME/.agenc", () => {
-    expect(resolveAgencHome({ HOME: "/home/user" })).toBe("/home/user/.agenc");
+    const fixtureHome = mkdtempSync(join(tmpdir(), "agenc-env-home-"));
+    try {
+      expect(resolveAgencHome({ HOME: fixtureHome })).toBe(
+        join(realpathSync(fixtureHome), ".agenc"),
+      );
+    } finally {
+      rmSync(fixtureHome, { recursive: true, force: true });
+    }
   });
 
   test("resolveApiKey prefers XAI_API_KEY over the documented GROK alias", () => {
@@ -1607,15 +1616,18 @@ describe("env: resolvers", () => {
     expect(
       applyEnvOverrides(base, { AGENC_EFFORT_LEVEL: "none" }).reasoning_effort,
     ).toBe("none");
+    expect(
+      applyEnvOverrides(base, { AGENC_EFFORT_LEVEL: "max" }).reasoning_effort,
+    ).toBe("max");
   });
 
-  test.each(["max", "auto", "unset", "warp", ""])(
+  test.each(["auto", "unset", "warp", ""])(
     "applyEnvOverrides rejects non-canonical AGENC_EFFORT_LEVEL=%j",
     (value) => {
       expect(() => applyEnvOverrides(
         mergeConfigs(defaultConfig(), { reasoning_effort: "low" }),
         { AGENC_EFFORT_LEVEL: value },
-      )).toThrow(/invalid AGENC_EFFORT_LEVEL.*minimal, low, medium, high, xhigh, or none/u);
+      )).toThrow(/invalid AGENC_EFFORT_LEVEL.*minimal, low, medium, high, xhigh, max, or none/u);
     },
   );
 

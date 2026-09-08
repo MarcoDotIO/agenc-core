@@ -38,6 +38,11 @@ import { AGENC_DAEMON_PROTOCOL_VERSION } from "./protocol/index.js";
 import { AgenCDaemonSessionManager } from "./session-lifecycle.js";
 import { ensureAgenCDaemonAutostart } from "./daemon-autostart.js";
 import {
+  AGENC_DAEMON_HEARTBEAT_FRESH_MS,
+  resolveAgenCDaemonHeartbeatPath,
+} from "./daemon-heartbeat.js";
+import {
+  acquireAgenCDaemonLifecycleLock,
   AGENC_DAEMON_PID_MAX_BYTES,
   AGENC_DAEMON_READY_TIMEOUT_MS_ENV,
   AGENC_DAEMON_WEBSOCKET_DEFAULT_HOST,
@@ -45,27 +50,27 @@ import {
   AGENC_DAEMON_WEBSOCKET_DEFAULT_PORT,
   AGENC_DAEMON_WEBSOCKET_PORT_ENV,
   AgenCDaemonRpcShutdownCoordinator,
-  acquireAgenCDaemonLifecycleLock,
+  createAgenCDaemonRealtimeHeaderResolver,
   DEFAULT_DAEMON_READY_TIMEOUT_MS,
   defaultAgenCDaemonPidPath,
-  resolveAgenCDaemonReadyTimeoutMs,
   ensureAgenCDaemonCookie,
   formatAgenCDaemonCliHelpText,
-  createAgenCDaemonRealtimeHeaderResolver,
+  formatAgenCDaemonStateDatabasesLine,
   parseAgenCDaemonCliArgs,
   readAgenCDaemonPid,
-  resolveAgenCDaemonRealtimeBaseUrl,
-  resolveAgenCDaemonWebSocketListenOptions,
   resolveAgenCDaemonCookiePath,
   resolveAgenCDaemonPidPath,
+  resolveAgenCDaemonReadyTimeoutMs,
+  resolveAgenCDaemonRealtimeBaseUrl,
   resolveAgenCDaemonSnapshotPath,
   resolveAgenCDaemonSocketPath,
+  resolveAgenCDaemonWebSocketListenOptions,
   runAgenCDaemonAuthorityCleanup,
   runAgenCDaemonCli,
-  validateAgenCDaemonWebSocketOrigin,
-  writeAgenCDaemonPid,
   type AgenCDaemonCliHost,
   type AgenCDaemonCliIo,
+  validateAgenCDaemonWebSocketOrigin,
+  writeAgenCDaemonPid,
 } from "./daemon-cli.js";
 import {
   AgenCDelegateBackgroundAgentRunner,
@@ -77,6 +82,11 @@ import {
 import { createEmptyToolPermissionContext } from "../permissions/types.js";
 import { PermissionModeRegistry } from "../permissions/permission-mode.js";
 import { ConfigStore } from "../config/store.js";
+import {
+  _resetErrorLogForTesting,
+  getErrorLogQueueStats,
+  logMCPError,
+} from "../../src/utils/log.js";
 import { SandboxExecutionBroker } from "../sandbox/execution-broker.js";
 import {
   sandboxExecutionBrokerAuthorityFromSessionAuthority,
@@ -523,7 +533,7 @@ function createReadyPublishedDaemonOptions(
 function createSignalProcess() {
   type TestDaemonSignal = AgenCShutdownSignal;
   const listeners = new Map<TestDaemonSignal, Set<() => void>>();
-  /** Signals emitted before any listener (startup race); flushed on once(). */
+  /** Signals emitted before any listener (startup race); flushed on registration. */
   const pending = new Set<TestDaemonSignal>();
   const deliver = (signal: TestDaemonSignal): void => {
     for (const listener of [...(listeners.get(signal) ?? [])]) {
@@ -542,6 +552,7 @@ function createSignalProcess() {
     }
   };
   return {
+    on: addListener,
     once: (signal: AgenCShutdownSignal, listener: () => void) => {
       addListener(signal, listener);
     },
@@ -1477,6 +1488,73 @@ describe("AgenC daemon CLI", () => {
     } finally {
       await rm(agencHome, { recursive: true, force: true });
     }
+  });
+
+  // #2228: the project state databases on disk are part of status, so a home
+  // whose database keeps growing shows it before every start gets slow.
+  it("status reports the project state databases on disk", async () => {
+    const agencHome = await tempAgencHome();
+    // Pin the Linux branch so the pid is proven by the injected inspector on
+    // every host; off Linux an unbound pid is indeterminate by design.
+    const host = { ...createHost(agencHome), platform: "linux" as const };
+    const io = createIo();
+    host.runningPids.add(4555);
+    await writeAgenCDaemonPid(resolveAgenCDaemonPidPath(host.env, host.userHome), 4555);
+    const projects = join(agencHome, "projects");
+    for (const name of ["alpha", "beta", "empty"]) {
+      await mkdir(join(projects, name), { recursive: true });
+    }
+    const mebibyte = 1024 * 1024;
+    await writeFile(join(projects, "alpha", "agenc-state_1.sqlite"), Buffer.alloc(3 * mebibyte));
+    await writeFile(join(projects, "alpha", "agenc-state_1.sqlite-wal"), Buffer.alloc(mebibyte));
+    await writeFile(join(projects, "beta", "agenc-state_1.sqlite"), Buffer.alloc(mebibyte));
+
+    await expect(
+      runAgenCDaemonCli(
+        { kind: "command", action: "status" },
+        {
+          host,
+          io,
+          // The footprint comes from disk, so it is reported even when
+          // health.stats is unavailable.
+          requestHealthStats: vi.fn(async () => {
+            throw new Error("health.stats unavailable");
+          }),
+          inspectLegacyDaemonProcess: inspectLegacyTestDaemon,
+          waitForDaemonReady: async () => true,
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const out = io.stdoutText();
+    expect(out).toContain("AgenC daemon running (pid 4555)");
+    expect(out).toMatch(
+      /databases: \d+ project state DB\(s\), [\d.]+ MiB on disk \(largest 4\.0 MiB: alpha\)/u,
+    );
+    expect(out).not.toContain("uptime:");
+
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it("omits the databases line when no project has a state database", () => {
+    expect(
+      formatAgenCDaemonStateDatabasesLine({
+        projects: 0,
+        totalBytes: 0,
+        largestBytes: 0,
+        largestProject: null,
+      }),
+    ).toBeNull();
+    expect(
+      formatAgenCDaemonStateDatabasesLine({
+        projects: 196,
+        totalBytes: 1_235_812_352,
+        largestBytes: 693_108_736,
+        largestProject: "Users-tetsuoarena-claude-agenc-work-be0c0dda",
+      }),
+    ).toBe(
+      "  databases: 196 project state DB(s), 1178.6 MiB on disk (largest 661.0 MiB: Users-tetsuoarena-claude-agenc-work-be0c0dda)",
+    );
   });
 
   it("status enriches the running line with health.stats over the socket", async () => {
@@ -2827,6 +2905,59 @@ describe("AgenC daemon CLI", () => {
     }
   });
 
+  // #2232: a startup cancelled during recovery must not linger on a hung
+  // cleanup task; each task is bounded and the daemon exits.
+  it("bounds a hung cleanup task after a cancelled startup instead of lingering", async () => {
+    const agencHome = await tempAgencHome();
+    const baseHost = createHost(agencHome);
+    const io = createIo();
+    const acknowledgeAfterCleanup = vi.fn(async () => {});
+    let requested = false;
+    let resolveRequested!: () => void;
+    const requestedPromise = new Promise<void>((resolve) => {
+      resolveRequested = () => {
+        requested = true;
+        resolve();
+      };
+    });
+    const host: AgenCDaemonCliHost = {
+      ...baseHost,
+      startupGuardReceiver: {
+        requested: requestedPromise,
+        wasRequested: () => requested,
+        acknowledgeAfterCleanup,
+        close: () => {},
+      },
+    };
+    const started = Date.now();
+    await expect(
+      runAgenCDaemonCli(
+        { kind: "command", action: "run" },
+        {
+          host,
+          io,
+          // The parent cancels while recovery is still running, as in the
+          // incident; recovery itself never finishes.
+          beforeDaemonReady: () => {
+            resolveRequested();
+            return new Promise<void>(() => {});
+          },
+          beforeDaemonAuthorityCleanup: () => new Promise<void>(() => {}),
+          startupCancelCleanupTaskTimeoutMs: 100,
+        },
+      ),
+    ).resolves.toBe(1);
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(io.stderrText()).toContain(
+      'cleanup[daemon-authority] failed: cleanup task "daemon-authority" did not finish within 100 ms',
+    );
+    // The real receiver closes its channel after the first send, so the parent
+    // sees the cleanup verdict: not ok. The foreground wrapper's later call is
+    // a no-op there; this fake records it, hence the first-call assertion.
+    expect(acknowledgeAfterCleanup.mock.calls[0]).toEqual([false]);
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
   it("consumes rejected lifecycle lock diagnostic observers", async () => {
     const agencHome = await tempAgencHome();
     const host = createHost(agencHome);
@@ -3015,6 +3146,88 @@ describe("AgenC daemon CLI", () => {
     await rm(agencHome, { recursive: true, force: true });
   });
 
+  // #2225: while the replacement daemon recovers its agent runs it is serving
+  // but has not committed its identity; the heartbeat proves it is alive, so
+  // status says so instead of "indeterminate".
+  async function statusOfUnboundPid(
+    heartbeat: { readonly pid: number; readonly ageMs: number } | null,
+  ): Promise<{
+    readonly code: number;
+    readonly out: string;
+    readonly err: string;
+    readonly terminatedPids: readonly number[];
+    readonly healthProbes: number;
+  }> {
+    const agencHome = await tempAgencHome();
+    const host = { ...createHost(agencHome), platform: "darwin" as const };
+    const io = createIo();
+    host.runningPids.add(4602);
+    await writeAgenCDaemonPid(resolveAgenCDaemonPidPath(host.env, host.userHome), 4602);
+    if (heartbeat !== null) {
+      writeFileSync(
+        resolveAgenCDaemonHeartbeatPath(agencHome),
+        JSON.stringify({
+          pid: heartbeat.pid,
+          beat: 45,
+          at: new Date(Date.now() - heartbeat.ageMs).toISOString(),
+          uptimeS: 225,
+          rssMb: 950,
+          heapUsedMb: 700,
+          eventLoopLagMs: 12,
+        }),
+      );
+    }
+    const requestHealthStats = vi.fn(async () => {
+      throw new Error("must not probe an unbound pid");
+    });
+    const code = await runAgenCDaemonCli(
+      { kind: "command", action: "status" },
+      { host, io, requestHealthStats },
+    );
+    await rm(agencHome, { recursive: true, force: true });
+    return {
+      code,
+      out: io.stdoutText(),
+      err: io.stderrText(),
+      terminatedPids: host.terminatedPids,
+      healthProbes: requestHealthStats.mock.calls.length,
+    };
+  }
+
+  it("reports an unbound live pid as alive but not yet bound when its heartbeat is fresh", async () => {
+    const result = await statusOfUnboundPid({ pid: 4602, ageMs: 2_000 });
+    expect(result.code).toBe(1);
+    expect(result.out).toContain("AgenC daemon alive but not yet bound (pid 4602)");
+    expect(result.out).toContain("identity: not published yet");
+    expect(result.out).toMatch(
+      /heartbeat: \d+ s ago, rss 950 MB, heap 700 MB, event-loop lag 12 ms, up 4 min/u,
+    );
+    expect(result.out).not.toContain("daemon running");
+    expect(result.err).not.toContain("indeterminate");
+    expect(result.healthProbes).toBe(0);
+    expect(result.terminatedPids).toEqual([]);
+  });
+
+  it("keeps an unbound pid indeterminate when its heartbeat is stale, and says how old it is", async () => {
+    const result = await statusOfUnboundPid({
+      pid: 4602,
+      ageMs: AGENC_DAEMON_HEARTBEAT_FRESH_MS + 45_000,
+    });
+    expect(result.code).toBe(1);
+    expect(result.out).not.toContain("alive but not yet bound");
+    expect(result.err).toContain("indeterminate for unbound pid 4602");
+    expect(result.err).toMatch(/its last heartbeat is \d+ s old .* so the process may be hung/u);
+  });
+
+  it("does not vouch for an unbound pid on another process's heartbeat", async () => {
+    const result = await statusOfUnboundPid({ pid: 4601, ageMs: 2_000 });
+    expect(result.code).toBe(1);
+    expect(result.out).not.toContain("alive but not yet bound");
+    expect(result.err).toContain(
+      "indeterminate for unbound pid 4602; no portable instance identity is available",
+    );
+  });
+
   it("reload targets the authenticated sidecar instead of a live reused pid", async () => {
     const agencHome = await tempAgencHome();
     const host = createHost(agencHome);
@@ -3193,6 +3406,41 @@ describe("AgenC daemon CLI", () => {
       }
     },
   );
+
+  it("drains diagnostic startup events and detaches the sink when the foreground daemon stops", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const io = createIo();
+    const signalProcess = createSignalProcess();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    host.runningPids.add(host.pid);
+    _resetErrorLogForTesting();
+    logMCPError("server", "queued startup diagnostic");
+    const running = runAgenCDaemonCli(
+      { kind: "command", action: "run" },
+      { host, io, signalProcess },
+    );
+    try {
+      await waitForPid(pidPath);
+      logMCPError("server", "live diagnostic");
+      expect(io.stderrText()).toContain("queued startup diagnostic");
+      expect(io.stderrText()).toContain("live diagnostic");
+      expect(getErrorLogQueueStats()).toMatchObject({ errors: 0, retainedBytes: 0 });
+    } finally {
+      await stopRunningDaemons([{ signalProcess, running }]);
+      await rm(agencHome, { recursive: true, force: true });
+    }
+    try {
+      expect(getErrorLogQueueStats()).toEqual({
+        errors: 0, debug: 0, retainedBytes: 0, droppedErrors: 0, droppedDebug: 0,
+      });
+      logMCPError("server", "after shutdown");
+      expect(io.stderrText()).not.toContain("after shutdown");
+      expect(getErrorLogQueueStats().errors).toBe(1);
+    } finally {
+      _resetErrorLogForTesting();
+    }
+  });
 
   it("reload command re-reads config and starts configured mcp.server without shutdown", async () => {
     const agencHome = await tempAgencHome();
@@ -4633,14 +4881,20 @@ backend = "local"
       { kind: "command", action: "run" },
       { host, io, signalProcess },
     );
-    await expect(waitForPid(pidPath)).resolves.toBe(4100);
-
-    expect(io.stdoutText()).toContain("AgenC daemon running");
-    signalProcess.emit("SIGTERM");
-    await expect(running).resolves.toBe(0);
-    await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
-
-    await rm(agencHome, { recursive: true, force: true });
+    try {
+      await expect(waitForPid(pidPath)).resolves.toBe(4100);
+      // PID publication precedes the asynchronous lifecycle-lock release.
+      await vi.waitFor(
+        () => expect(io.stdoutText()).toContain("AgenC daemon running"),
+        { timeout: DAEMON_MILESTONE_BUDGET_MS },
+      );
+      signalProcess.emit("SIGTERM");
+      await expect(running).resolves.toBe(0);
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
+    } finally {
+      await stopRunningDaemons([{ signalProcess, running }]);
+      await rm(agencHome, { recursive: true, force: true });
+    }
   });
 
   it("does not autostart MCP without an explicit workspace scope", async () => {
@@ -4998,7 +5252,9 @@ snapshot_max_bytes = 64
     expect(agentList.agents[1]).toMatchObject({
       agentId: "run-restart",
       objective: "recover daemon state",
-      status: "running",
+      // Restored with nothing to resume: idle until its next prompt. The
+      // run's own persisted status stays "running" in the recovery metadata.
+      status: "idle",
       activeSessionIds: ["session-restart"],
       metadata: {
         recovery: {
@@ -5031,7 +5287,7 @@ snapshot_max_bytes = 64
     });
     expect(agentList.agents[0]).toMatchObject({
       agentId: "run-other",
-      status: "running",
+      status: "idle",
       metadata: {
         recovery: {
           runStatus: "blocked",
@@ -6200,7 +6456,7 @@ snapshot_max_bytes = 64
     );
     expect(recovered).toMatchObject({
       agentId: createdAgentId,
-      status: "running",
+      status: "idle",
       metadata: {
         recovery: {
           runnable: true,

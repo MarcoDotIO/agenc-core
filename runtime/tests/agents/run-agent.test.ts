@@ -71,6 +71,8 @@ import {
 } from "../sandbox/execution-broker.js";
 import { PermissionModeRegistry } from "../permissions/permission-mode.js";
 import { createEmptyToolPermissionContext } from "../permissions/types.js";
+import { buildAgenCToolUseContext } from "../session/agenc-tool-use-context.js";
+import { DEFAULT_MAX_RESULT_SIZE_CHARS } from "../constants/toolLimits.js";
 import {
   disposeSandboxExecutionBroker,
   isSandboxExecutionBrokerDisposed,
@@ -97,6 +99,7 @@ import type {
   ManagedFeatures,
   ModelInfo,
   SessionConfiguration,
+  TurnContext,
 } from "../session/turn-context.js";
 import type { ToolRegistry } from "../tool-registry.js";
 import type {
@@ -984,6 +987,7 @@ describe("runAgent", () => {
       expect(result).toMatchObject({ outcome: "completed" });
       expect(refreshFromAuthority).not.toHaveBeenCalled();
       expect(childServices?.mcpManager).not.toBe(parentMcpManager);
+      expect(Object.isFrozen(childServices?.mcpManager)).toBe(true);
       expect(childServices?.mcpManager.getConnectedServers?.()).toEqual([]);
       expect(childServices?.registry.tools.map((tool) => tool.name)).toEqual([
         "system.echo",
@@ -1715,12 +1719,13 @@ describe("runAgent", () => {
     });
   });
 
-  it("captures AgentSummary cache-safe params from the real child run state", async () => {
+  it("captures matching session and child tool metadata from the same registry", async () => {
+    const toolName = "system.echo";
     const provider = makeProvider([{ content: "summary seed" }]);
     const registry = {
       tools: [
         {
-          name: "system.echo",
+          name: toolName,
           description: "echo",
           inputSchema: { type: "object" },
           execute: async () => ({ content: JSON.stringify({ ok: true }) }),
@@ -1730,7 +1735,7 @@ describe("runAgent", () => {
         {
           type: "function",
           function: {
-            name: "system.echo",
+            name: toolName,
             description: "echo",
             parameters: { type: "object" },
           },
@@ -1789,6 +1794,23 @@ describe("runAgent", () => {
     expect(params.toolUseContext.options.contextWindowTokens).toBe(
       providerOptions.contextWindowTokens,
     );
+    const mainContext = buildAgenCToolUseContext(session, {
+      cwd: "/tmp",
+      modelInfo: {
+        slug: "fake-model",
+        contextWindow: 200_000,
+        effectiveContextWindowPercent: 100,
+      },
+    } as TurnContext);
+    expect(params.toolUseContext.options.tools).toEqual(mainContext.options.tools);
+    expect(params.toolUseContext.options.tools).toEqual([{
+      ...registry.toLLMTools()[0],
+      name: toolName,
+      description: "echo",
+      inputJSONSchema: { type: "object" },
+      isMcp: toolName.startsWith("mcp__"),
+      maxResultSizeChars: DEFAULT_MAX_RESULT_SIZE_CHARS,
+    }]);
     expect(typeof params.toolUseContext.getAppState).toBe("function");
     expect(params.toolUseContext.readFileState.max).toBeGreaterThan(0);
     expect(params.toolUseContext.readFileState.maxSize).toBeGreaterThan(0);
@@ -2276,6 +2298,41 @@ describe("runAgent", () => {
     expect(session.mailbox.hasPending()).toBe(true);
     await vi.advanceTimersByTimeAsync(400);
     expect(submit).toHaveBeenCalledTimes(2);
+    expect(session.mailbox.hasPending()).toBe(false);
+  });
+
+  // #2236: after a user Stop, a child's receipt must not start a parent turn;
+  // it waits in the mailbox for the user's next prompt.
+  it("holds a parent follow-up while the user's stop is latched; the receipt waits for the next user turn", async () => {
+    vi.useFakeTimers();
+    const provider = makeProvider([{ content: "follow-up result" }]);
+    const session = makeStubSession({ services: { provider } });
+    const submit = vi.fn(async () => {
+      session.drainPendingInputMessages();
+    });
+    session.installTurnDriverHooks({ submit });
+    session.markStoppedByUser();
+    const { live } = await spawnLive(session);
+
+    const { result } = await collectRun(
+      runAgent({
+        live,
+        parent: session,
+        initialMessages: [{ role: "user", content: "schedule follow-up" }],
+        taskPrompt: "schedule follow-up",
+      }),
+    );
+    expect(result.outcome).toBe("completed");
+    expect(session.mailbox.hasPending()).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(submit).not.toHaveBeenCalled();
+    expect(session.mailbox.hasPending()).toBe(true);
+
+    // The next user prompt clears the latch and its turn drains the receipt.
+    session.clearUserStop();
+    expect(session.stoppedByUserSinceLastPrompt).toBe(false);
+    session.drainPendingInputMessages();
     expect(session.mailbox.hasPending()).toBe(false);
   });
 

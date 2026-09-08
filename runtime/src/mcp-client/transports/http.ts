@@ -23,8 +23,10 @@ import { connectMCPClientWithCleanup } from "./connect-with-cleanup.js";
 import { getProxyFetchOptions } from "../../utils/proxy.js";
 import type { ProviderEnvironment } from "../../llm/provider-options.js";
 import { EMPTY_MCP_REQUEST_ENVIRONMENT } from "../environment.js";
+import type { McpOAuthConfig } from "../../config/mcp-oauth.js";
 
 export interface MCPServerHttpConfig {
+  readonly oauth?: McpOAuthConfig;
   readonly name: string;
   readonly endpoint: string;
   readonly headers?: Record<string, string>;
@@ -52,10 +54,15 @@ export async function createHttpMCPConnection(
   const proxyOptions = getProxyFetchOptions({ environment });
 
   const url = new URL(config.endpoint);
+  const oauth = config.oauth === undefined ? undefined : await import("../../services/mcp/interactive-auth.js");
   const transport = new StreamableHTTPClientTransport(url, {
+    ...(oauth === undefined || config.oauth === undefined ? {} : {
+      authProvider: oauth.runtimeMcpOAuthProvider(config.name, config.endpoint, "http", config.oauth, environment, config.headers),
+      fetch: oauth.mcpOAuthTransportFetch(environment, fetch, config),
+    }),
     requestInit: {
       ...proxyOptions,
-      ...(config.headers !== undefined
+      ...(config.headers !== undefined && config.oauth === undefined
         ? { headers: { ...config.headers } }
         : {}),
     },

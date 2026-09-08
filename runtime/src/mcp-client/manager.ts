@@ -56,6 +56,7 @@ import type { SandboxExecutionBrokerLike } from "../sandbox/execution-broker.js"
 import { registerSandboxExecutionLifecycleParticipant } from "../sandbox/execution-lifecycle.js";
 import { MCPTransportCleanupError } from "./transports/connect-with-cleanup.js";
 import { assertValidMcpServerName } from "./server-name.js";
+import { isMcpAuthenticationError } from "../services/mcp/auth-errors.js";
 
 /** I-50: cancellable MCP startup wait; 30s default. */
 const MCP_STARTUP_TIMEOUT_MS = 30_000;
@@ -219,6 +220,7 @@ function immutableMcpServerConfig(config: MCPServerConfig): MCPServerConfig {
         );
   return Object.freeze({
     ...config,
+    ...(config.oauth === undefined ? {} : { oauth: Object.freeze({ ...config.oauth, ...(config.oauth.scopes ? { scopes: Object.freeze([...config.oauth.scopes]) } : {}) }) }),
     ...(config.args !== undefined
       ? { args: Object.freeze([...config.args]) }
       : {}),
@@ -331,6 +333,7 @@ export function toScopedMcpServerConfig(
         config.endpoint,
       ),
       ...(config.headers !== undefined ? { headers: config.headers } : {}),
+      ...(config.oauth === undefined ? {} : { oauth: { ...config.oauth, scopes: config.oauth.scopes ? [...config.oauth.scopes] : undefined } }),
       ...policy,
       ...provenance,
     };
@@ -345,6 +348,7 @@ export function toScopedMcpServerConfig(
         config.endpoint,
       ),
       ...(config.headers !== undefined ? { headers: config.headers } : {}),
+      ...(config.oauth === undefined ? {} : { oauth: { ...config.oauth, scopes: config.oauth.scopes ? [...config.oauth.scopes] : undefined } }),
       ...policy,
       ...provenance,
     };
@@ -833,7 +837,7 @@ export class MCPManager {
           successCount++;
           this.connectionStates.set(cfg.name, { type: "connected" });
         } else {
-          this.connectionStates.set(cfg.name, {
+          this.connectionStates.set(cfg.name, isMcpAuthenticationError(result.reason) ? { type: "needs-auth" } : {
             type: "failed",
             error: errMessage(result.reason),
           });
@@ -1301,7 +1305,7 @@ export class MCPManager {
     return promise.catch((error: unknown) => {
       if (this.isReconnectLifecycleCurrent(lifecycleGeneration, running)) {
         this.commitSurfaceMutation(() => {
-          this.connectionStates.set(config.name, {
+          this.connectionStates.set(config.name, isMcpAuthenticationError(error) ? { type: "needs-auth" } : {
             type: "failed",
             error: errMessage(error),
           });
@@ -1355,7 +1359,7 @@ export class MCPManager {
     } catch (error) {
       if (this.isReconnectLifecycleCurrent(lifecycleGeneration, running)) {
         this.commitSurfaceMutation(() => {
-          this.connectionStates.set(config.name, {
+          this.connectionStates.set(config.name, isMcpAuthenticationError(error) ? { type: "needs-auth" } : {
             type: "failed",
             error: errMessage(error),
           });

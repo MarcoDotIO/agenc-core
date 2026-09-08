@@ -26,6 +26,41 @@ Bare interactive startup with a fresh install uses the **config** default
 explicit model, the registry also uses **`grok-4.6`**. Managed OpenRouter is a
 separate provider route and its paid default remains **`x-ai/grok-4.5`**.
 
+## Gemini reasoning effort
+
+The native Gemini adapter sends an explicit effort as
+`generationConfig.thinkingConfig.thinkingLevel`. The model catalog, `/effort`,
+child-agent and role overrides, and provider/model switch checks use the same
+supported-level metadata.
+
+| Model | Explicit levels | Provider default when omitted |
+| --- | --- | --- |
+| `gemini-3.1-pro-preview` | `low`, `medium`, `high` | `high` |
+| `gemini-3.7-flash` | `low`, `medium`, `high` | `medium` |
+| `gemini-3.5-flash` | `minimal`, `low`, `medium`, `high` | `medium` |
+| `gemini-3-flash-preview` | `minimal`, `low`, `medium`, `high` | `high` |
+| `gemini-3-pro-preview` | `low`, `high` | `high` |
+
+An unconfigured Gemini session leaves thinking controls out of the request.
+An explicit `reasoning_effort = "none"` also omits the control, even when
+another configured effort would otherwise apply. Neither case disables the
+model's thinking. `/effort default` removes the saved override. A compatible
+effort already stamped on a session remains in effect after a provider switch.
+
+Unsupported explicit levels fail before a request is sent. AgenC does not
+translate `minimal`, `xhigh`, or `max` into a different Gemini level. Unknown
+model variants do not inherit levels from a name prefix. Gemini 2.5 Pro,
+Flash, and Flash-Lite use `thinkingBudget` on the native `generateContent`
+API, so AgenC does not accept named effort levels for those models or invent
+a token-budget conversion.
+
+Sources checked on 2026-09-08: Google's
+[native ThinkingConfig reference](https://ai.google.dev/api/generate-content#ThinkingConfig),
+[thinking guide](https://ai.google.dev/gemini-api/docs/thinking), and
+[Gemini 3 guide](https://ai.google.dev/gemini-api/docs/gemini-3).
+The Interactions API's level abstraction for Gemini 2.5 does not apply to
+AgenC's native `generateContent` requests.
+
 ## Single provider authority
 
 Startup provider selection is explicit and layered. Before managed policy is
@@ -93,7 +128,7 @@ the Grok 4.6 default and capability change.
 they run only through the Grok Build CLI ACP path. See
 [grok-oauth.md](../grok-oauth.md#composer-models-acp).
 
-## Built-in providers (22)
+## Built-in providers (23)
 
 | Slug | Display name | Default model | Default base URL | Ordered credential env aliases | Ordered endpoint env aliases | Onboarding access |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -113,6 +148,7 @@ they run only through the Grok Build CLI ACP path. See
 | `zai` | Z.AI | `glm-5.3` | `https://api.z.ai/api/paas/v4` | `ZAI_API_KEY` | `ZAI_BASE_URL` | `api-key` |
 | `zai-coding-plan` | Z.AI Coding Plan | `glm-5.3` | `https://api.z.ai/api/coding/paas/v4` | `ZAI_CODING_PLAN_API_KEY` | `ZAI_CODING_PLAN_BASE_URL` | `api-key` |
 | `gemini` | Gemini | `gemini-3.1-pro-preview` | `https://generativelanguage.googleapis.com/v1beta` | `GEMINI_API_KEY`, `GOOGLE_API_KEY` | `GEMINI_BASE_URL` | `api-key` |
+| `kimi` | Kimi (Moonshot) | `kimi-k3` | `https://api.moonshot.ai/v1` | `MOONSHOT_API_KEY` | _(fixed global endpoint)_ | `api-key` |
 | `mistral` | Mistral | `mistral-medium-latest` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` | `MISTRAL_BASE_URL` | `api-key` |
 | `nvidia-nim` | NVIDIA NIM | `nvidia/llama-3.1-nemotron-70b-instruct` | `https://integrate.api.nvidia.com/v1` | `NVIDIA_API_KEY` | `NVIDIA_BASE_URL` | `api-key` |
 | `minimax` | MiniMax | `MiniMax-M2.5` | `https://api.minimax.io/v1` | `MINIMAX_API_KEY` | `MINIMAX_BASE_URL` | `api-key` |
@@ -156,6 +192,12 @@ stores credential values.
   retired native `agenc` credential field are explicit one-way migration
   inputs only. Reads, refreshes, and clears stay bound to the client's captured
   `HomeContext`, and refresh compare-and-swap preserves a newer login.
+  Within an OpenAI provider instance, concurrent 401 failures share one
+  refresh for the credentials used by those requests. Delayed failures from
+  older credentials cannot invalidate a refreshed session. Cancelling a chat
+  or stream stops that caller's wait without cancelling the shared refresh.
+  Genuine refresh exhaustion stays in effect until the provider is recreated
+  after login. Single-wire requests never refresh or mark refresh exhausted.
   List reachable models with `agenc openai-models --json`
   (`{ok, models, authMode}`; tokens never in the output). See
   [cli.md](cli.md#openai-models).
@@ -336,6 +378,54 @@ separate `ZAI_API_KEY` (or another independent media backend) to expose
 [Generate Image](https://docs.z.ai/api-reference/image/generate-image), and
 [pricing](https://docs.z.ai/guides/overview/pricing).
 
+Kimi uses `MOONSHOT_API_KEY` only with Moonshot's fixed global
+`https://api.moonshot.ai/v1` authority. The native `kimi` slug has no base-URL
+environment override and never borrows another provider's key; regional or
+custom OpenAI-compatible deployments belong under `openai-compatible`. Its
+curated global catalog is:
+
+| Model | Context | Default / maximum output | Cached input / input / output per 1M tokens | Reasoning effort (default) |
+| --- | ---: | ---: | ---: | --- |
+| `kimi-k3` | 1,048,576 | 131,072 / 1,048,576 | $0.30 / $3.00 / $15.00 | `low`, `high`, `max` (`max`) |
+| `kimi-k2.7-code` | 262,144 | 32,768 harness default / not published | $0.19 / $0.95 / $4.00 | provider-controlled |
+| `kimi-k2.7-code-highspeed` | 262,144 | 32,768 harness default / not published | $0.38 / $1.90 / $8.00 | provider-controlled |
+| `kimi-k2.6` | 262,144 | 32,768 harness default / not published | $0.16 / $0.95 / $4.00 | provider-controlled |
+
+All four models receive the normal AgenC function-tool catalog and vision
+history. Requests above Moonshot's 128-tool limit fail locally rather than
+silently clipping tools. K3 accepts `required`; K2.7 and K2.6 normalize that
+unsupported mode to `auto`. Named function choices are incompatible with
+thinking and are normalized for all four. Parallel-tool and fixed sampling
+controls are omitted, and every model uses
+`max_completion_tokens`.
+The K2.x 64,000-token configurable ceiling is an AgenC safety guard, not a
+published Moonshot model maximum.
+
+K3 and K2.7 always think; AgenC omits the optional `thinking` request field for
+both. K2.6 receives `thinking: { type: "enabled", keep: "all" }`. AgenC keeps
+`reasoning_content` outside visible assistant text and replays every historical
+block only to the exact same Kimi provider/model when the history is intact.
+Authenticated compaction markers describe an already-authoritative projected
+history and do not permanently disable replay. A boundary dropped during wire
+normalization or orphan-tool repair still invalidates the whole replay set;
+benign adjacent user-context merging does not. Kimi streams
+fail closed on malformed JSON, missing/conflicting terminal reasons, or a
+partial tool call not finalized with `finish_reason=tool_calls`.
+
+Vision input must be inline base64 or an already-uploaded `ms://` reference;
+public HTTP image URLs and SVG are rejected before network dispatch. Supported
+formats are JPG, PNG, WebP, GIF, BMP, HEIC, and HEIF, and the final request is
+bounded to 100 MB. JSON Schema response format is available on all four
+models. Combining it with tools is enabled only for `kimi-k2.7-code`, whose
+complete tool-call/result/final-JSON loop has been verified; the other three
+remain fail-closed until their combined loop is verified. Kimi supplies no
+native image-generation route, so `ImagineImage` continues to use a separately
+authorized media backend. Sources: [model overview](https://platform.kimi.ai/docs/api/models-overview.md),
+[thinking models](https://platform.kimi.ai/docs/guide/use-thinking-models.md),
+[vision models](https://platform.kimi.ai/docs/guide/use-kimi-vision-model.md),
+[Chat Completions](https://platform.kimi.ai/docs/api/chat.md), and
+[pricing](https://platform.kimi.ai/docs/pricing/chat-k3.md).
+
 ## Local context windows
 
 How AgenC learns the token budget for a local or OpenAI-compatible model.
@@ -394,6 +484,10 @@ supplies context and output limits even with a custom base URL. Provider health
 checks still authenticate with `GET {base}/models`; a rejected or expired key
 therefore does not appear usable, but that response never overrides the
 curated limits.
+
+Kimi likewise uses its curated native catalog for the limits documented above;
+`GET /models` remains a credential-health check rather than model-metadata
+authority.
 
 ### Local probes (recorded against live servers)
 
@@ -539,6 +633,15 @@ Its retry behavior is:
 - Session backoff base is **200 ms**.
 - After budget admission, model calls set `singleWireAttempt: true`: **no HTTP
   retry** on that lease. A retry needs a new reservation.
+
+Request deadlines and caller cancellation stay active through JSON, text,
+and non-2xx body consumption. A body-read failure after a successful HTTP
+status does not trigger a transport retry. An aborted or timed-out error body
+is not retried either.
+Body failures cancel the reader without waiting for a stalled cancellation
+callback. Completed reads release the reader, timers and abort listeners.
+Successful streams keep their separate streaming lifecycle and idle watchdog.
+
 Grok uses an SDK transport with a distinct retry contract: its default budget
 is **2**, `maxRetries` can override it, and the SDK owns retry eligibility and
 backoff. A `singleWireAttempt` still forces that SDK budget to **0**. Those are
@@ -577,6 +680,7 @@ Reasoning models disagree about where chain-of-thought goes.
 | Non-streaming `message.reasoning_content` | Becomes visible assistant content only when `message.content` is absent, null, or otherwise not text/content blocks. A string `content`, including an empty string, takes precedence. |
 | Cerebras `delta.reasoning` / `message.reasoning` | Emits/stores hidden thinking separately from `content`; opaque state is replayed as `reasoning` only to the exact same Cerebras model. |
 | Z.AI `delta.reasoning_content` / `message.reasoning_content` | Emits/stores hidden thinking separately from `content`; all blocks are replayed in order only for a complete, immediately adjacent multi-round tool chain on the exact same Z.AI model. Other turns clear the whole stale chain. |
+| Kimi `delta.reasoning_content` / `message.reasoning_content` | Emits/stores hidden thinking separately from `content`; intact historical blocks are replayed in order only to the exact same native Kimi model, and any compaction/boundary repair clears the complete replay set. |
 | Leading `<think>...</think>` or `◁think▷...◁/think▷` in `content` | First leading block (whitespace before the opener allowed) moves to thinking. Text after the closer is the answer. |
 | Literal `<think>` later in the answer | Left visible. Only a marker that opens at the start of the assistant message starts a block. |
 | Opener with no closer | Remainder is thinking. The generation died mid-thought; it is not an answer. |
@@ -597,8 +701,8 @@ rejects or silently ignores. An undefined `acceptsX` flag still means
 
 | Field | Who gets it |
 | --- | --- |
-| `reasoning_effort` | OpenAI reasoning-family slugs (`gpt-5`, `o1`, `o3`, `o4`, `codex`, `chatgpt-5`). Grok 4.3 / 4.5 / 4.6, `grok-4-20-multi-agent` / `grok-4.20-multi-agent`, and `grok-build-latest`. Meta Muse Spark models for `minimal`, `low`, `medium`, `high`, and `xhigh` only. Z.AI GLM-5.3 models for `low`, `high`, and `max` only. Cerebras `gpt-oss-120b` for `low`, `medium`, `high`; Cerebras `qwen-3.8-27b` and `gemma-4-31b` for `none`, `low`, `medium`, `high`. NVIDIA NIM families below, and only values in that family's enum. Everyone else: stripped. `/effort` on a local model is a no-op on the wire. |
-| `tool_choice` | Meta and Z.AI accept only `auto`. `required` and named choices are normalized to `auto`; `none` omits both the tools and choice fields. A Z.AI request over 128 function definitions fails locally rather than dropping tools. Cerebras omits tool-choice/parallel controls whenever no tool definitions are attached, as required by API v2. Other compatible providers keep the requested value. |
+| `reasoning_effort` | OpenAI reasoning-family slugs (`gpt-5`, `o1`, `o3`, `o4`, `codex`, `chatgpt-5`). Grok 4.3 / 4.5 / 4.6, `grok-4-20-multi-agent` / `grok-4.20-multi-agent`, and `grok-build-latest`. Meta Muse Spark models for `minimal`, `low`, `medium`, `high`, and `xhigh` only. Z.AI GLM-5.3 models and native Kimi K3 for `low`, `high`, and `max` only. Cerebras `gpt-oss-120b` for `low`, `medium`, `high`; Cerebras `qwen-3.8-27b` and `gemma-4-31b` for `none`, `low`, `medium`, `high`. NVIDIA NIM families below, and only values in that family's enum. Everyone else: stripped. `/effort` on a local model is a no-op on the wire. |
+| `tool_choice` | Meta and Z.AI accept only `auto`. `required` and named choices are normalized to `auto`; `none` omits both the tools and choice fields. Native Kimi K3 additionally accepts `required`; Kimi K2.7/K2.6 normalize it to `auto`, and all native Kimi models normalize named choices because they are incompatible with thinking. Requests above the Z.AI or Kimi 128-function limit fail locally rather than dropping tools. Cerebras omits tool-choice/parallel controls whenever no tool definitions are attached, as required by API v2. Other compatible providers keep the requested value. |
 | `stop` | Meta rejects stop sequences, so its adapter strips them. Z.AI receives only the first sequence from a caller list. Other compatible providers keep caller-supplied sequences. |
 | `service_tier` | `openai` and `azure-openai`; explicit Cerebras pass-through remains for configured dedicated endpoints, while its shared catalog advertises no selectable tier |
 | `stream_options.include_usage` | Default **on**. Z.AI omits this undocumented control. `STREAM_USAGE_INCOMPATIBLE_PROVIDERS` is otherwise empty, and no operator or per-instance override is wired. |
@@ -626,7 +730,7 @@ For `lmstudio` and `openai-compatible` only
   `maxOutputTokens` option and `max_output_tokens` setting supply the requested
   value. Non-local OpenAI chat-completions requests use
   `max_completion_tokens`. The runtime default remains
-  `DEFAULT_MAX_OUTPUT_TOKENS` (**32_000**); Meta, QwenCloud, and Cerebras also
+  `DEFAULT_MAX_OUTPUT_TOKENS` (**32_000**); Meta, QwenCloud, Cerebras, and Kimi also
   use `max_completion_tokens`, while Z.AI explicitly uses `max_tokens`. This ceiling applies only to the two
   grammar-constrained slugs.
 - **`/no_think` system suffix** when the model slug matches `qwen3` /

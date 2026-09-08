@@ -85,6 +85,7 @@ import type {
 import type { AgentRuntimeOptions } from "../../session/runtime-options.js";
 
 export interface AgenCBackgroundAgentStartParams {
+  readonly signal?: AbortSignal;
   readonly objective: string;
   readonly cwd?: string;
   readonly model?: string;
@@ -129,6 +130,7 @@ export interface AgenCBackgroundAgentStartResult {
 }
 
 export interface AgenCBackgroundAgentRestoreParams {
+  readonly signal?: AbortSignal;
   readonly agentId: string;
   readonly objective: string;
   readonly cwd?: string;
@@ -298,7 +300,10 @@ export interface AgenCBackgroundAgentMessageTerminal extends JsonObject {
 }
 
 export type AgenCBackgroundAgentMessageErrorCode =
-  "TURN_IN_PROGRESS" | "CLIENT_MESSAGE_ID_CONFLICT" | "PROMPT_BLOCKED";
+  | "TURN_IN_PROGRESS"
+  | "CLIENT_MESSAGE_ID_CONFLICT"
+  | "PROMPT_BLOCKED"
+  | "SESSION_HISTORY_BLOCKED";
 
 export class AgenCBackgroundAgentMessageError extends Error {
   readonly code: AgenCBackgroundAgentMessageErrorCode;
@@ -481,6 +486,8 @@ export interface AgenCBackgroundAgentRunner {
     reason: string,
   ): Promise<AgenCBackgroundAgentCancellationPreparation>;
   stopAgent?(agentId: string, reason?: string): Promise<void>;
+  /** Daemon-owned one-shot invocation: derive its final outcome from a settled message. */
+  finishAgentRun?(agentId: string, messageId: string): Promise<"completed" | "failed" | "cancelled" | undefined>;
   /** Daemon-only shutdown disposition; caller prose cannot select suspension. */
   suspendIdleAgentForDaemonShutdown?(
     agentId: string,
@@ -742,6 +749,8 @@ interface ActiveMessageSubmission {
   assistantMessageOrdinal: number;
   activeAssistantMessageId?: string;
   terminal?: AgenCBackgroundAgentMessageTerminal;
+  /** Owning phase outcome; conversational turn_complete alone also includes bounded failures. */
+  terminalStopReason?: string;
   readonly promise: Promise<AgenCBackgroundAgentMessageResult>;
   settled: boolean;
 }
@@ -777,6 +786,8 @@ interface AgentTerminalUsage {
   readonly outputTokens: number;
   readonly totalTokens: number;
   readonly costUsd: number;
+  /** False when historical coverage or a per-model price is incomplete. */
+  readonly costKnown: boolean;
 }
 
 function positiveSequence(value: unknown): number | undefined {
@@ -798,6 +809,19 @@ function positiveInteger(value: unknown): number {
 }
 
 export interface AgenCDelegateBackgroundAgentRunnerOptions {
+  readonly agentStopTimeoutMs?: number;
+  /**
+   * Bound on the two waits a daemon restore adds around the durable-turn
+   * resume it drives (#2239): waiting for the recovered turn to START before
+   * `restoreAgent` returns, and waiting for a newer turn to release the
+   * history slot before the recovered conversation is merged back.
+   *
+   * Defaults to `DAEMON_AGENT_CREATE_TIMEOUT_MS`, the same deadline the
+   * bootstrap prewarm scope gave the resume when it ran inline, so the restore
+   * can never block longer than it did before the reorder. Injectable so tests
+   * do not have to burn the production deadline.
+   */
+  readonly durableResumeTimeoutMs?: number;
   readonly bootstrap?: AgenCBootstrapFunction;
   readonly ensureAgentControl?: AgenCEnsureAgentControlFunction;
   readonly authBackend?: AuthBackend;
