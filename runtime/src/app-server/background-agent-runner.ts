@@ -165,10 +165,11 @@ import {
 } from "../state/runtime-settings-snapshot.js";
 import { runWithAgentRuntimeOptions } from "../session/runtime-options.js";
 import { shutdownSessionLifecycle } from "../session/lifecycle.js";
-import { withTimeout } from "../utils/sleep.js";
+import { sleep, withTimeout } from "../utils/sleep.js";
 import {
   DaemonOperationScope,
   DAEMON_AGENT_STOP_TIMEOUT_MS,
+  DAEMON_AGENT_CREATE_TIMEOUT_MS,
   DAEMON_AGENT_HARD_STOP_TIMEOUT_MS,
 } from "./operation-deadline.js";
 
@@ -385,6 +386,7 @@ export {
 
 export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentRunner {
   readonly #agentStopTimeoutMs: number;
+  readonly #durableResumeTimeoutMs: number;
   readonly #bootstrap: AgenCBootstrapFunction;
   readonly #requireSandboxReadyAtStartup: boolean;
   readonly #ensureAgentControl: AgenCEnsureAgentControlFunction;
@@ -417,6 +419,11 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     this.#agentStopTimeoutMs = options.agentStopTimeoutMs ?? DAEMON_AGENT_STOP_TIMEOUT_MS;
     if (!Number.isSafeInteger(this.#agentStopTimeoutMs) || this.#agentStopTimeoutMs <= 0 || this.#agentStopTimeoutMs > 2_147_483_647) {
       throw new RangeError("agentStopTimeoutMs must be a positive timer interval");
+    }
+    this.#durableResumeTimeoutMs =
+      options.durableResumeTimeoutMs ?? DAEMON_AGENT_CREATE_TIMEOUT_MS;
+    if (!Number.isSafeInteger(this.#durableResumeTimeoutMs) || this.#durableResumeTimeoutMs <= 0 || this.#durableResumeTimeoutMs > 2_147_483_647) {
+      throw new RangeError("durableResumeTimeoutMs must be a positive timer interval");
     }
     this.#bootstrap = options.bootstrap ?? bootstrapLocalRuntimeSession;
     this.#requireSandboxReadyAtStartup = options.bootstrap === undefined;
@@ -1005,12 +1012,31 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
               }
             : {}),
           deferSessionStartHooks: true,
+          // The two deferrals are mutually exclusive (#2239).
+          //
+          // Without `deferAgentStartupSideEffects`, bootstrap runs the startup
+          // prewarm inline and would resume-continue the orphaned turn before
+          // either prerequisite exists, so that ONE step is withheld here for
+          // `#driveDeferredDurableResume` below.
+          //
+          // With it, `bin/bootstrap.ts` gates the whole prewarm block on the
+          // same flag from INSIDE the function it defers, so
+          // `runStartupPrewarm` runs for those restores neither at bootstrap
+          // nor on the first ordinary submit — the orphan is not resumed at
+          // all today, before or after this change. That gap is pre-existing
+          // and out of scope here. Not setting `deferDurableTurnResume` on top
+          // of it is therefore a no-op right now, and deliberately so: if the
+          // prewarm is ever moved onto the deferred submit hook, the flag
+          // would mark the resume pending long after `#driveDeferredDurableResume`
+          // has already run and returned, and the orphan is single-shot
+          // (bootstrap's replay persists its `turn_aborted{process_killed}`),
+          // so it would be lost rather than merely late.
           ...(params.resumeSuspendedRun === true ||
           params.resumeStartupActivationPending === true
             ? {
                 deferAgentStartupSideEffects: true,
               }
-            : {}),
+            : { deferDurableTurnResume: true }),
           argv: buildBootstrapArgv(
             restoreBootstrapSelection(params),
             this.#argv,
@@ -1306,16 +1332,55 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           params.agentId,
           active,
         );
-        await this.#hydrateRecoveredAgentState({
-          agentId: params.agentId,
-          session: bootstrap.session,
-          registry: bootstrap.registry,
-          thread: managedThread,
-          initialMessages: params.initialMessages ?? [],
-          replayToolCalls: params.replayToolCalls ?? [],
-          currentSessionId: params.currentSessionId,
-          onReplayToolResult: params.onReplayToolResult,
-        });
+        const restoredSession = bootstrap.session;
+        const recoveredInitialMessages = params.initialMessages ?? [];
+        const recoveredReplayedMessages =
+          await this.#hydrateRecoveredAgentState({
+            agentId: params.agentId,
+            session: restoredSession,
+            registry: bootstrap.registry,
+            thread: managedThread,
+            initialMessages: recoveredInitialMessages,
+            replayToolCalls: params.replayToolCalls ?? [],
+            currentSessionId: params.currentSessionId,
+            onReplayToolResult: params.onReplayToolResult,
+          });
+        params.signal?.throwIfAborted();
+        // Whether there is anything to merge back is decided HERE, before any
+        // waiting: `daemon-cli` supplies recovered messages only when the
+        // snapshot carried them, so the ordinary recovered run — no snapshot
+        // conversation, no in-flight tool calls — has nothing to re-apply.
+        // Leaving that test inside the thunk would make such a run wait out
+        // the whole slot poll and then record a lost conversation that never
+        // existed.
+        const hasRecoveredConversation =
+          recoveredInitialMessages.length > 0 ||
+          recoveredReplayedMessages.length > 0;
+        // Last: this generation now owns `#active`, the approval bridge, and
+        // the canonical event bridge, so a resumed turn that needs approval
+        // reaches a client instead of the arbiter default deny.
+        await this.#driveDeferredDurableResume(
+          active,
+          // The resumed turn republishes `session.state.history` from the
+          // checkpoint prefix it continues (`syncSessionState`), which erases
+          // the recovered conversation hydrated just above. Re-apply it once
+          // the turn is over, which is the order that held while the resume
+          // ran inside bootstrap.
+          hasRecoveredConversation
+            ? () =>
+                hydrateRecoveredSessionHistory(restoredSession, {
+                  initialMessages: recoveredInitialMessages,
+                  replayedMessages: recoveredReplayedMessages,
+                })
+            : undefined,
+          // Callers that own a restore deadline (the on-demand lifecycle path)
+          // release the wait immediately on abort; the daemon-startup path
+          // passes none, which is why that wait is also bounded by a timeout.
+          params.signal,
+        );
+        // Waiting for the recovered turn to start is a new suspension point,
+        // so an abort raised during it must still fail the restore rather
+        // than publish this generation.
         params.signal?.throwIfAborted();
         return true;
       } catch (error) {
@@ -1770,7 +1835,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     readonly onReplayToolResult?: (
       result: AgenCBackgroundAgentReplayToolResult,
     ) => void | Promise<void>;
-  }): Promise<void> {
+  }): Promise<readonly LLMMessage[]> {
     const replayedMessages = await replayRecoveredToolCalls({
       thread: params.thread,
       parent: params.session,
@@ -1790,6 +1855,10 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       initialMessages: params.initialMessages,
       replayedMessages,
     });
+    // Returned so the caller can re-apply the history merge after a durable
+    // resume has republished the same slot; the tool calls themselves are
+    // dispatched exactly once, here (#2239).
+    return replayedMessages;
   }
 
   async attachAgentSessionEvents(
@@ -4222,6 +4291,179 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     return resolved;
   }
 
+  /**
+   * Drive the durable-turn resume bootstrap withheld from its startup prewarm.
+   *
+   * Ordering is the whole point (#2239): the resumed turn is a real model turn
+   * that can call tools needing approval, and it must run AFTER
+   * `#installDaemonApprovalBridge` published `services.approvalResolver` and
+   * AFTER `#active.set`, because `#requestDaemonToolDecision` denies outright
+   * for an agent that is not registered.
+   *
+   * Returns once the recovered turn has STARTED (`turn_resumed`), or the
+   * resume has finished without one, or `durableResumeTimeoutMs` expires —
+   * never once it has completed. Waiting for the start closes the window in
+   * which `restoreAgent` had already returned while the resume was still
+   * queued: a client that submitted in that window had its brand-new turn
+   * aborted `replaced` by the late resume. With the recovered turn already
+   * holding the session's turn slot, the newer user message replaces the
+   * resume instead, which is the direction every other in-flight turn follows.
+   *
+   * Waiting for COMPLETION is not an option: an approval has no default
+   * timeout, so it would block the restore — and the daemon's own startup — on
+   * a decision that cannot be delivered until restore returns and a client
+   * attaches. The request buffers on the agent until then.
+   *
+   * The bound is not optional either. Everything the resume does before
+   * `turn_resumed` can block (checkpoint provider restore, `spawnTask`'s abort
+   * drain, the fsync-durable emit), `daemon-cli` awaits every recovered
+   * restore serially BEFORE `socketServer.listen()`, and the only caller on
+   * that path passes no `signal` — so an unbounded wait here stops the daemon
+   * from ever listening, and with it the client attach this fix exists to
+   * enable. `durableResumeTimeoutMs` defaults to the deadline the inline
+   * resume already ran under (`DaemonOperationScope("session startup prewarm",
+   * DAEMON_AGENT_CREATE_TIMEOUT_MS)` in `bin/bootstrap.ts`), so the restore
+   * cannot block for longer than it did before the reorder.
+   *
+   * On expiry the resume KEEPS RUNNING and the reason is recorded on the
+   * session. Cancelling it would be worse than late: the orphan is single-shot
+   * (bootstrap's replay has already persisted its `turn_aborted{process_killed}`),
+   * so abandoning it destroys the interrupted turn, where the only thing lost
+   * by not waiting is the start barrier — the pre-existing race in which a
+   * client message submitted in the gap is replaced by the late resume.
+   *
+   * `reapplyRecoveredHistory` runs after the resumed turn is over, because the
+   * turn republishes `session.state.history` from its checkpoint prefix and
+   * would otherwise leave the daemon-recovered conversation erased. It is
+   * `undefined` when the recovered run carried no conversation to merge, and
+   * then nothing waits and nothing is reported.
+   */
+  async #driveDeferredDurableResume(
+    active: ActiveBackgroundAgent,
+    reapplyRecoveredHistory: (() => Promise<void>) | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    const runDeferredDurableTurnResume =
+      active.bootstrap.runDeferredDurableTurnResume;
+    if (typeof runDeferredDurableTurnResume !== "function") return;
+    const session = active.bootstrap.session;
+    let signalStarted = (): void => {};
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    let turnWasOpened = false;
+    const stopWatchingForStart = subscribeDurableResumeStarted(session, () => {
+      turnWasOpened = true;
+      signalStarted();
+    });
+    const finished = (async () => {
+      try {
+        let resumed = false;
+        try {
+          resumed = (await runDeferredDurableTurnResume()).resumed === true;
+        } catch {
+          // The resume is best-effort and already records its own failure on
+          // the conversation thread record.
+        }
+        // History is republished by `syncSessionState` only if a turn actually
+        // re-opened, so `turn_resumed` — not just a clean attempt outcome —
+        // also decides this: a resume that threw after re-opening the turn
+        // overwrote the recovered conversation just the same.
+        if (!resumed && !turnWasOpened) return;
+        // No recovered conversation, nothing to wait for: a run with nothing
+        // to merge must not poll the turn slot and must not report a loss.
+        if (reapplyRecoveredHistory === undefined) return;
+        await this.#reapplyRecoveredHistory(active, reapplyRecoveredHistory);
+      } catch {
+        // Nothing here may surface as an unhandled rejection on a live daemon.
+      } finally {
+        stopWatchingForStart();
+        signalStarted();
+      }
+    })();
+    void finished.catch(() => undefined);
+    const outcome = await waitForDurableResumeStart(
+      started,
+      this.#durableResumeTimeoutMs,
+      signal,
+    );
+    if (outcome !== "timed-out") return;
+    // Recorded, never silent: the operator and the client that attaches next
+    // both learn that this agent's recovered turn had not started yet, and
+    // that the daemon went on listening rather than waiting for it.
+    emitDurableResumeWarning(
+      session,
+      "durable_resume_start_timeout",
+      `the recovered turn did not start within ${this.#durableResumeTimeoutMs}ms; ` +
+        "daemon startup continued and the resume is still running in the background",
+    );
+  }
+
+  /**
+   * Restore the daemon-recovered conversation the resumed turn republished
+   * over. Only called when there IS one — the caller decides that before any
+   * waiting starts.
+   *
+   * A newer turn owning the session's turn slot is the hard case: a client
+   * message that replaced the resume is the fresher authority, and merging the
+   * recovered tool results underneath a live turn would rewrite its context —
+   * and be overwritten by that turn's next `syncSessionState` anyway. Skipping
+   * outright, however, drops `initialMessages` and the re-dispatched
+   * `replayToolCalls` for good, a loss that did not exist before the resume
+   * moved after `#hydrateRecoveredAgentState`. So the merge WAITS for the slot
+   * instead, bounded by `durableResumeTimeoutMs`; only a slot that never frees
+   * within that bound records the drop and gives up.
+   *
+   * Two limitations are accepted here rather than claimed away, and both are
+   * pinned by tests:
+   *
+   * 1. What the merge restores depends on what the replacing turn left behind.
+   *    Onto an EMPTY history it restores the whole recovered conversation;
+   *    onto a history that turn has already published, it appends only the
+   *    re-dispatched tool results, at the tail, and does NOT reintroduce
+   *    `initialMessages` ahead of a conversation that has moved on. Base never
+   *    faced that ordering because it merged before any client turn could
+   *    exist. Reordering a newer turn's own conversation to make room for the
+   *    recovered prefix would be the larger harm.
+   * 2. The bound is `durableResumeTimeoutMs`, a daemon-startup deadline;
+   *    nothing derives it from how long a client turn may run, so a replacing
+   *    turn that outlives it gives the merge up and records
+   *    `recovered_history_reapply_abandoned`. The alternative is a background
+   *    poll with no end on a session that may never free the slot. Losing the
+   *    merge is therefore possible, but never silent.
+   *
+   * The slot read and the merge are not one atomic step. The merge is
+   * idempotent (`hydrateRecoveredSessionHistory` skips messages already in
+   * history), so a turn that starts inside that window costs at worst the same
+   * overwrite skipping would have caused, never a corrupted history.
+   */
+  async #reapplyRecoveredHistory(
+    active: ActiveBackgroundAgent,
+    reapplyRecoveredHistory: () => Promise<void>,
+  ): Promise<void> {
+    const session = active.bootstrap.session;
+    const deadline = Date.now() + this.#durableResumeTimeoutMs;
+    for (;;) {
+      // Every path that retires a generation — `stopAgent`,
+      // `#retireUnpublishedRestoreGeneration`, terminal cleanup — closes
+      // ingress or records a pending terminal BEFORE dropping the `#active`
+      // entry, so this one predicate covers "this agent is going away".
+      if (!isRunnableActiveAgent(active)) return;
+      if (session.activeTurn.unsafePeek() === null) {
+        await reapplyRecoveredHistory();
+        return;
+      }
+      if (Date.now() >= deadline) break;
+      await sleep(RECOVERED_HISTORY_SLOT_POLL_MS, undefined, { unref: true });
+    }
+    emitDurableResumeWarning(
+      session,
+      "recovered_history_reapply_abandoned",
+      `a newer turn held the history for ${this.#durableResumeTimeoutMs}ms after the ` +
+        "recovered turn ended; the daemon-recovered conversation was not merged back",
+    );
+  }
+
   #installDaemonApprovalBridge(
     session: LocalRuntimeBootstrap["session"],
   ): () => void {
@@ -5043,6 +5285,87 @@ async function consumeDaemonPendingProviderSwitches(
       `provider switch to ${pending.provider}/${pending.model} could not be applied before turn: ${outcome.reason}`,
     );
   }
+}
+
+/** Re-check cadence for the history slot a newer turn may be holding. */
+const RECOVERED_HISTORY_SLOT_POLL_MS = 25;
+
+/**
+ * Wait for the recovered turn to start, bounded by `timeoutMs` and by
+ * `signal`.
+ *
+ * The bound is what keeps a stalled resume from holding daemon startup:
+ * `daemon-cli` awaits every recovered restore serially before
+ * `socketServer.listen()`, and passes no `signal` on that path, so a timeout
+ * is the only release that path has (#2239).
+ */
+function waitForDurableResumeStart(
+  started: Promise<void>,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+): Promise<"started" | "timed-out" | "aborted"> {
+  return new Promise<"started" | "timed-out" | "aborted">((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    let settled = false;
+    const finish = (outcome: "started" | "timed-out" | "aborted"): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
+      resolve(outcome);
+    };
+    void started.then(() => finish("started"));
+    if (signal?.aborted === true) {
+      finish("aborted");
+      return;
+    }
+    timer = setTimeout(() => finish("timed-out"), timeoutMs);
+    timer.unref?.();
+    onAbort = (): void => finish("aborted");
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * Record why the runner stopped waiting on a recovered turn.
+ *
+ * The session event log is the channel a client sees on attach and the
+ * rollout keeps, so an expiry is diagnosable after the fact instead of
+ * looking like a resume that silently never happened.
+ */
+function emitDurableResumeWarning(
+  session: LocalRuntimeBootstrap["session"],
+  cause: string,
+  message: string,
+): void {
+  try {
+    session.emit({
+      id: session.nextInternalSubId(),
+      msg: { type: "warning", payload: { cause, message } },
+    });
+  } catch {
+    // A session torn down under us must not turn a diagnostic into a failure.
+  }
+}
+
+/**
+ * Call `onStarted` the first time the session re-opens a durable turn.
+ *
+ * `turn_resumed` is emitted by `run-turn` immediately after `spawnTask` has
+ * installed the recovered turn as the session's active turn and before any
+ * phase work, so it is the earliest point at which the resume can no longer be
+ * beaten to the turn slot by a client message (#2239).
+ */
+function subscribeDurableResumeStarted(
+  session: LocalRuntimeBootstrap["session"],
+  onStarted: () => void,
+): () => void {
+  // Typed on purpose: renaming the event or the subscription must break the
+  // build here rather than turn the start barrier into a silent no-op.
+  return session.eventLog.subscribe((event) => {
+    if (event.msg.type === "turn_resumed") onStarted();
+  });
 }
 
 // Install the daemon turn driver. Prompt ingress normally runs before durable

@@ -82,6 +82,7 @@ import { AgentControl } from "../agents/control.js";
 import { AgentRoleCatalog } from "../agents/role-catalog.js";
 import { ThreadManager } from "../agents/thread-manager.js";
 import { ConversationThreadManager } from "../conversation/thread-manager.js";
+import type { DurableResumeAttempt } from "../conversation/thread-manager.js";
 import { AgentRegistry } from "../agents/registry.js";
 import { createAgentRoleWorkspace } from "../agents/role.js";
 import { loadFreshAgentDefinitions } from "../tools/AgentTool/loadAgentsDir.js";
@@ -640,6 +641,19 @@ export interface BootstrapLocalRuntimeSessionOptions {
    * prewarm until the first non-Editor submit.
    */
   readonly deferAgentStartupSideEffects?: boolean;
+  /**
+   * Do not resume-continue an orphaned in-flight turn from inside bootstrap;
+   * hand that one step to the caller through
+   * `LocalRuntimeBootstrap.runDeferredDurableTurnResume`.
+   *
+   * The startup prewarm otherwise runs unchanged (fresh default turn,
+   * provider warm-up, agent-task registration). Daemon-owned sessions set
+   * this because the resumed turn is driven to completion inside bootstrap,
+   * i.e. before the daemon can install `services.approvalResolver` and
+   * register the agent — so every tool needing approval in that turn is
+   * refused with no prompt reaching the user (#2239).
+   */
+  readonly deferDurableTurnResume?: boolean;
   /** Stable calendar-budget identity; daemon agents default to their run id. */
   readonly executionAdmissionBudgetIdentity?: string;
 }
@@ -676,6 +690,20 @@ export interface LocalRuntimeBootstrap {
   readonly memoryMdPath: string;
   readonly shutdown: () => Promise<void>;
   readonly autonomousModeEnabled: boolean;
+  /**
+   * Drive the durable-turn resume that `deferDurableTurnResume` withheld from
+   * the startup prewarm. Call it once the caller can answer approvals for
+   * this session — for the daemon, after the approval bridge is installed and
+   * the agent is registered (#2239).
+   *
+   * Resolves to the neutral no-op outcome when nothing was deferred. Never
+   * throws: a resume failure is recorded on the conversation thread record,
+   * exactly as it is when the prewarm drives the resume inline.
+   *
+   * Optional so the many test doubles that stand in for a bootstrap keep
+   * compiling; `bootstrapLocalRuntimeSession` always provides it.
+   */
+  readonly runDeferredDurableTurnResume?: () => Promise<DurableResumeAttempt>;
 }
 
 export interface PreparedConfiguredExecutionAuthority {
@@ -1565,6 +1593,8 @@ async function bootstrapLocalRuntimeSessionScoped(
   let agentControlForShutdown: AgentControl | null = null;
   let rolloutStoreForReturn: RolloutStore | null = null;
   let ctxForReturn: TurnContext | null = null;
+  let conversationThreadManagerForReturn: ConversationThreadManager | null =
+    null;
   const mcpService = createSessionMcpService(mcpManager, {
     authority: configStore,
     environment: sessionMcpRequestEnvironment,
@@ -1783,7 +1813,11 @@ async function bootstrapLocalRuntimeSessionScoped(
         });
         const conversationThreadManager = new ConversationThreadManager({
           threadManager,
+          ...(options.deferDurableTurnResume === true
+            ? { deferDurableTurnResume: true }
+            : {}),
         });
+        conversationThreadManagerForReturn = conversationThreadManager;
         // `bootstrapSession` runs the canonical startup prewarm after
         // SessionConfigured; registration only claims the root thread here.
         await conversationThreadManager.registerConversationRootSession(s, {
@@ -2231,6 +2265,11 @@ async function bootstrapLocalRuntimeSessionScoped(
       memoryMdPath,
       shutdown,
       autonomousModeEnabled,
+      runDeferredDurableTurnResume: async (): Promise<DurableResumeAttempt> => {
+        const manager = conversationThreadManagerForReturn;
+        if (manager === null) return { resumed: false };
+        return manager.runDeferredDurableTurnResume(session);
+      },
     };
   } catch (err) {
     try {
