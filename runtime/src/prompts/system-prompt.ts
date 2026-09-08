@@ -339,14 +339,18 @@ export function getSimpleToneAndStyleSection(): string {
   return joinSection("# Tone and style", items);
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Dynamic sections (post-boundary — session-specific)
-// ─────────────────────────────────────────────────────────────────────
-
-/** session_guidance — per-session guidance derived from config/tools.
- *  AgenC-original. Drives the `Use ask-user-question when stuck` and
- *  `Use subagents when matching` reminders that depend on the actual
- *  visible tool catalog and agent surface for this turn. */
+/**
+ * 9. session_guidance — guidance derived from the visible tool catalog.
+ * AgenC-original. Drives the `Use ask-user-question when stuck` and
+ * `Use subagents when matching` reminders.
+ *
+ * agenc-core#2263: this belongs in the static head, next to
+ * {@link getUsingYourToolsSection}, because it is a pure function of the same
+ * `enabledTools` set (`agentsEnabled` is `enabledTools.has("spawn_agent")`).
+ * Sitting in the dynamic tail cost it a re-read on every request — the tail is
+ * the last input item, so the provider's cached prefix always stops in front
+ * of it — for content that never changes while the catalog holds.
+ */
 function getSessionGuidanceSection(
   enabledTools: ReadonlySet<string>,
   agentsEnabled: boolean,
@@ -376,6 +380,10 @@ function getSessionGuidanceSection(
   if (items.length === 0) return null;
   return joinSection("# Session-specific guidance", items);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Dynamic sections (post-boundary — session-specific)
+// ─────────────────────────────────────────────────────────────────────
 
 /** memory — the directory block of `loadMemoryPrompt()` (per-session
  *  paths). Wired as a compute closure so the caller can pass a pre-loaded
@@ -996,7 +1004,8 @@ export async function assembleSystemPrompt(
   // next to per-tool guidance.
   // Section order:
   //   intro → system → doing_tasks → actions → using_your_tools
-  //   → (agent_tool) → tone_and_style → output_efficiency → (auto memory)
+  //   → (agent_tool) → (session_guidance) → tone_and_style
+  //   → output_efficiency → (auto memory)
   const staticSections: Array<string | null> = [
     getSimpleIntroSection(opts.outputStyle != null),
     getSimpleSystemSection(),
@@ -1006,6 +1015,7 @@ export async function assembleSystemPrompt(
     getActionsSection(),
     getUsingYourToolsSection(enabledTools),
     getAgentToolSection(enabledTools),
+    getSessionGuidanceSection(enabledTools, agentsEnabled),
     getSimpleToneAndStyleSection(),
     getOutputEfficiencySection(),
     getMemoryInstructionsSection(opts.memoryInstructions),
@@ -1017,11 +1027,6 @@ export async function assembleSystemPrompt(
       "client_rendering",
       () => clientRendering,
       "rendering capabilities belong to the captured client, not the daemon process",
-    ),
-    DANGEROUS_uncachedSystemPromptSection(
-      "session_guidance",
-      () => getSessionGuidanceSection(enabledTools, agentsEnabled),
-      "session-scoped guidance changes with tools/agent availability",
     ),
     DANGEROUS_uncachedSystemPromptSection(
       "permissions",
