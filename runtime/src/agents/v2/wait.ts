@@ -20,16 +20,30 @@ import {
 } from "./common.js";
 
 /**
- * Consecutive timed-out waits with no mailbox update in between, per
- * session. A wait that completes clears it. Kept off the session object so
- * the tool needs nothing new from the runtime; the WeakMap dies with the
- * session.
+ * Consecutive timed-out waits with no mailbox update in between, for one
+ * turn of one session. A wait that completes clears it, and so does the
+ * next turn: the budget is what THIS turn spent polling, so a turn that
+ * delegates to a fresh agent is never charged for the previous turn's
+ * stall. Kept off the session object so the tool needs nothing new from
+ * the runtime; the WeakMap dies with the session.
  */
 interface WaitTimeoutStreak {
+  /** Turn the streak was accrued in; "" when no turn is active. */
+  turnId: string;
   consecutive: number;
   waitedMs: number;
 }
 const waitTimeoutStreaks = new WeakMap<object, WaitTimeoutStreak>();
+
+/**
+ * Id of the turn this wait belongs to. Typed against `Session` rather than
+ * duck-typed so a rename on the session side breaks the build instead of
+ * silently reverting the streak to session scope. Read without taking the
+ * lock: the wait must not queue behind whoever holds the turn.
+ */
+function currentTurnId(session: Session): string {
+  return session.activeTurn.unsafePeek()?.turnId ?? "";
+}
 
 function maxConsecutiveWaitTimeouts(session: {
   readonly config?: {
@@ -206,6 +220,11 @@ export function createWaitAgentTool(opts: MultiAgentV2Options): Tool {
         callId: waitCallId,
       },
     });
+    // Read the turn before the wait, not after it: an interrupt can replace the
+    // turn while this wait is still sleeping, and charging the result to
+    // whatever turn is active on resume would bill the new turn for time it
+    // never spent.
+    const turnId = currentTurnId(sessionOrError);
     // The executor injects the turn's abort signal; a stopped swarm used to
     // hold its parent turn open until this wait's deadline (#2201).
     const abortSignal = (args as { readonly __abortSignal?: AbortSignal })
@@ -263,10 +282,11 @@ export function createWaitAgentTool(opts: MultiAgentV2Options): Tool {
         ...(updates.length > 0 ? { updates } : {}),
       });
     }
-    const streak = waitTimeoutStreaks.get(sessionOrError) ?? {
-      consecutive: 0,
-      waitedMs: 0,
-    };
+    const carried = waitTimeoutStreaks.get(sessionOrError);
+    const streak =
+      carried !== undefined && carried.turnId === turnId
+        ? carried
+        : { turnId, consecutive: 0, waitedMs: 0 };
     streak.consecutive += 1;
     streak.waitedMs += timeoutMs;
     waitTimeoutStreaks.set(sessionOrError, streak);

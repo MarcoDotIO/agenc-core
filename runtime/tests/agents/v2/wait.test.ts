@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Session } from "../../session/session.js";
+import { mkSession } from "../../fixtures.js";
 import { createWaitAgentTool } from "./wait.js";
 import type { MultiAgentV2Options } from "./common.js";
 
@@ -11,8 +12,10 @@ function fixture(options?: {
     async (_timeoutMs: number, _ownership?: unknown, _signal?: AbortSignal) => false,
   );
   const emit = vi.fn();
+  const turn = { turnId: "turn-1" };
   const session = {
     conversationId: options?.conversationId ?? "root-session",
+    activeTurn: { unsafePeek: () => turn },
     emit,
     nextInternalSubId: () => "sub-1",
     waitForMailboxChange,
@@ -56,7 +59,14 @@ function fixture(options?: {
     }),
   } as unknown as MultiAgentV2Options;
   const tool = createWaitAgentTool(opts);
-  return { tool, session, waitForMailboxChange, listAgents, registerSessionRoot };
+  return {
+    tool,
+    session,
+    turn,
+    waitForMailboxChange,
+    listAgents,
+    registerSessionRoot,
+  };
 }
 
 async function call(tool: ReturnType<typeof createWaitAgentTool>, args = {}) {
@@ -158,11 +168,130 @@ describe("wait_agent consecutive timeouts", () => {
     expect(result.body).toMatchObject({ waited_ms: 60_000 });
   });
 
+  it("gives each turn its own budget", async () => {
+    const { tool, turn } = fixture();
+    for (let n = 1; n <= 3; n += 1) await call(tool);
+    expect((await call(tool)).isError).toBe(true);
+    // The next turn asks a fresh agent to work: the budget the previous
+    // turn spent must not fail its first wait.
+    turn.turnId = "turn-2";
+    const first = await call(tool);
+    expect(first.isError).toBeUndefined();
+    expect(first.body).toEqual({
+      message: "Wait timed out.",
+      timed_out: true,
+      consecutive_timeouts: 1,
+      waited_ms: 30_000,
+    });
+  });
+
+  it("charges a wait to the turn that started it, not the one that replaced it", async () => {
+    const { tool, turn, waitForMailboxChange } = fixture();
+    let releaseWait!: () => void;
+    waitForMailboxChange.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => {
+        releaseWait = resolve;
+      });
+      return false;
+    });
+    const inFlight = call(tool);
+    await Promise.resolve();
+    // An interrupt starts the next turn while the wait is still sleeping;
+    // `waitForMailboxChange` has no abort signal, so it keeps running.
+    turn.turnId = "turn-2";
+    releaseWait();
+    await inFlight;
+    const first = await call(tool);
+    expect(first.isError).toBeUndefined();
+    expect(first.body).toEqual({
+      message: "Wait timed out.",
+      timed_out: true,
+      consecutive_timeouts: 1,
+      waited_ms: 30_000,
+    });
+  });
+
   it("keeps streaks per session", async () => {
     const a = fixture({ conversationId: "a" });
     const b = fixture({ conversationId: "b" });
     for (let n = 0; n < 3; n += 1) await call(a.tool);
     expect((await call(b.tool)).body).toMatchObject({ consecutive_timeouts: 1 });
     expect((await call(a.tool)).isError).toBe(true);
+  });
+});
+
+describe("wait_agent turn budget on a real Session", () => {
+  /**
+   * The unit fixture above supplies its own `activeTurn` stub, so it cannot
+   * tell whether the tool still reads the turn the runtime actually keeps.
+   * Here only the sleep is stubbed: the turn ids, the `activeTurn` lock and
+   * the spawn/finish boundary are the production ones.
+   */
+  function realFixture(): {
+    readonly session: Session;
+    readonly tool: ReturnType<typeof createWaitAgentTool>;
+  } {
+    const { session } = mkSession();
+    vi.spyOn(session, "waitForMailboxChange").mockResolvedValue(false);
+    const opts = {
+      getSession: () => session,
+      workspace: {},
+      ensureAgentControl: () => ({
+        control: {
+          registerSessionRoot: () => {},
+          listAgents: () => [],
+          getLive: () => undefined,
+        },
+        registry: {},
+      }),
+    } as unknown as MultiAgentV2Options;
+    return { session, tool: createWaitAgentTool(opts) };
+  }
+
+  it("spends the budget within a live turn and restarts it in the next", async () => {
+    const { session, tool } = realFixture();
+    await session.spawnTask({ subId: "turn-A", kind: "regular" });
+    for (let n = 1; n <= 3; n += 1) {
+      expect((await call(tool)).body).toMatchObject({
+        consecutive_timeouts: n,
+      });
+    }
+    expect((await call(tool)).isError).toBe(true);
+
+    await session.onTaskFinished("turn-A");
+    await session.spawnTask({ subId: "turn-B", kind: "regular" });
+    const first = await call(tool);
+    expect(first.isError).toBeUndefined();
+    expect(first.body).toEqual({
+      message: "Wait timed out.",
+      timed_out: true,
+      consecutive_timeouts: 1,
+      waited_ms: 30_000,
+    });
+  });
+
+  it("does not charge the replacing turn for a wait started under the old one", async () => {
+    const { session, tool } = realFixture();
+    await session.spawnTask({ subId: "turn-A", kind: "regular" });
+    let releaseWait!: () => void;
+    vi.mocked(session.waitForMailboxChange).mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => {
+        releaseWait = resolve;
+      });
+      return false;
+    });
+    const inFlight = call(tool);
+    await Promise.resolve();
+    // The ordinary interrupt-then-resend path: `spawnTask` aborts turn-A and
+    // installs turn-B while turn-A's wait is still sleeping.
+    await session.spawnTask({ subId: "turn-B", kind: "regular" });
+    releaseWait();
+    await inFlight;
+    const first = await call(tool);
+    expect(first.isError).toBeUndefined();
+    expect(first.body).toMatchObject({
+      consecutive_timeouts: 1,
+      waited_ms: 30_000,
+    });
   });
 });
