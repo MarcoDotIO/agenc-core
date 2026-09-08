@@ -408,7 +408,9 @@ describe("canonical rollout compaction scanner", () => {
       expect(readdirSync(sessionTempRoot)).toEqual([]);
 
       // The bookkeeping that reduces no history is the repeat-heavy part of a
-      // compaction step, and the ceiling does not cost it its prefix.
+      // compaction step, so an active history this size is not what costs it
+      // its prefix. It is charged for hydrated lifecycle payload instead,
+      // which this rollout has none of; the two tests below charge it.
       const bookkeeping = { ...options, captureActiveHistory: false } as const;
       scanner.scan(rolloutPath, bookkeeping);
       expect(readdirSync(sessionTempRoot)).toHaveLength(2);

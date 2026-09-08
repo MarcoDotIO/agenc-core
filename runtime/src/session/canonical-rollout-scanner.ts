@@ -354,9 +354,26 @@ const MAX_VALIDATED_PREFIXES = 2;
  * `MAX_COMPACTION_LIFECYCLE_RECORDS` bounds how many rows a prefix retains,
  * not how large one is, and a rollback row holds the entire pre-compaction
  * conversation. A prefix past this ceiling answers its scan and is then
- * released: the sessions large enough to reach it are the ones that can least
- * afford a second copy, and the bookkeeping that stays small - six of the
- * eight calls per compaction step - keeps its prefix either way.
+ * released, and the next scan replays the whole file exactly as it did before
+ * this scanner existed: past the ceiling there is no regression and no gain,
+ * so the reuse this file buys is only ever claimed below it.
+ *
+ * Where the ceiling actually bites, measured on real rollouts rather than
+ * argued: the one call per compaction step that reduces active history loses
+ * its prefix as soon as the session's own active history passes the ceiling,
+ * which is the shape #2229 opens with. The other seven reduce none, so they
+ * are charged only for what their lifecycle rows hydrate, and that is charged
+ * in persisted canonical bytes: about 266 B for every message a committed
+ * compaction pins, so a rollout carrying sixteen 1,000-message compactions
+ * releases even that prefix, while one rollback is charged the whole
+ * pre-compaction conversation and releases it at once.
+ *
+ * The charge is not what the prefix holds. A persisted ref hydrates back into
+ * a much larger object than its canonical bytes, so the count runs under the
+ * heap: eight such compactions counted 2.1 MB here and held 4.2 MB of settled
+ * heap. That keeps the bound a small constant - a few times this ceiling,
+ * times `MAX_VALIDATED_PREFIXES` - rather than the session-scaled retention
+ * the ceiling exists to prevent, but the constant is not this number.
  */
 const MAX_RETAINED_PREFIX_BYTES = 4 * 1_024 * 1_024;
 
@@ -1045,6 +1062,10 @@ function observeCanonicalRecord(
   const lifecycleAttemptId = item.payload.attempt_id;
   if (item.type === "compaction_intent") {
     state.attempts.set(lifecycleAttemptId, {
+      // Persisted intents arrive hydrated, and their bytes were counted
+      // against the retention ceiling on the way through the payload
+      // registry. An inline intent is retained here uncounted: no writer
+      // emits that shape today, and one that did would need counting here.
       intent: item.payload,
       records: [record],
       calls: new Map(),

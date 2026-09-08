@@ -28,8 +28,14 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
-import type { CompactionPreparedSourceV1 } from "../../src/services/compact/transaction-types.js";
+import {
+  COMPACTION_SOURCE_DIGEST_DOMAIN,
+  type CompactionPreparedSourceV1,
+} from "../../src/services/compact/transaction-types.js";
+import { compactConversationTransactionally } from "../../src/services/compact/transaction.js";
+import { scanCanonicalRollout } from "../../src/session/canonical-rollout-scanner.js";
 import { RolloutStore } from "../../src/session/rollout-store.js";
+import { bindCompactionTransactionHarness } from "../helpers/compaction-transaction-harness.js";
 
 let temporaryHome = "";
 let previousHome: string | undefined;
@@ -91,6 +97,73 @@ describe("canonical rollout scan reuse", () => {
     }
   });
 
+  it("reads a compacted session a whole replay cheaper", async () => {
+    const store = createStore("scan-reuse-compacted", 600);
+    try {
+      await commitWholeHistory(store, "compacted-attempt");
+      // One scan to take in the compaction's own tail: the claim below is
+      // about what the scans after that owe the file.
+      store.prepareSource("settle-attempt", []);
+      const size = statSync(store.rolloutPath).size;
+      // What this scan costs without a validated prefix, on these exact
+      // bytes: the two passes every scan owed before #2229.
+      const replay = measure(() =>
+        scanCanonicalRollout(
+          store.rolloutPath,
+          fullReplayOptions("scan-reuse-compacted"),
+        ),
+      );
+      const warm = measure(() => store.prepareSource("warm-attempt", []));
+
+      // The rollout really carries a committed compaction, and the prepared
+      // source is the history that compaction left active.
+      expect(replay.value.attempts.size).toBe(1);
+      expect(warm.value.messages.length).toBe(
+        replay.value.activeHistory?.messages.length,
+      );
+      expect(warm.value.messages.length).toBeLessThan(600);
+      expect(replay.bytes - warm.bytes).toBeGreaterThan(size * 0.9);
+    } finally {
+      store.close();
+    }
+  }, 180_000);
+
+  it("replays a compacted session past the retention ceiling", async () => {
+    const store = createStore("scan-reuse-ceiling", 200);
+    try {
+      await commitWholeHistory(store, "ceiling-attempt");
+      // Active history back over MAX_RETAINED_PREFIX_BYTES: past the ceiling
+      // a prefix answers its scan and is released, so the next scan replays.
+      appendRows(store, 1_200, 4_096);
+      const size = statSync(store.rolloutPath).size;
+      const replay = measure(() =>
+        scanCanonicalRollout(
+          store.rolloutPath,
+          fullReplayOptions("scan-reuse-ceiling"),
+        ),
+      );
+      const first = measure(() => store.prepareSource("first-attempt", []));
+      const second = measure(() => store.prepareSource("second-attempt", []));
+
+      // The same shape saves a whole replay below the ceiling, one test up.
+      // What is different here is only how much history the scan reduces.
+      const active = replay.value.activeHistory?.messages.length;
+      expect(replay.value.attempts.size).toBe(1);
+      expect(active).toBeGreaterThan(1_200);
+      expect(replay.bytes - second.bytes).toBeLessThan(size * 0.1);
+      // No regression either: what the released prefix costs is a replay, and
+      // a replay answers exactly what the full scan of the same bytes does.
+      expect(second.value.messages.length).toBe(active);
+      expect(second.value.messages).toEqual(first.value.messages);
+      expect(second.value.source.history_digest).toBe(
+        first.value.source.history_digest,
+      );
+      expect(pinnedRows(second.value)).toEqual(pinnedRows(first.value));
+    } finally {
+      store.close();
+    }
+  }, 180_000);
+
   it("rejects a rollout whose validated prefix changed underneath it", () => {
     const store = createStore("scan-reuse-corruption", 200);
     try {
@@ -108,6 +181,65 @@ describe("canonical rollout scan reuse", () => {
     }
   });
 });
+
+/** The scan `prepareSource` asks for, without a scanner to reuse a prefix. */
+function fullReplayOptions(sessionId: string) {
+  return {
+    sessionTempRoot: join(temporaryHome, "rollout-temp"),
+    expectedRunId: sessionId,
+    expectedEpoch: 1,
+    maximumScanMilliseconds: 120_000,
+    compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
+    captureActiveHistory: true,
+  } as const;
+}
+
+/** Commit one whole-history compaction through the real transaction. */
+async function commitWholeHistory(
+  store: RolloutStore,
+  attemptId: string,
+): Promise<void> {
+  const prepared = store.prepareSource(attemptId, []);
+  const harness = bindCompactionTransactionHarness(store, {
+    contextWindowTokens: 2_000_000,
+    maxOutputTokens: 512,
+  });
+  try {
+    const result = await compactConversationTransactionally(harness.context, {
+      customInstructions: "canonical scan reuse",
+      automatic: false,
+      messagesToKeep: [],
+      completeSourceMessages: prepared.messages,
+      messagesToSummarize: prepared.messages,
+      summaryPlacement: "before_keep",
+      createBoundaryMarker: () => ({
+        role: "user",
+        originalRole: "developer",
+        content: "compaction boundary",
+      }),
+      createSummaryMessage: (content) => ({ role: "user", content }),
+    });
+    if (result.transaction === undefined) {
+      throw new Error("compaction did not commit a transaction");
+    }
+  } finally {
+    harness.close();
+    store.flushDurable();
+  }
+}
+
+function appendRows(store: RolloutStore, rows: number, fill: number): void {
+  for (let index = 0; index < rows; index += 1) {
+    store.appendRollout({
+      type: "response_item",
+      payload: {
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `grown-${String(index).padStart(4, "0")}-${"x".repeat(fill)}`,
+      },
+    });
+  }
+  store.flushDurable();
+}
 
 function createStore(sessionId: string, rows: number): RolloutStore {
   const store = new RolloutStore({
