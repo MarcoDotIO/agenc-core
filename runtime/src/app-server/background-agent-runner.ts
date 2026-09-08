@@ -262,6 +262,7 @@ import {
   isInterruptibleActiveAgent,
   hasRuntimeActiveTurn,
   hasOpenAgentDescendants,
+  stoppingAgentSuffix,
   runtimeActiveTurnId,
   isClearInFlight,
   shellSubmissionMessageId,
@@ -1899,9 +1900,6 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     if (active === undefined || !isRunnableActiveAgent(active)) {
       throw new Error(`AgenC daemon agent not running: ${agentId}`);
     }
-    // The user speaks again: child receipts held since a stop may now start
-    // follow-up turns (#2236).
-    active.bootstrap.session.clearUserStop?.();
     const contentFingerprint = messageContentFingerprint(
       params.originalContent,
     );
@@ -1943,9 +1941,23 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         active.pendingShellExecutionCount > 0 ||
         hasRuntimeActiveTurn(active.bootstrap.session))
     ) {
+      // A stop the user asked for is still unwinding: a swarm's children each
+      // have their own model call and tool work to finish, so the busy window
+      // outlives the click by far more than the client expects (#2201). Say
+      // that instead of "already has an active turn", which reads as work the
+      // user never stopped.
+      const stopping =
+        active.bootstrap.session.stoppedByUserSinceLastPrompt === true;
+      const stillStopping = stopping
+        ? stoppingAgentSuffix(active.control, active.thread.threadId)
+        : "";
       throw new AgenCBackgroundAgentMessageError(
         "TURN_IN_PROGRESS",
-        `session ${params.sessionId} already has an active or queued turn`,
+        stopping
+          ? `session ${params.sessionId} is still stopping the turn you ` +
+            `interrupted${stillStopping}; it accepts the next prompt once the ` +
+            `stop lands`
+          : `session ${params.sessionId} already has an active or queued turn`,
       );
     }
     // A history the live tool-pair validator has closed cannot take the user
@@ -1978,6 +1990,11 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       promise,
       settled: false,
     };
+    // The user speaks again: child receipts held since a stop may now start
+    // follow-up turns (#2236). Only an admitted message counts — a refused one
+    // never reaches the session, so releasing the latch there let a receipt
+    // restart the very work the user stopped (#2201).
+    active.bootstrap.session.clearUserStop?.();
     active.messageSubmissionsById.set(params.messageId, submission);
     active.pendingMessageSubmissionCount += 1;
 

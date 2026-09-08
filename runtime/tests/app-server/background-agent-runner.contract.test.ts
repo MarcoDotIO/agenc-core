@@ -737,6 +737,9 @@ function makeTopLevelRunner(opts: {
   };
   let nextInternalSubId = 0;
   const sessionAbortController = new AbortController();
+  // The real Session latches a client Stop until the next user message; the
+  // stub carries the same state so tests can read it, not just the calls.
+  let stoppedByUserSinceLastPrompt = false;
   const session = {
     abortController: sessionAbortController,
     abortTerminal: vi.fn((reason: string) => {
@@ -807,8 +810,15 @@ function makeTopLevelRunner(opts: {
       unsafePeek: () => sessionState,
     },
     abortAllTasks: vi.fn(async () => {}),
-    markStoppedByUser: vi.fn(),
-    clearUserStop: vi.fn(),
+    markStoppedByUser: vi.fn(() => {
+      stoppedByUserSinceLastPrompt = true;
+    }),
+    clearUserStop: vi.fn(() => {
+      stoppedByUserSinceLastPrompt = false;
+    }),
+    get stoppedByUserSinceLastPrompt() {
+      return stoppedByUserSinceLastPrompt;
+    },
     trackDurableOperation: <T>(operation: Promise<T>): Promise<T> => {
       durableOperations.add(operation);
       void operation.then(
@@ -9083,6 +9093,82 @@ describe("AgenC delegate background-agent runner", () => {
       "legacy queued turn",
       expect.objectContaining({ displayUserMessage: "legacy queued turn" }),
     );
+  });
+
+  it("[managed-thread] a prompt refused while a stop unwinds keeps the stop latched and names it", async () => {
+    const initialSubmissionStarted = Promise.withResolvers<void>();
+    const releaseInitialSubmission = Promise.withResolvers<void>();
+    const { runner, session, control, stub } = makeTopLevelRunner({
+      conversationId: "session-stop-refusal",
+      threadInitialStatus: { status: "pending_init" } as AgentStatus,
+    });
+    stub.thread.submit.mockImplementationOnce(async () => {
+      initialSubmissionStarted.resolve();
+      await releaseInitialSubmission.promise;
+      return "session-stop-refusal";
+    });
+    await runner.startAgent({
+      objective: "fan the work out to a swarm",
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    await initialSubmissionStarted.promise;
+    const child = (name: string, depth: number) =>
+      [name, { agentId: name, agentPath: `/root/${name}`, depth }] as const;
+    control.openThreadSpawnChildren.mockReturnValue([child("worker-1", 1)]);
+    control.liveThreadSpawnChildren.mockReturnValue(
+      new Map<string, ReadonlyArray<readonly [string, unknown]>>([
+        ["session-stop-refusal", [child("worker-1", 1), child("worker-2", 1)]],
+        ["worker-1", [child("worker-1/helper", 2)]],
+      ]),
+    );
+
+    expect(
+      await runner.interruptAgentTurn("session-stop-refusal", "user_cancel"),
+    ).toBe(true);
+    expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+
+    // #2201: the stopped turn is still unwinding, so the next prompt is
+    // refused. The refusal must say the session is stopping, and must not
+    // spend the stop latch — the user's words never entered the session, so
+    // a child receipt arriving next would restart the stopped work (#2236).
+    const refusal = await runner
+      .submitAgentMessage("session-stop-refusal", {
+        sessionId: "session_1",
+        content: "never mind, do something else",
+        originalContent: "never mind, do something else",
+        messageId: "refused-after-stop",
+        streamId: "refused-after-stop",
+        acceptedAt: "2026-09-07T00:00:00.000Z",
+        ifBusy: "reject",
+      })
+      .then(
+        (result) => result as unknown,
+        (error: unknown) => error,
+      );
+    expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+    expect(refusal).toBeInstanceOf(Error);
+    expect(refusal).toMatchObject({
+      code: "TURN_IN_PROGRESS",
+      // Names the stop, and counts the whole subtree still unwinding under it.
+      message: expect.stringContaining(
+        "is still stopping the turn you interrupted (3 agents still stopping)",
+      ),
+    });
+
+    // A prompt the daemon does admit still releases the latch.
+    releaseInitialSubmission.resolve();
+    await expect(
+      runner.submitAgentMessage("session-stop-refusal", {
+        sessionId: "session_1",
+        content: "do something else",
+        originalContent: "do something else",
+        messageId: "admitted-after-stop",
+        streamId: "admitted-after-stop",
+        acceptedAt: "2026-09-07T00:00:01.000Z",
+      }),
+    ).resolves.toMatchObject({ disposition: "started" });
+    expect(session.stoppedByUserSinceLastPrompt).toBe(false);
   });
 
   it("[managed-thread] accepts the first opt-in-admission message on a deferred spawn still in pending_init", async () => {
