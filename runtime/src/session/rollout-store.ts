@@ -162,7 +162,7 @@ import {
   reconstructCompactionPayloadV1,
 } from "../services/compact/payload-manifest.js";
 import {
-  scanCanonicalRollout,
+  CanonicalRolloutScanner,
   type CanonicalCompactionAttemptScan,
   type CanonicalRolloutScan,
 } from "./canonical-rollout-scanner.js";
@@ -767,6 +767,12 @@ export class RolloutStore {
   private readonly afterCompactionSourcePruneRewriteForTestingOnly?: () => void;
   private readonly afterCompactionRollbackAppendForTestingOnly?: () => void;
   private readonly nowMilliseconds: () => number;
+  /**
+   * One scanner for this store's rollout: compaction bookkeeping scans it
+   * several times per step, and the scanner replays only what was appended
+   * since its last scan instead of the whole session.
+   */
+  private readonly canonicalScanner = new CanonicalRolloutScanner();
   private readonly durablyCommittedCompactionsAwaitingReconstruction =
     new Set<string>();
   private readonly compactionSourcePayloadBundles = new Map<
@@ -959,6 +965,7 @@ export class RolloutStore {
       if (this.startScheduler) this.scheduler.start();
     } catch (error) {
       this.scheduler.stop();
+      this.canonicalScanner.close();
       this.store.close();
       this.stateDriver.close();
       throw error;
@@ -1021,7 +1028,7 @@ export class RolloutStore {
   ): CompactionPreparedSourceV1 {
     this.store.upgradeCanonicalSchemaHeader(ROLLOUT_SCHEMA_VERSION);
     this.store.syncCanonicalTail();
-    const scan = scanCanonicalRollout(this.rolloutPath, {
+    const scan = this.canonicalScanner.scan(this.rolloutPath, {
       sessionTempRoot: this.sessionTempRoot,
       expectedRunId: this.sessionId,
       expectedEpoch: this.runEpoch,
@@ -1241,7 +1248,7 @@ export class RolloutStore {
     const candidates = this.compactionRetentionRepo.listActiveForSourceBinding(
       source.source_binding,
     );
-    const scan = scanCanonicalRollout(this.rolloutPath, {
+    const scan = this.canonicalScanner.scan(this.rolloutPath, {
       sessionTempRoot: this.sessionTempRoot,
       expectedRunId: source.session_id,
       expectedEpoch: this.runEpoch,
@@ -1536,7 +1543,7 @@ export class RolloutStore {
 
   private assertCompactionCommitFresh(intent: CompactionIntentV1): void {
     this.store.syncCanonicalTail();
-    const scan = scanCanonicalRollout(this.rolloutPath, {
+    const scan = this.canonicalScanner.scan(this.rolloutPath, {
       sessionTempRoot: this.sessionTempRoot,
       expectedRunId: intent.source.session_id,
       expectedEpoch: this.runEpoch,
@@ -1725,7 +1732,7 @@ export class RolloutStore {
       );
     }
     this.store.syncCanonicalTail();
-    const scan = scanCanonicalRollout(this.rolloutPath, {
+    const scan = this.canonicalScanner.scan(this.rolloutPath, {
       sessionTempRoot: this.sessionTempRoot,
       expectedRunId: pin.sessionId,
       expectedEpoch: this.runEpoch,
@@ -2123,7 +2130,7 @@ export class RolloutStore {
       );
     }
     this.store.syncCanonicalTail();
-    const scan = scanCanonicalRollout(this.rolloutPath, {
+    const scan = this.canonicalScanner.scan(this.rolloutPath, {
       sessionTempRoot: this.sessionTempRoot,
       expectedRunId: pin.sessionId,
       expectedEpoch: this.runEpoch,
@@ -2317,7 +2324,7 @@ export class RolloutStore {
       );
     }
     this.store.syncCanonicalTail();
-    const scan = scanCanonicalRollout(this.rolloutPath, {
+    const scan = this.canonicalScanner.scan(this.rolloutPath, {
       sessionTempRoot: this.sessionTempRoot,
       expectedRunId: pin.sessionId,
       expectedEpoch: this.runEpoch,
@@ -2453,7 +2460,7 @@ export class RolloutStore {
   private compactionSourcePrefixMatches(pin: CompactionPinRecord): boolean {
     try {
       this.store.syncCanonicalTail();
-      const scan = scanCanonicalRollout(this.rolloutPath, {
+      const scan = this.canonicalScanner.scan(this.rolloutPath, {
         sessionTempRoot: this.sessionTempRoot,
         expectedRunId: pin.sessionId,
         expectedEpoch: this.runEpoch,
@@ -2476,7 +2483,7 @@ export class RolloutStore {
     const existingPins = this.compactionRetentionRepo.listSession(
       this.sessionId,
     );
-    const scan = scanCanonicalRollout(this.rolloutPath, {
+    const scan = this.canonicalScanner.scan(this.rolloutPath, {
       sessionTempRoot: this.sessionTempRoot,
       expectedRunId: this.sessionId,
       ...(this.reopenTerminalRun ? {} : { expectedEpoch: this.runEpoch }),
@@ -3717,6 +3724,7 @@ export class RolloutStore {
 
   close(): void {
     this.scheduler.stop();
+    this.canonicalScanner.close();
     this.stateDriver.close();
     this.store.close();
   }
