@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync, rmSync } from "node:fs";
+import { readFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { writeDurableAtomicFileSync } from "../utils/durable-atomic-file.js";
@@ -38,6 +38,91 @@ export interface DaemonHeartbeatProcess {
 
 export function resolveAgenCDaemonHeartbeatPath(daemonHome: string): string {
   return join(daemonHome, AGENC_DAEMON_HEARTBEAT_FILENAME);
+}
+
+/**
+ * The heartbeat left behind by a daemon that died where no handler could run.
+ * The replacement autostarts seconds later and its first beat overwrote the
+ * file, so the only record of the exit was gone before anyone could read it
+ * (#2199). A starting daemon moves it here, and nothing but the next such
+ * exit replaces it.
+ */
+export const AGENC_DAEMON_PREVIOUS_HEARTBEAT_FILENAME =
+  "daemon-heartbeat.prev.json";
+
+export function resolveAgenCDaemonPreviousHeartbeatPath(
+  daemonHome: string,
+): string {
+  return join(daemonHome, AGENC_DAEMON_PREVIOUS_HEARTBEAT_FILENAME);
+}
+
+export interface ClaimedDaemonHeartbeat {
+  readonly heartbeat: DaemonHeartbeat;
+  /**
+   * Where the heartbeat was kept, or null when it could not be moved out of
+   * the way of this daemon's first beat and is about to be overwritten.
+   */
+  readonly keptPath: string | null;
+}
+
+/**
+ * Keep the heartbeat of the daemon this one replaced, and return it to be
+ * reported. A clean stop removes the file, so a heartbeat whose process is
+ * gone is an exit that ran no handler: a SIGKILL, or an abort with crash
+ * reporting off. A heartbeat whose pid is still alive belongs to a live
+ * daemon and is left where it is, so a takeover never blinds `status`.
+ */
+export function claimAbandonedDaemonHeartbeat(options: {
+  readonly path: string;
+  readonly previousPath: string;
+  readonly pid: number;
+  readonly isPidRunning: (pid: number) => boolean;
+}): ClaimedDaemonHeartbeat | null {
+  const heartbeat = readAgenCDaemonHeartbeat(options.path);
+  if (heartbeat === null || heartbeat.pid === options.pid) return null;
+  if (options.isPidRunning(heartbeat.pid)) return null;
+  try {
+    renameSync(options.path, options.previousPath);
+  } catch {
+    // Another starting daemon claimed it first, or it cannot be kept. Report
+    // it only while it is still on disk, so a race does not report it twice.
+    const current = readAgenCDaemonHeartbeat(options.path);
+    if (current?.pid !== heartbeat.pid || current.beat !== heartbeat.beat) {
+      return null;
+    }
+    return { heartbeat, keptPath: null };
+  }
+  return { heartbeat, keptPath: options.previousPath };
+}
+
+/**
+ * The line a starting daemon writes about the exit it replaced. It names the
+ * kept file only when the keep succeeded: pointing an operator at a path that
+ * holds nothing is worse than leaving the record inline, which it already is.
+ */
+export function describeClaimedDaemonExit(
+  claim: ClaimedDaemonHeartbeat,
+  nowMs: number,
+): string {
+  return (
+    describeAbandonedDaemonExit(claim.heartbeat, nowMs) +
+    (claim.keptPath === null
+      ? "; it could not be kept, so this line is all that is left of it"
+      : `; kept at ${claim.keptPath}`)
+  );
+}
+
+/** One line for the daemon's log and for `status`: which daemon this one replaced. */
+export function describeAbandonedDaemonExit(
+  heartbeat: DaemonHeartbeat,
+  nowMs: number,
+): string {
+  return (
+    `the previous daemon (pid ${heartbeat.pid}) exited without recording a reason; ` +
+    `its last heartbeat was at ${heartbeat.at}, ` +
+    `${describeHeartbeatAge(heartbeatAgeSeconds(heartbeat, nowMs))} ago: ` +
+    describeDaemonHeartbeatVitals(heartbeat)
+  );
 }
 
 /**
@@ -124,6 +209,26 @@ export function heartbeatAgeSeconds(heartbeat: DaemonHeartbeat, nowMs: number): 
 export function isDaemonHeartbeatFresh(heartbeat: DaemonHeartbeat, nowMs: number): boolean {
   const ageMs = nowMs - Date.parse(heartbeat.at);
   return ageMs >= 0 ? ageMs <= AGENC_DAEMON_HEARTBEAT_FRESH_MS : true;
+}
+
+/**
+ * Nothing expires the kept record, so its age is read months after the exit.
+ * Raw seconds stop carrying that ("2678400 s ago"), so it is written the way
+ * the uptime beside it on the same line is.
+ */
+function describeHeartbeatAge(seconds: number): string {
+  if (seconds < 60) return `${seconds} s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min`;
+  if (seconds < 86400) {
+    const minutes = Math.floor((seconds % 3600) / 60);
+    return minutes === 0
+      ? `${Math.floor(seconds / 3600)} h`
+      : `${Math.floor(seconds / 3600)} h ${minutes} min`;
+  }
+  const hours = Math.floor((seconds % 86400) / 3600);
+  return hours === 0
+    ? `${Math.floor(seconds / 86400)} d`
+    : `${Math.floor(seconds / 86400)} d ${hours} h`;
 }
 
 function describeUptime(uptimeS: number): string {
