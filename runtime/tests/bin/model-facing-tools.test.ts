@@ -142,6 +142,9 @@ function fakeSession(cwd = process.cwd()): Session {
   } as const;
   return {
     conversationId: "session-test",
+    // The runtime's active-turn slot: tools read the live turn id off it,
+    // and these fixtures run outside any turn.
+    activeTurn: { unsafePeek: () => null },
     roleWorkspace,
     agentDefinitions: {
       agentRoleWorkspaceId: roleWorkspace.id,
