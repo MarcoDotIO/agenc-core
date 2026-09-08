@@ -7,6 +7,7 @@ import {
   AGENC_DAEMON_HEARTBEAT_FRESH_MS,
   claimAbandonedDaemonHeartbeat,
   describeAbandonedDaemonExit,
+  describeClaimedDaemonExit,
   describeDaemonHeartbeat,
   describeUnboundDaemonHeartbeat,
   installAgenCDaemonHeartbeat,
@@ -158,7 +159,8 @@ describe("daemon heartbeat", () => {
         pid: proc.pid,
         isPidRunning: () => false,
       });
-      expect(claimed?.pid).toBe(79303);
+      expect(claimed?.heartbeat.pid).toBe(79303);
+      expect(claimed?.keptPath).toBe(previousPath);
       expect(existsSync(path)).toBe(false);
       const dispose = installAgenCDaemonHeartbeat({ path, intervalMs: 1_000, proc });
       try {
@@ -218,7 +220,38 @@ describe("daemon heartbeat", () => {
       });
       // The rename failed but the evidence is still there and about to be
       // overwritten, so it is reported rather than lost in silence.
-      expect(stillOnDisk?.pid).toBe(79303);
+      expect(stillOnDisk?.heartbeat.pid).toBe(79303);
+      expect(stillOnDisk?.keptPath).toBeNull();
+    });
+
+    // The line used to name the kept file whether or not the keep worked, so
+    // an operator whose `.prev.json` could not be written was sent to a path
+    // holding nothing.
+    it("names the kept file only when the heartbeat was kept", () => {
+      const heartbeat = { ...readOrSample(), pid: 79303 };
+      const nowMs = Date.parse("2026-09-06T12:39:45.000Z");
+      expect(
+        describeClaimedDaemonExit({ heartbeat, keptPath: "/tmp/kept.json" }, nowMs),
+      ).toBe(`${describeAbandonedDaemonExit(heartbeat, nowMs)}; kept at /tmp/kept.json`);
+      expect(describeClaimedDaemonExit({ heartbeat, keptPath: null }, nowMs)).toBe(
+        `${describeAbandonedDaemonExit(heartbeat, nowMs)}; ` +
+          "it could not be kept, so this line is all that is left of it",
+      );
+    });
+
+    // Nothing expires the kept record: it is still being read when its age has
+    // run into days, where raw seconds say nothing.
+    it("writes the age of a long-kept exit the way it writes uptime", () => {
+      const heartbeat = { ...readOrSample(), pid: 79303 };
+      const at = Date.parse(heartbeat.at);
+      const ageIn = (ms: number) =>
+        describeAbandonedDaemonExit(heartbeat, at + ms).match(/at \S+, (.+) ago:/)?.[1];
+      expect(ageIn(45_000)).toBe("45 s");
+      expect(ageIn(95_000)).toBe("1 min");
+      expect(ageIn(3 * 3_600_000 + 20 * 60_000)).toBe("3 h 20 min");
+      expect(ageIn(2 * 3_600_000)).toBe("2 h");
+      expect(ageIn(31 * 86_400_000)).toBe("31 d");
+      expect(ageIn(31 * 86_400_000 + 5 * 3_600_000)).toBe("31 d 5 h");
     });
   });
 

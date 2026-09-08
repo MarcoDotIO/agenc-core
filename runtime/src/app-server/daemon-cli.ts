@@ -63,8 +63,12 @@ import {
   writeDaemonRuntimeInfo,
 } from "./daemon-runtime-info.js";
 import {
+  AGENC_DAEMON_HEARTBEAT_FRESH_MS,
+  AGENC_DAEMON_PREVIOUS_HEARTBEAT_FILENAME,
   claimAbandonedDaemonHeartbeat,
+  type DaemonHeartbeat,
   describeAbandonedDaemonExit,
+  describeClaimedDaemonExit,
   describeUnboundDaemonHeartbeat,
   heartbeatAgeSeconds,
   installAgenCDaemonHeartbeat,
@@ -1946,11 +1950,15 @@ async function stopAgenCDaemon(
         removeDaemonRuntimeInfo(runtimeInfoPath, runtimeInfo.instanceId);
       }
     }
-    reportLastDaemonHeartbeat(
-      io,
-      resolveAgenCDaemonHeartbeatPath(daemonHome),
-      pid,
-    );
+    if (
+      !reportLastDaemonHeartbeat(
+        io,
+        resolveAgenCDaemonHeartbeatPath(daemonHome),
+        pid,
+      )
+    ) {
+      reportKeptDaemonExit(io, daemonHome);
+    }
     io.stdout.write(`AgenC daemon stopped (pid ${pid})\n`);
     return 0;
   });
@@ -2124,6 +2132,30 @@ async function waitForBoundPidExit(
 }
 
 /**
+ * The spawn capture that belongs to this exit, or null. Every spawn rotates
+ * the capture but only an unexplained exit rotates the heartbeat, so the two
+ * agree at the autostart that replaced the dead daemon and drift apart at the
+ * next restart. A capture written after the dead daemon's last beat is a later
+ * spawn's, and naming it here would send an operator to the wrong file.
+ */
+function spawnStderrCaptureOfExit(
+  heartbeat: DaemonHeartbeat,
+  path: string,
+): string | null {
+  let writtenAtMs: number;
+  try {
+    writtenAtMs = statSync(path).mtimeMs;
+  } catch {
+    return null; // never captured, or already cleaned up
+  }
+  // The dead daemon stopped writing when it died, which is its last beat plus
+  // at most the beats it never sent.
+  const lastItCouldHaveWrittenMs =
+    Date.parse(heartbeat.at) + AGENC_DAEMON_HEARTBEAT_FRESH_MS;
+  return writtenAtMs <= lastItCouldHaveWrittenMs ? path : null;
+}
+
+/**
  * The unexplained exit the running daemon replaced, kept until it is
  * diagnosed. The heartbeat says what the dead process last reported about
  * itself; the spawn capture holds whatever it managed to write to stderr.
@@ -2139,11 +2171,34 @@ function reportReplacedDaemonExit(
   io.stdout.write(
     `  replaced: ${describeAbandonedDaemonExit(heartbeat, Date.now())}\n`,
   );
-  io.stdout.write(
-    `  evidence: ${previousPath}, ` +
-      `${resolveAgenCDaemonSpawnStderrPreviousPath(host.env, host.userHome)} ` +
-      "(remove the first once the exit is diagnosed)\n",
+  const spawnStderrPath = spawnStderrCaptureOfExit(
+    heartbeat,
+    resolveAgenCDaemonSpawnStderrPreviousPath(host.env, host.userHome),
   );
+  io.stdout.write(
+    `  evidence: ${previousPath}` +
+      `${spawnStderrPath === null ? "" : `, ${spawnStderrPath}`} ` +
+      `(remove ${AGENC_DAEMON_PREVIOUS_HEARTBEAT_FILENAME} once the exit is diagnosed)\n`,
+  );
+}
+
+/**
+ * The kept exit, for the branches that report a daemon which is not running.
+ * They read the live heartbeat path, which the claim empties, so a daemon that
+ * was replaced and then stopped or died without beating would otherwise leave
+ * those branches with nothing to say (#2199).
+ */
+function reportKeptDaemonExit(
+  io: AgenCDaemonCliIo,
+  daemonHome: string,
+): boolean {
+  const keptPath = resolveAgenCDaemonPreviousHeartbeatPath(daemonHome);
+  const heartbeat = readAgenCDaemonHeartbeat(keptPath);
+  if (heartbeat === null) return false;
+  io.stderr.write(
+    `agenc: ${describeClaimedDaemonExit({ heartbeat, keptPath }, Date.now())}\n`,
+  );
+  return true;
 }
 
 async function statusAgenCDaemon(
@@ -2185,9 +2240,8 @@ async function statusAgenCDaemon(
         : pidSnapshot !== null && host.isPidRunning(pidSnapshot)
           ? pidSnapshot
           : null;
-    const heartbeatPath = resolveAgenCDaemonHeartbeatPath(
-      resolveAgenCDaemonHome(host.env, host.userHome),
-    );
+    const daemonHome = resolveAgenCDaemonHome(host.env, host.userHome);
+    const heartbeatPath = resolveAgenCDaemonHeartbeatPath(daemonHome);
     if (legacyPid === null) {
       const socketPath = resolveAgenCDaemonSocketPath(host.env, host.userHome);
       if (await canConnectToUnixSocket(socketPath)) {
@@ -2209,7 +2263,9 @@ async function statusAgenCDaemon(
         );
         return 1;
       }
-      reportLastDaemonHeartbeat(io, heartbeatPath, null);
+      if (!reportLastDaemonHeartbeat(io, heartbeatPath, null)) {
+        reportKeptDaemonExit(io, daemonHome);
+      }
       io.stdout.write("AgenC daemon stopped\n");
       return 1;
     }
@@ -3381,8 +3437,7 @@ async function runAgenCDaemonForegroundLocked(
     // daemon was replaced; a foreground run writes it to its terminal instead.
     if (replacedDaemon !== null) {
       writeErrorLog(
-        `agenc: ${describeAbandonedDaemonExit(replacedDaemon, Date.now())}; ` +
-          `kept at ${resolveAgenCDaemonPreviousHeartbeatPath(replacedDaemonHome)}\n`,
+        `agenc: ${describeClaimedDaemonExit(replacedDaemon, Date.now())}\n`,
       );
     }
     cleanup.register("daemon-error-log-sink", installAgenCDaemonErrorLogSink({

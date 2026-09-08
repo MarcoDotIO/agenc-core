@@ -5,6 +5,7 @@ import {
   fstatSync,
   mkdirSync,
   readFileSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import {
@@ -3322,6 +3323,55 @@ describe("AgenC daemon CLI", () => {
     }
   });
 
+  // #2199: the line named the kept file whether or not the keep worked, which
+  // sent an operator to a path holding nothing while this daemon's first beat
+  // overwrote the heartbeat the line was made from.
+  it("does not claim to have kept a heartbeat it could not keep", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    host.env.AGENC_DAEMON_RUN = "1";
+    const io = createIo();
+    const signalProcess = createSignalProcess();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    host.runningPids.add(host.pid);
+    // A directory where the kept heartbeat goes: the keep fails the way a
+    // lost rename race does, and the record is about to be overwritten.
+    mkdirSync(join(agencHome, "daemon-heartbeat.prev.json"));
+    writeFileSync(
+      resolveAgenCDaemonHeartbeatPath(agencHome),
+      JSON.stringify({
+        pid: 79303,
+        beat: 312,
+        at: "2026-09-06T16:22:46.000Z",
+        uptimeS: 1_560,
+        rssMb: 397,
+        heapUsedMb: 108,
+        eventLoopLagMs: 2,
+      }),
+    );
+    const running = runAgenCDaemonCli(
+      { kind: "command", action: "run" },
+      { host, io, signalProcess },
+    );
+    try {
+      await waitForPid(pidPath, DAEMON_MILESTONE_BUDGET_MS, {
+        running,
+        stderrText: io.stderrText,
+      });
+      const log = await readFile(join(agencHome, "daemon.log"), "utf8");
+      expect(log).toContain(
+        "agenc: the previous daemon (pid 79303) exited without recording a reason",
+      );
+      expect(log).toContain(
+        "it could not be kept, so this line is all that is left of it",
+      );
+      expect(log).not.toContain("kept at");
+    } finally {
+      await stopRunningDaemons([{ signalProcess, running }]);
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
   // #2199: after the replacement is up, `status` is where a user who saw only
   // "connection closed" learns that a daemon was replaced and where to look.
   it("status names the daemon the running one replaced and points at the evidence", async () => {
@@ -3342,6 +3392,12 @@ describe("AgenC daemon CLI", () => {
         eventLoopLagMs: 2,
       }),
     );
+    // The spawn that replaced the dead daemon kept its stderr here, so this
+    // capture stopped being written when that daemon died.
+    const spawnStderrPath = join(agencHome, "daemon-spawn-stderr.prev.log");
+    writeFileSync(spawnStderrPath, "FATAL ERROR: Ineffective mark-compacts\n");
+    const diedAt = new Date(Date.now() - 44_000);
+    utimesSync(spawnStderrPath, diedAt, diedAt);
 
     await expect(
       runAgenCDaemonCli(
@@ -3366,6 +3422,151 @@ describe("AgenC daemon CLI", () => {
     expect(out).toContain("45 s ago: rss 397 MB");
     expect(out).toContain(join(agencHome, "daemon-heartbeat.prev.json"));
     expect(out).toContain(join(agencHome, "daemon-spawn-stderr.prev.log"));
+
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  // #2199: every spawn rotates the stderr capture, but only an unexplained
+  // exit rotates the heartbeat, so the pair holds until anything restarts
+  // after the exit and the capture then belongs to a later, healthy spawn.
+  it("status does not offer a later spawn's stderr as the replaced daemon's evidence", async () => {
+    const agencHome = await tempAgencHome();
+    const host = { ...createHost(agencHome), platform: "linux" as const };
+    const io = createIo();
+    host.runningPids.add(4556);
+    await writeAgenCDaemonPid(resolveAgenCDaemonPidPath(host.env, host.userHome), 4556);
+    writeFileSync(
+      join(agencHome, "daemon-heartbeat.prev.json"),
+      JSON.stringify({
+        pid: 79303,
+        beat: 312,
+        at: new Date(Date.now() - 3 * 86_400_000).toISOString(),
+        uptimeS: 1_560,
+        rssMb: 397,
+        heapUsedMb: 108,
+        eventLoopLagMs: 2,
+      }),
+    );
+    // Two clean restarts later this capture is the daemon before the running
+    // one, and has nothing to do with the exit three days ago.
+    writeFileSync(join(agencHome, "daemon-spawn-stderr.prev.log"), "");
+
+    await expect(
+      runAgenCDaemonCli(
+        { kind: "command", action: "status" },
+        {
+          host,
+          io,
+          requestHealthStats: vi.fn(async () => {
+            throw new Error("health.stats unavailable");
+          }),
+          inspectLegacyDaemonProcess: inspectLegacyTestDaemon,
+          waitForDaemonReady: async () => true,
+        },
+      ),
+    ).resolves.toBe(0);
+
+    const out = io.stdoutText();
+    expect(out).toContain("replaced: the previous daemon (pid 79303)");
+    expect(out).toContain("3 d ago: rss 397 MB");
+    expect(out).toContain(join(agencHome, "daemon-heartbeat.prev.json"));
+    expect(out).not.toContain("daemon-spawn-stderr.prev.log");
+
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  // #2199: the claim moves the record out of the live heartbeat path, so the
+  // branches that report a daemon which is not running have to read where it
+  // was kept; otherwise a replacement that died too leaves `status` silent.
+  it("status reports the kept exit once no daemon is left to report", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const io = createIo();
+    const keptPath = join(agencHome, "daemon-heartbeat.prev.json");
+    writeFileSync(
+      keptPath,
+      JSON.stringify({
+        pid: 79303,
+        beat: 312,
+        at: new Date(Date.now() - 45_000).toISOString(),
+        uptimeS: 1_560,
+        rssMb: 397,
+        heapUsedMb: 108,
+        eventLoopLagMs: 2,
+      }),
+    );
+
+    await expect(
+      runAgenCDaemonCli({ kind: "command", action: "status" }, { host, io }),
+    ).resolves.toBe(1);
+    expect(io.stdoutText()).toContain("AgenC daemon stopped");
+    expect(io.stderrText()).toContain(
+      "the previous daemon (pid 79303) exited without recording a reason",
+    );
+    expect(io.stderrText()).toContain(`kept at ${keptPath}`);
+
+    // A daemon that died after the claim left its own heartbeat behind: that
+    // is the exit to report, and the older kept one is not repeated under it.
+    const later = createIo();
+    writeFileSync(
+      resolveAgenCDaemonHeartbeatPath(agencHome),
+      JSON.stringify({
+        pid: 79999,
+        beat: 4,
+        at: new Date(Date.now() - 5_000).toISOString(),
+        uptimeS: 20,
+        rssMb: 120,
+        heapUsedMb: 60,
+        eventLoopLagMs: 1,
+      }),
+    );
+    await expect(
+      runAgenCDaemonCli({ kind: "command", action: "status" }, { host, io: later }),
+    ).resolves.toBe(1);
+    expect(later.stderrText()).toContain(
+      "the last daemon (pid 79999) sent its last heartbeat",
+    );
+    expect(later.stderrText()).not.toContain("pid 79303");
+
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  // #2199: same gap on the way out - stopping the replacement is when an
+  // operator is most likely to be looking for what happened to its predecessor.
+  it("stop reports the kept exit of the daemon it took over from", async () => {
+    const agencHome = await tempAgencHome();
+    const host = { ...createHost(agencHome), platform: "linux" as const };
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const daemonPid = 4313;
+    host.runningPids.add(daemonPid);
+    await writeAgenCDaemonPid(pidPath, daemonPid);
+    const keptPath = join(agencHome, "daemon-heartbeat.prev.json");
+    writeFileSync(
+      keptPath,
+      JSON.stringify({
+        pid: 79303,
+        beat: 312,
+        at: new Date(Date.now() - 45_000).toISOString(),
+        uptimeS: 1_560,
+        rssMb: 397,
+        heapUsedMb: 108,
+        eventLoopLagMs: 2,
+      }),
+    );
+
+    await expect(
+      runAgenCDaemonCli(
+        { kind: "command", action: "stop" },
+        { host, io, inspectLegacyDaemonProcess: inspectLegacyTestDaemon },
+      ),
+    ).resolves.toBe(0);
+
+    expect(io.stdoutText()).toContain(`AgenC daemon stopped (pid ${daemonPid})`);
+    expect(io.stderrText()).toContain(
+      "the previous daemon (pid 79303) exited without recording a reason",
+    );
+    expect(io.stderrText()).toContain(`kept at ${keptPath}`);
 
     await rm(agencHome, { recursive: true, force: true });
   });
