@@ -31,6 +31,11 @@ import { RolloutStore } from "./rollout-store.js";
 import { getProjectDir, getSessionDir } from "./session-store.js";
 
 const TEST_RUN_TIMESTAMP = "2026-08-03T00:00:00.000Z";
+/** The two disk registries a validated rollout prefix owns while it is held. */
+const scanRegistryEntries = [
+  expect.stringMatching(/^agenc-c2-payloads-/u),
+  expect.stringMatching(/^agenc-recovery-identities-/u),
+];
 
 let agencHome = "";
 let originalAgencHome = "";
@@ -270,8 +275,10 @@ describe("RolloutStore temporary authority", () => {
       });
       expect(storeA.sessionTempRoot).toBe(rootA);
       expect(storeB.sessionTempRoot).toBe(rootB);
-      expect(readdirSync(rootA)).toEqual([]);
-      expect(readdirSync(rootB)).toEqual([]);
+      // An open store keeps the registries of the rollout prefix it validated,
+      // and keeps them under the root it captured rather than an ambient one.
+      expect(readdirSync(rootA).sort()).toEqual(scanRegistryEntries);
+      expect(readdirSync(rootB).sort()).toEqual(scanRegistryEntries);
     } finally {
       storeA?.close();
       storeB?.close();
@@ -279,6 +286,8 @@ describe("RolloutStore temporary authority", () => {
       rmSync(cwdA, { recursive: true, force: true });
       rmSync(cwdB, { recursive: true, force: true });
     }
+    expect(readdirSync(rootA)).toEqual([]);
+    expect(readdirSync(rootB)).toEqual([]);
   });
 });
 

@@ -305,6 +305,22 @@ export class StrictCanonicalJournalValidator {
     if (this.#finished)
       throw new Error("canonical journal validator is closed");
     this.#finished = true;
+    return this.#seal(this.#sourceHash.digest("hex"));
+  }
+
+  /**
+   * The same proof `finish` returns, computed over everything pushed so far
+   * while the validator stays open. A reader that already validated a prefix
+   * of an append-only journal can prove the prefix, then push only the bytes
+   * appended since instead of replaying the file from zero.
+   */
+  snapshot(): StrictCanonicalJournal {
+    if (this.#finished)
+      throw new Error("canonical journal validator is closed");
+    return this.#seal(this.#sourceHash.copy().digest("hex"));
+  }
+
+  #seal(sourceSha256: string): StrictCanonicalJournal {
     if (this.#pendingByteLength > 0) {
       this.#fail(
         "unterminated_record",
@@ -315,7 +331,6 @@ export class StrictCanonicalJournalValidator {
         },
       );
     }
-    const sourceSha256 = this.#sourceHash.digest("hex");
     if (
       this.#options.trustedSourceSha256 !== undefined &&
       sourceSha256 !== this.#options.trustedSourceSha256

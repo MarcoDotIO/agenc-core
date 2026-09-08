@@ -5,8 +5,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 
 import { COMPACTION_SOURCE_DIGEST_DOMAIN } from "../../src/services/compact/transaction-types.js";
-import { scanCanonicalRollout } from "../../src/session/canonical-rollout-scanner.js";
+import { compactConversationTransactionally } from "../../src/services/compact/transaction.js";
+import {
+  CanonicalRolloutScanner,
+  scanCanonicalRollout,
+  type CanonicalRolloutScan,
+} from "../../src/session/canonical-rollout-scanner.js";
 import { RolloutStore } from "../../src/session/rollout-store.js";
+import { bindCompactionTransactionHarness } from "../helpers/compaction-transaction-harness.js";
 
 let temporaryHome = "";
 let previousHome: string | undefined;
@@ -199,7 +205,98 @@ describe("canonical rollout compaction scanner", () => {
     }
     expect(readdirSync(sessionTempRoot)).toEqual([]);
   });
+
+  it("agrees with a full replay after a compaction landed on the tail", async () => {
+    const store = createStore("prefix-reuse-agrees");
+    const rolloutPath = store.rolloutPath;
+    const scanner = new CanonicalRolloutScanner();
+    const options = {
+      sessionTempRoot: join(temporaryHome, "scan-temp"),
+      expectedRunId: "prefix-reuse-agrees",
+      expectedEpoch: 1,
+      maximumScanMilliseconds: 30_000,
+      compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
+      captureActiveHistory: true,
+    } as const;
+    try {
+      for (let index = 0; index < 200; index += 1) {
+        store.appendRollout({
+          type: "response_item",
+          payload: {
+            role: index % 2 === 0 ? "user" : "assistant",
+            content: `before-compaction-${index}-${"detail ".repeat(64)}`,
+          },
+        });
+      }
+      store.flushDurable();
+      // Warm the scanner on the pre-compaction prefix, so the whole compaction
+      // lifecycle below reaches it as an appended tail.
+      scanner.scan(rolloutPath, options);
+
+      const prepared = store.prepareSource("agreement-attempt", []);
+      const harness = bindCompactionTransactionHarness(store, {
+        contextWindowTokens: 64_000,
+        maxOutputTokens: 512,
+      });
+      try {
+        const result = await compactConversationTransactionally(
+          harness.context,
+          {
+            customInstructions: "prefix reuse agreement",
+            automatic: false,
+            messagesToKeep: [],
+            completeSourceMessages: prepared.messages,
+            messagesToSummarize: prepared.messages,
+            summaryPlacement: "before_keep",
+            createBoundaryMarker: () => ({
+              role: "user",
+              originalRole: "developer",
+              content: "compaction boundary",
+            }),
+            createSummaryMessage: (content) => ({ role: "user", content }),
+          },
+        );
+        expect(result.transaction).toBeDefined();
+      } finally {
+        harness.close();
+      }
+      store.flushDurable();
+
+      const warm = scanner.scan(rolloutPath, options);
+      const cold = scanCanonicalRollout(rolloutPath, options);
+      expect(comparable(warm)).toEqual(comparable(cold));
+      expect(warm.attempts.size).toBe(1);
+    } finally {
+      scanner.close();
+      store.close();
+    }
+  }, 120_000);
 });
+
+
+/** Every part of a scan, in a shape deep equality can compare. */
+function comparable(scan: CanonicalRolloutScan): unknown {
+  return {
+    proof: scan.proof,
+    attempts: [...scan.attempts].map(([attemptId, attempt]) => [
+      attemptId,
+      {
+        intent: attempt.intent,
+        records: attempt.records,
+        admissionValid: attempt.admissionValid,
+        hasLaterCanonicalWork: attempt.hasLaterCanonicalWork,
+        sourceHistoryRetained: attempt.sourceHistoryRetained,
+        sourceHistoryManifest: attempt.sourceHistoryManifest,
+      },
+    ]),
+    sourceRecords: [...scan.sourceRecords].sort(
+      ([left], [right]) => left - right,
+    ),
+    payloadRecordsAtAttempts: [...scan.payloadRecordsAtAttempts],
+    activeHistory: scan.activeHistory,
+    historyAtAttempts: [...scan.historyAtAttempts],
+  };
+}
 
 function createStore(sessionId: string): RolloutStore {
   const store = new RolloutStore({
