@@ -84,6 +84,32 @@ function hasOpenAgentDescendants(
   return false;
 }
 
+/**
+ * How many live agents are still unwinding under this root thread. Named in
+ * the refusal a stop-in-flight returns so the user reads what the wait is for
+ * rather than a bare "busy" (#2201).
+ */
+function stoppingAgentSuffix(
+  control: AgentControl,
+  rootThreadId: string,
+): string {
+  const childrenByParent = control.liveThreadSpawnChildren();
+  const pending = [rootThreadId];
+  const visited = new Set<string>();
+  let count = 0;
+  while (pending.length > 0) {
+    const parent = pending.pop()!;
+    if (visited.has(parent)) continue;
+    visited.add(parent);
+    for (const [childThreadId] of childrenByParent.get(parent) ?? []) {
+      count += 1;
+      pending.push(childThreadId);
+    }
+  }
+  if (count === 0) return "";
+  return ` (${count} agent${count === 1 ? "" : "s"} still stopping)`;
+}
+
 function runtimeActiveTurnId(
   session: LocalRuntimeBootstrap["session"],
 ): string | undefined {
@@ -761,6 +787,7 @@ export {
   isInterruptibleActiveAgent,
   hasRuntimeActiveTurn,
   hasOpenAgentDescendants,
+  stoppingAgentSuffix,
   runtimeActiveTurnId,
   isClearInFlight,
   shellSubmissionMessageId,

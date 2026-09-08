@@ -202,7 +202,9 @@ records are visibly truncated for forward progress; only deferred triggers
 schedule autonomous follow-up turns, while passive context waits for the next
 human/root turn. A user Stop holds even the deferred triggers: until the user
 speaks again, a child receipt stays in the mailbox instead of starting a parent
-turn, so stopping a turn does not let its verifiers resume it.
+turn, so stopping a turn does not let its verifiers resume it. Only a message
+the daemon admits counts as speaking again; a prompt refused while the stop is
+still unwinding leaves the hold in place.
 
 `wait_agent` drains all currently delivered updates, not one named worker. It
 is therefore mutating and intentionally has no target filter. Use
@@ -485,7 +487,9 @@ The flag cannot combine with `initialContent` or other first-turn fields
 (`runtime/src/app-server/daemon-dispatcher.ts`). The thread sits in
 `pending_init`; `ifBusy: "reject"` on `message.send` refuses only an
 in-flight or queued turn, not `pending_init`. Rejecting the first prompt would
-deadlock the session. See [daemon.md](daemon.md).
+deadlock the session. While a user Stop is unwinding, the same refusal names
+the stop and counts the agents still stopping instead of reporting a turn the
+user never stopped. See [daemon.md](daemon.md).
 
 SDK helpers on `AgencClient`: `spawnAgent`, `listAgents`, `attachAgent`,
 `stopAgent`, `agentLogs`. See [`../sdk.md`](../sdk.md).
