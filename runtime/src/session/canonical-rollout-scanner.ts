@@ -73,6 +73,7 @@ class DiskCompactionPayloadRegistry {
   readonly #select: BetterSqlite3.Statement<[string, string]>;
   readonly #count: BetterSqlite3.Statement<[string, string]>;
   #closed = false;
+  #retainedPayloadBytes = 0;
 
   constructor(temporaryRoot: string) {
     const directory = mkdtempSync(join(temporaryRoot, "agenc-c2-payloads-"));
@@ -149,8 +150,17 @@ class DiskCompactionPayloadRegistry {
     );
   }
 
-  reconstruct(manifest: CompactionPayloadManifestV1): unknown {
+  /**
+   * Rebuild a spooled payload. `retained` says whether the caller keeps the
+   * result: a scan that only proves a payload hands it straight back to the
+   * collector, while a hydrated lifecycle row holds it for as long as the
+   * scan state does.
+   */
+  reconstruct(manifest: CompactionPayloadManifestV1, retained = true): unknown {
     this.#assertOpen();
+    if (retained) {
+      this.#retainedPayloadBytes += manifest.canonical_utf8_bytes;
+    }
     const chunks = this.#select
       .all(manifest.attempt_id, manifest.payload_kind)
       .map((row) => {
@@ -167,6 +177,11 @@ class DiskCompactionPayloadRegistry {
         return parsed;
       });
     return reconstructCompactionPayloadV1(manifest, chunks);
+  }
+
+  /** Reconstructed payload bytes the caller is still holding. */
+  get retainedPayloadBytes(): number {
+    return this.#retainedPayloadBytes;
   }
 
   hasComplete(manifest: CompactionPayloadManifestV1): boolean {
@@ -330,18 +345,20 @@ interface ValidatedPrefix {
 const MAX_VALIDATED_PREFIXES = 2;
 
 /**
- * How much active history a scanner keeps between scans of one rollout.
+ * How much a scanner keeps in memory between scans of one rollout.
  *
- * A prefix that reduces active history holds a second copy of the whole
- * conversation, next to the one the runtime already has, and that copy grows
- * with the session. Everything else a prefix holds is the compaction
- * lifecycle, which its own retention budget already bounds. So a prefix that
- * grew past this ceiling answers its scan and is then released: the sessions
- * large enough to reach it are exactly the ones that can least afford the
- * second copy, and the bookkeeping calls that reduce no history - six of the
- * eight per compaction step - keep their prefix either way.
+ * Two of the things a prefix holds grow with the session rather than with the
+ * compaction budget. Reduced active history is a second copy of the whole
+ * conversation next to the one the runtime already has. The other is what a
+ * hydrated compaction lifecycle row reconstructs back into itself:
+ * `MAX_COMPACTION_LIFECYCLE_RECORDS` bounds how many rows a prefix retains,
+ * not how large one is, and a rollback row holds the entire pre-compaction
+ * conversation. A prefix past this ceiling answers its scan and is then
+ * released: the sessions large enough to reach it are the ones that can least
+ * afford a second copy, and the bookkeeping that stays small - six of the
+ * eight calls per compaction step - keeps its prefix either way.
  */
-const MAX_RETAINED_ACTIVE_HISTORY_BYTES = 4 * 1_024 * 1_024;
+const MAX_RETAINED_PREFIX_BYTES = 4 * 1_024 * 1_024;
 
 /** Validated prefixes, most recently used first. */
 interface PrefixOwner {
@@ -358,9 +375,10 @@ interface PrefixOwner {
  * digest must equal the incrementally maintained one, so a prefix that changed
  * underneath a reused validator fails the scan instead of answering from it.
  *
- * What it keeps is bounded: a prefix that reduced more than
- * `MAX_RETAINED_ACTIVE_HISTORY_BYTES` of active history, and a prefix keyed to
- * one attempt, are released once they have answered.
+ * What it keeps is bounded: a prefix holding more than
+ * `MAX_RETAINED_PREFIX_BYTES` of reduced history and hydrated compaction
+ * payload, and a prefix keyed to one attempt, are released once they have
+ * answered.
  *
  * Every prefix owns two disk registries, so a scanner must be closed.
  */
@@ -564,14 +582,15 @@ function scanCanonicalRolloutUntimed(
         historyAtAttempts: new Map(state.historyAtAttempts),
       };
       // Whether this prefix is worth keeping is only knowable now: how much
-      // history it reduced is a fact about the bytes it read. Deciding here
-      // also keeps a prefix that is about to be released from taking a slot
-      // away from one a later scan can still use. A prefix keyed to one
-      // attempt's history is never worth keeping - no later scan asks its
-      // question.
+      // history it reduced, and how much payload its lifecycle rows hold, are
+      // facts about the bytes it read. Deciding here also keeps a prefix that
+      // is about to be released from taking a slot away from one a later scan
+      // can still use. A prefix keyed to one attempt's history is never worth
+      // keeping - no later scan asks its question.
       if (
         (options.captureHistoryAtAttemptIds ?? []).length > 0 ||
-        state.activeSourceBytes > MAX_RETAINED_ACTIVE_HISTORY_BYTES
+        state.activeSourceBytes + prefix.payloadRegistry.retainedPayloadBytes >
+          MAX_RETAINED_PREFIX_BYTES
       ) {
         discardPrefix(owner, prefix);
       } else if (carried === undefined) {
@@ -1145,8 +1164,11 @@ function validatePersistedSourceHistory(
   persisted: CompactionPersistedIntentV1,
   payloadRegistry: DiskCompactionPayloadRegistry,
 ): void {
+  // Proving the chain is all this does with the payload; the reader below
+  // rejects it or drops it, so the prefix keeps nothing from here.
   const sourceHistory = payloadRegistry.reconstruct(
     persisted.source_history_manifest,
+    false,
   );
   // The inline rollback reader strictly validates projection messages and the
   // source-history digest before the value can participate in reconstruction.

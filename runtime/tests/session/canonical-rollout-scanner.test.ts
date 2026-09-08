@@ -420,6 +420,78 @@ describe("canonical rollout compaction scanner", () => {
     }
   }, 120_000);
 
+  it("keeps no prefix once the payload its lifecycle holds passes the ceiling", async () => {
+    const store = createStore("prefix-lifecycle-ceiling");
+    const rolloutPath = store.rolloutPath;
+    const sessionTempRoot = join(temporaryHome, "lifecycle-ceiling-temp");
+    mkdirSync(sessionTempRoot, { recursive: true });
+    const scanner = new CanonicalRolloutScanner();
+    // The bookkeeping shape: it reduces no active history, so the active
+    // history ceiling can never be what releases this prefix.
+    const options = bookkeepingOptions(
+      sessionTempRoot,
+      "prefix-lifecycle-ceiling",
+    );
+    try {
+      appendLargeHistory(store, 1_000);
+
+      // Nothing hydrated yet, so this prefix is small and worth keeping: its
+      // two disk registries are the visible sign that the scanner holds one.
+      scanner.scan(rolloutPath, options);
+      expect(readdirSync(sessionTempRoot)).toHaveLength(2);
+
+      const transaction = await commitWholeHistory(store, "ceiling-source");
+      // A rollback reconstructs the whole pre-compaction conversation back
+      // into the row the scan retains, which is how a bounded number of
+      // lifecycle rows becomes a session-sized thing to hold.
+      store.markProjectionComplete(transaction.attempt_id);
+      store.rollbackCompaction({
+        attemptId: transaction.attempt_id,
+        nowMs: transaction.committed.committed_at_ms + 2,
+      });
+      store.flushDurable();
+
+      const scan = scanner.scan(rolloutPath, options);
+      expect(retainedPayloadBytes(scan)).toBeGreaterThan(4 * 1_024 * 1_024);
+      expect(readdirSync(sessionTempRoot)).toEqual([]);
+    } finally {
+      scanner.close();
+      store.close();
+    }
+  }, 180_000);
+
+  it("keeps the prefix of a scan that only proved a large payload", async () => {
+    const store = createStore("prefix-proved-payload");
+    const rolloutPath = store.rolloutPath;
+    const sessionTempRoot = join(temporaryHome, "proved-payload-temp");
+    mkdirSync(sessionTempRoot, { recursive: true });
+    const scanner = new CanonicalRolloutScanner();
+    const options = bookkeepingOptions(
+      sessionTempRoot,
+      "prefix-proved-payload",
+    );
+    try {
+      appendLargeHistory(store, 1_000);
+      await commitWholeHistory(store, "proved-source");
+
+      // Proving the committed attempt's source history reconstructs it and
+      // then drops every byte: counting that would put this prefix over the
+      // ceiling, while what it actually still holds is far under it.
+      const scan = scanner.scan(rolloutPath, options);
+      expect(scan.attempts.size).toBe(1);
+      const proved =
+        [...scan.attempts.values()][0]!.sourceHistoryManifest
+          ?.canonical_utf8_bytes ?? 0;
+      const held = retainedPayloadBytes(scan);
+      expect(held).toBeLessThan(4 * 1_024 * 1_024);
+      expect(proved + held).toBeGreaterThan(4 * 1_024 * 1_024);
+      expect(readdirSync(sessionTempRoot)).toHaveLength(2);
+    } finally {
+      scanner.close();
+      store.close();
+    }
+  }, 180_000);
+
   it("keeps no prefix that is keyed to one attempt's history", () => {
     const store = createStore("prefix-per-attempt");
     const rolloutPath = store.rolloutPath;
@@ -533,6 +605,74 @@ function comparable(scan: CanonicalRolloutScan): unknown {
     activeHistory: scan.activeHistory,
     historyAtAttempts: [...scan.historyAtAttempts],
   };
+}
+
+/** The bookkeeping shape of scan: it reduces no active history. */
+function bookkeepingOptions(sessionTempRoot: string, sessionId: string) {
+  return {
+    sessionTempRoot,
+    expectedRunId: sessionId,
+    expectedEpoch: 1,
+    maximumScanMilliseconds: 120_000,
+    compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
+    captureActiveHistory: false,
+  } as const;
+}
+
+/** Enough conversation that one compaction of it passes the ceiling. */
+function appendLargeHistory(store: RolloutStore, rows: number): void {
+  for (let index = 0; index < rows; index += 1) {
+    store.appendRollout({
+      type: "response_item",
+      payload: {
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `lifecycle-${index}-${"x".repeat(4_096)}`,
+      },
+    });
+  }
+  store.flushDurable();
+}
+
+async function commitWholeHistory(store: RolloutStore, attemptId: string) {
+  const prepared = store.prepareSource(attemptId, []);
+  const harness = bindCompactionTransactionHarness(store, {
+    contextWindowTokens: 2_000_000,
+    maxOutputTokens: 512,
+  });
+  try {
+    const result = await compactConversationTransactionally(harness.context, {
+      customInstructions: "retention ceiling",
+      automatic: false,
+      messagesToKeep: [],
+      completeSourceMessages: prepared.messages,
+      messagesToSummarize: prepared.messages,
+      summaryPlacement: "before_keep",
+      createBoundaryMarker: () => ({
+        role: "user",
+        originalRole: "developer",
+        content: "compaction boundary",
+      }),
+      createSummaryMessage: (content) => ({ role: "user", content }),
+    });
+    const transaction = result.transaction;
+    if (transaction === undefined) {
+      throw new Error("compaction did not commit a transaction");
+    }
+    return transaction;
+  } finally {
+    harness.close();
+    store.flushDurable();
+  }
+}
+
+/** What the scan's lifecycle rows reconstructed and are still holding. */
+function retainedPayloadBytes(scan: CanonicalRolloutScan): number {
+  return [...scan.attempts.values()]
+    .flatMap((attempt) => attempt.records)
+    .reduce(
+      (total, record) => total + JSON.stringify(record.item.payload).length,
+      0,
+    );
 }
 
 /** Fixed-width markers so a record can be rewritten without resizing it. */
