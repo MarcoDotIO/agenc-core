@@ -7,9 +7,15 @@ import { StringDecoder } from "node:string_decoder";
 import type { JsonObject } from "../app-server/protocol/index.js";
 
 export type WhisperModel = "base" | "small";
-export type WhisperLanguage = "auto" | "en" | "es";
+export const WHISPER_LANGUAGES = ["auto", "en", "es", "fr", "de", "it", "pt", "nl", "pl", "ru", "uk", "zh", "ja", "ko", "ar", "hi", "tr"] as const;
+export type WhisperLanguage = (typeof WHISPER_LANGUAGES)[number];
+export type WhisperTask = "transcribe" | "translate";
+export type WhisperCompute = "auto" | "cpu";
+export const MAX_WHISPER_PROMPT_CHARS = 500;
 export interface WhisperStatus extends JsonObject {
   readonly engine: "whisper.cpp";
+  /** Optional on older daemons; version 1 enables task, compute, and prompt. */
+  readonly optionsVersion?: 1;
   readonly available: boolean;
   readonly reason?: string;
   readonly models: readonly { readonly id: WhisperModel; readonly installed: boolean; readonly bytes: number }[];
@@ -23,6 +29,9 @@ export interface WhisperInstallParams { readonly model: WhisperModel }
 export interface WhisperTranscribeParams extends WhisperInstallParams {
   readonly audio: { readonly data: string; readonly mimeType: "audio/wav" };
   readonly language: WhisperLanguage;
+  readonly task?: WhisperTask;
+  readonly compute?: WhisperCompute;
+  readonly prompt?: string;
 }
 export interface WhisperService {
   status(params: unknown): Promise<WhisperStatus>;
@@ -56,11 +65,23 @@ function modelParam(params: unknown): WhisperModel {
   if (model !== "base" && model !== "small") invalid("Choose Base or Small");
   return model;
 }
-export function validateWhisperAudio(params: unknown): { model: WhisperModel; language: WhisperLanguage; wav: Buffer } {
-  const input = object(params, ["audio", "model", "language"]);
+interface ValidatedWhisperOptions {
+  readonly task: WhisperTask;
+  readonly compute: WhisperCompute;
+  readonly prompt: string;
+}
+export function validateWhisperAudio(params: unknown): ValidatedWhisperOptions & { model: WhisperModel; language: WhisperLanguage; wav: Buffer } {
+  const input = object(params, ["audio", "model", "language", "task", "compute", "prompt"]);
   const model = modelParam({ model: input.model });
   const language = input.language;
-  if (language !== "auto" && language !== "en" && language !== "es") invalid("Unsupported Whisper language");
+  if (typeof language !== "string" || !(WHISPER_LANGUAGES as readonly string[]).includes(language)) invalid("Unsupported Whisper language");
+  const task = input.task === undefined ? "transcribe" : input.task;
+  if (task !== "transcribe" && task !== "translate") invalid("Unsupported Whisper task");
+  const compute = input.compute === undefined ? "auto" : input.compute;
+  if (compute !== "auto" && compute !== "cpu") invalid("Unsupported Whisper compute mode");
+  const rawPrompt = input.prompt === undefined ? "" : input.prompt;
+  if (typeof rawPrompt !== "string" || rawPrompt.length > MAX_WHISPER_PROMPT_CHARS || /[\u0000-\u001f\u007f]/u.test(rawPrompt)) invalid("Vocabulary must be at most 500 characters and contain no control characters");
+  const prompt = rawPrompt.trim();
   const audio = object(input.audio, ["data", "mimeType"]);
   if (audio.mimeType !== "audio/wav" || typeof audio.data !== "string") invalid("Expected WAV audio");
   const encoded = audio.data;
@@ -75,7 +96,15 @@ export function validateWhisperAudio(params: unknown): { model: WhisperModel; la
       wav.readUInt16LE(20) !== 1 || wav.readUInt16LE(22) !== 1 || wav.readUInt32LE(24) !== 16000 ||
       wav.readUInt32LE(28) !== 32000 || wav.readUInt16LE(32) !== 2 || wav.readUInt16LE(34) !== 16 ||
       wav.toString("ascii", 36, 40) !== "data" || wav.readUInt32LE(40) !== wav.length - 44 || (wav.length - 44) % 2 !== 0) invalid("Audio must be PCM16 mono 16 kHz WAV, at most 30 seconds");
-  return { model, language, wav };
+  return { model, language: language as WhisperLanguage, task, compute, prompt, wav };
+}
+/** Translate means English output only. Every value remains one argv element. */
+export function whisperOptionsArgs(options: ValidatedWhisperOptions): string[] {
+  return [
+    ...(options.task === "translate" ? ["-tr"] : []),
+    ...(options.compute === "cpu" ? ["-ng"] : []),
+    ...(options.prompt ? ["--prompt", options.prompt] : []),
+  ];
 }
 function cancelled(signal: AbortSignal): void {
   if (signal.aborted) throw new WhisperError("REQUEST_CANCELLED", "Whisper request cancelled");
@@ -155,7 +184,7 @@ export class LocalWhisperService implements WhisperService {
     try {
       const available = Boolean(await this.#executable());
       const models = await Promise.all((Object.keys(WHISPER_MODELS) as WhisperModel[]).map(async (id) => ({ id, bytes: WHISPER_MODELS[id].bytes, installed: await this.#installed(id) })));
-      return { engine: "whisper.cpp", available, ...(available ? {} : { reason: "Install whisper.cpp on this computer, or configure AGENC_WHISPER_CLI on the host." }), models };
+      return { engine: "whisper.cpp", optionsVersion: 1, available, ...(available ? {} : { reason: "Install whisper.cpp on this computer, or configure AGENC_WHISPER_CLI on the host." }), models };
     } catch (error) {
       if (error instanceof WhisperError) throw error;
       throw new WhisperError("WHISPER_STORAGE_UNAVAILABLE", "Could not read private Whisper storage");
@@ -207,7 +236,7 @@ export class LocalWhisperService implements WhisperService {
     }
   }
   async transcribe(params: unknown, signal: AbortSignal): Promise<WhisperTranscription> {
-    const { model, language, wav } = validateWhisperAudio(params);
+    const { model, language, task, compute, prompt, wav } = validateWhisperAudio(params);
     cancelled(signal);
     if (this.#transcribing || this.#installing) throw new WhisperError("WHISPER_BUSY", "Whisper is busy. Try again when it finishes.");
     this.#transcribing = true;
@@ -225,7 +254,7 @@ export class LocalWhisperService implements WhisperService {
       const audioPath = join(temp, "speech.wav");
       const audioFile = await open(audioPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
       try { await audioFile.writeFile(wav); } finally { await audioFile.close(); }
-      const text = await runWhisperProcess(executable, ["-m", this.#modelPath(model), "-f", audioPath, "-l", language, "-np", "-nt", "-nf", "-t", "4"], temp, this.#env, signal);
+      const text = await runWhisperProcess(executable, ["-m", this.#modelPath(model), "-f", audioPath, "-l", language, "-np", "-nt", "-nf", "-t", "4", ...whisperOptionsArgs({ task, compute, prompt })], temp, this.#env, signal);
       return { text: text.trim(), model, provider: "local" };
     } catch (error) {
       cancelled(signal);

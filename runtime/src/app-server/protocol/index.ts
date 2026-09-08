@@ -8,7 +8,7 @@
 
 import type { RunRuntimeSettingsSnapshot } from "../../contracts/run-contracts.js";
 import type { WhisperStatus, WhisperTranscription } from "../../audio/whisper.js";
-export type { WhisperStatus, WhisperTranscription, WhisperInstallParams, WhisperTranscribeParams } from "../../audio/whisper.js";
+export type { WhisperStatus, WhisperTranscription, WhisperInstallParams, WhisperTranscribeParams, WhisperLanguage, WhisperTask, WhisperCompute } from "../../audio/whisper.js";
 import type { ProviderModelSelectionOutcome } from "../../contracts/provider-model-selection.js";
 import type { RoutineCapabilities, RoutineListResult, RoutineResult, RoutineDeleteResult, RoutineRunResult, RoutineRunsResult, RoutineIdParams, RoutineCreateParams, RoutineUpdateParams, RoutineDeleteParams, RoutineRunsParams, RoutineCancelParams, RoutineUpdatedEvent } from "../../routines/types.js";
 export type * from "../../routines/types.js";

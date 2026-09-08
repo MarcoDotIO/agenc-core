@@ -22,6 +22,14 @@ never download a model or create storage. Base is approximately 148 MB and Small
 `5359861c739e955e79d9a303bcbc70fb988958b1`, and checked against upstream LFS
 SHA256 digests before atomic installation. Corrupt files are never used.
 
+Engine setup and model download are separate steps: the Settings download action
+installs model weights, not whisper.cpp itself. A missing engine must be installed
+on the host first. Model installation is complete only after its integrity check;
+the current RPC reports completion, not percentage progress. Show an indeterminate
+download/verification state, allow cancellation, and keep the existing model usable
+if a new download fails. No internet connection is needed to transcribe after the
+engine and chosen model are available.
+
 Models live under `<AGENC_HOME>/whisper` with private directory/file permissions.
 Audio is accepted as canonical PCM16 mono 16 kHz WAV, maximum 30 seconds, decoded
 only after strict base64/header validation. Each transcription uses a private
@@ -35,10 +43,35 @@ Client cancellation and disconnect terminate the child; SIGKILL follows after
 
 ## Internal local RPCs
 
-- `audio.whisper.status {}` returns `{engine:"whisper.cpp", available, reason?, models:[{id, installed, bytes}]}`.
+- `audio.whisper.status {}` returns `{engine:"whisper.cpp", optionsVersion:1, available, reason?, models:[{id, installed, bytes}]}`.
 - `audio.whisper.install {model:"base"|"small"}` explicitly downloads a model and returns the same status.
-- `audio.whisper.transcribe {model, language:"auto"|"en"|"es", audio:{mimeType:"audio/wav", data:<base64>}}` returns `{text, model, provider:"local"}`.
+- `audio.whisper.transcribe {model, language, audio:{mimeType:"audio/wav", data:<base64>}, task?, compute?, prompt?}` returns `{text, model, provider:"local"}`.
 - Use `request.cancel {requestId}` on the same connection to cancel installation or transcription. Closing that connection also cancels it.
+
+Input language is an explicit allowlist: `auto`, `en`, `es`, `fr`, `de`, `it`,
+`pt`, `nl`, `pl`, `ru`, `uk`, `zh`, `ja`, `ko`, `ar`, `hi`, and `tr`. Automatic
+language detection is available; selecting the known spoken language avoids
+asking the model to detect it from short phrases.
+
+Optional controls preserve old behavior when omitted:
+
+- `task`: `transcribe` (default) keeps the spoken language. `translate` asks
+  Whisper for **English output only** using `-tr`; it is not a general translation
+  service and does not change the selected input language.
+- `compute`: `auto` (default) keeps whisper.cpp's automatic acceleration behavior.
+  `cpu` disables GPU inference with `-ng`; it can be slower. The existing four
+  worker threads and execution deadline remain unchanged.
+- `prompt`: an empty string by default. Optional vocabulary hints, such as names
+  and product terms, use one `--prompt` argument. They are not a chat instruction
+  or a guarantee of exact spelling. Input is limited to 500 JavaScript characters,
+  must not contain C0/DEL control characters, and is trimmed before use. No shell
+  is used. Avoid entering secrets: vocabulary is part of the native process's
+  argument list and may be visible to local process-inspection tools.
+
+Status responses advertise `optionsVersion: 1`, including when the engine is
+missing and after successful installation. This field is optional in the type
+because older Core versions omit it. Desktop must gate the additional languages
+and new options on this marker; older Core rejects unknown parameters/languages.
 
 Feature-detect these methods from `initialize.result.capabilities["daemon.methods"]`.
 Use a dedicated client connection so inference/download does not block the normal

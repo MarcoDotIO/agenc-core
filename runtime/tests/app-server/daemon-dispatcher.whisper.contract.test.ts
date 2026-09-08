@@ -3,7 +3,7 @@ import { AgenCDaemonJsonRpcDispatcher } from "../../src/app-server/daemon-dispat
 import { WhisperError, type WhisperService } from "../../src/audio/whisper.js";
 import type { JsonObject } from "../../src/app-server/protocol/index.js";
 import { BROWSER_METHODS } from "../../src/remote/access.js";
-const status = { engine: "whisper.cpp" as const, available: true, models: [{ id: "base" as const, installed: true, bytes: 147951465 }] };
+const status = { engine: "whisper.cpp" as const, optionsVersion: 1 as const, available: true, models: [{ id: "base" as const, installed: true, bytes: 147951465 }] };
 function request(id: string, method: string, params: JsonObject = {}): JsonObject { return { jsonrpc: "2.0", id, method, params }; }
 function fixture(whisper?: WhisperService) {
   const dispatcher = new AgenCDaemonJsonRpcDispatcher({ agentManager: {} as never, ...(whisper ? { whisper } : {}) });
@@ -47,6 +47,17 @@ describe("local Whisper daemon RPC", () => {
       await initialize(connection);
       expect(await connection.dispatch(request("invalid", "audio.whisper.install", { model: "bad" }))).toMatchObject({ error: { code: -32602, data: { code: "WHISPER_INVALID_ARGUMENT" } } });
       expect(await connection.dispatch(request("silent", "audio.whisper.transcribe"))).toMatchObject({ result: { text: "", provider: "local" } });
+    } finally { await connection.close(); await dispatcher.close(); }
+  });
+  it("preserves bounded transcription options and the status version over RPC", async () => {
+    const service = handlers(); const { connection, dispatcher } = fixture(service);
+    const params = { model: "base", language: "fr", task: "translate", compute: "cpu", prompt: "AgenC", audio: { mimeType: "audio/wav", data: "fixture" } };
+    try {
+      await initialize(connection);
+      expect(await connection.dispatch(request("status-options", "audio.whisper.status"))).toMatchObject({ result: { optionsVersion: 1 } });
+      expect(await connection.dispatch(request("install-options", "audio.whisper.install", { model: "base" }))).toMatchObject({ result: { optionsVersion: 1 } });
+      await connection.dispatch(request("transcribe-options", "audio.whisper.transcribe", params));
+      expect(service.transcribe).toHaveBeenCalledWith(params, expect.any(AbortSignal));
     } finally { await connection.close(); await dispatcher.close(); }
   });
 });

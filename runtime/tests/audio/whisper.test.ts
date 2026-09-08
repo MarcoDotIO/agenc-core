@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, mkdir, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LocalWhisperService, MAX_WHISPER_WAV_BYTES, runWhisperProcess, validateWhisperAudio, WHISPER_MODELS } from "../../src/audio/whisper.js";
+import { LocalWhisperService, MAX_WHISPER_WAV_BYTES, runWhisperProcess, validateWhisperAudio, WHISPER_MODELS, WHISPER_LANGUAGES, whisperOptionsArgs } from "../../src/audio/whisper.js";
 
 const homes: string[] = [];
 async function home(): Promise<string> { const value = await mkdtemp(join(tmpdir(), "agenc-whisper-unit-")); homes.push(value); return value; }
@@ -32,7 +32,37 @@ describe("Whisper bounded audio contract", () => {
   it.each(["..", "tiny", "base.en", "https://bad.invalid/a", "-f", null])("rejects non-allowlisted model %s", (model) => {
     expect(() => validateWhisperAudio({ ...params(), model })).toThrow();
   });
-  it.each(["fr", "--translate", null])("rejects invalid language %s", (language) => expect(() => validateWhisperAudio({ ...params(), language })).toThrow());
+  it.each(["unknown", "--translate", "en-US", "EN", "yue", null])("rejects invalid language %s", (language) => expect(() => validateWhisperAudio({ ...params(), language })).toThrow());
+  it.each(WHISPER_LANGUAGES)("accepts allowlisted input language %s", (language) => {
+    expect(validateWhisperAudio({ ...params(), language }).language).toBe(language);
+  });
+  it("preserves original behavior when all new options are omitted", () => {
+    const validated = validateWhisperAudio(params());
+    expect(validated).toMatchObject({ task: "transcribe", compute: "auto", prompt: "" });
+    expect(whisperOptionsArgs(validated)).toEqual([]);
+  });
+  it("translates only to English and bounds CPU selection to the no-GPU switch", () => {
+    const validated = validateWhisperAudio({ ...params(), language: "es", task: "translate", compute: "cpu", prompt: "  AgenC, whisper.cpp  " });
+    expect(validated).toMatchObject({ language: "es", task: "translate", compute: "cpu", prompt: "AgenC, whisper.cpp" });
+    expect(whisperOptionsArgs(validated)).toEqual(["-tr", "-ng", "--prompt", "AgenC, whisper.cpp"]);
+  });
+  it.each(["translate-to-es", "-tr", true, null])("rejects invalid task %s", (task) => expect(() => validateWhisperAudio({ ...params(), task })).toThrow());
+  it.each(["gpu", "-ng", true, null])("rejects invalid compute %s", (compute) => expect(() => validateWhisperAudio({ ...params(), compute })).toThrow());
+  it("validates prompt length in JavaScript characters and trims surrounding whitespace", () => {
+    expect(validateWhisperAudio({ ...params(), prompt: "x".repeat(500) }).prompt).toHaveLength(500);
+    expect(validateWhisperAudio({ ...params(), prompt: "😀".repeat(250) }).prompt).toHaveLength(500);
+    expect(() => validateWhisperAudio({ ...params(), prompt: "😀".repeat(251) })).toThrow();
+    expect(() => validateWhisperAudio({ ...params(), prompt: "x".repeat(501) })).toThrow();
+    expect(whisperOptionsArgs(validateWhisperAudio({ ...params(), prompt: "    " }))).toEqual([]);
+  });
+  it.each([...Array.from({ length: 32 }, (_, code) => String.fromCharCode(code)), "\u007f"])("rejects a control character in the vocabulary", (control) => {
+    expect(() => validateWhisperAudio({ ...params(), prompt: `AgenC${control}voice` })).toThrow();
+  });
+  it.each([false, 1, null, {}, []])("rejects non-string vocabulary", (prompt) => expect(() => validateWhisperAudio({ ...params(), prompt })).toThrow());
+  it("keeps CLI-looking, quoted, and shell-looking vocabulary in one literal argument", () => {
+    const prompt = '--language fr; $(touch secret) "quoted"';
+    expect(whisperOptionsArgs(validateWhisperAudio({ ...params(), prompt }))).toEqual(["--prompt", prompt]);
+  });
   it("rejects MIME confusion, extra keys, and noncanonical base64", () => {
     expect(() => validateWhisperAudio({ ...params(), path: "/etc/passwd" })).toThrow();
     for (const data of ["!".repeat(44), "A===", "YWJ=", "YQ", ` ${wav().toString("base64")}`]) {
@@ -69,6 +99,7 @@ describe("Whisper installation boundary", () => {
     const service = new LocalWhisperService({ home: root, env: { AGENC_WHISPER_CLI: "relative/whisper-cli", PATH: "/malicious" } });
     const status = await service.status({});
     expect(status.available).toBe(false);
+    expect(status.optionsVersion).toBe(1);
     expect(status.models).toEqual([{ id: "base", installed: false, bytes: WHISPER_MODELS.base.bytes }, { id: "small", installed: false, bytes: WHISPER_MODELS.small.bytes }]);
     expect(fetch).not.toHaveBeenCalled(); expect(await readdir(root)).toEqual([]);
   });
