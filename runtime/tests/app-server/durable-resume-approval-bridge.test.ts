@@ -61,6 +61,11 @@ interface ResumeObservation {
   readonly hasGuardianApprovalReviewer: boolean;
 }
 
+/** The slice of `session.state` these tests read and republish. */
+interface MutableSessionState {
+  history?: ReadonlyArray<Record<string, unknown>>;
+}
+
 /**
  * One started-but-never-terminated turn carrying a durable checkpoint whose
  * prefix is empty — the shape a SIGKILLed daemon leaves behind.
@@ -124,8 +129,11 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
   let workspace = "";
   let rolloutPath = "";
   let previousBuildId: string | undefined;
+  /** Every option object the runner handed the real bootstrap, in order. */
+  let bootstrapOptions: Array<Record<string, unknown>> = [];
 
   beforeEach(() => {
+    bootstrapOptions = [];
     home = mkdtempSync(join(tmpdir(), "agenc-2239-home-"));
     workspace = mkdtempSync(join(tmpdir(), "agenc-2239-ws-"));
     mkdirSync(join(workspace, ".git"), { recursive: true });
@@ -190,6 +198,7 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
   ): AgenCDelegateBackgroundAgentRunner {
     return new AgenCDelegateBackgroundAgentRunner({
       bootstrap: async (options) => {
+        bootstrapOptions.push(options as unknown as Record<string, unknown>);
         const bootstrap = await bootstrapLocalRuntimeSession(options);
         onBootstrapped?.(bootstrap);
         return bootstrap;
@@ -208,44 +217,83 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
   const RECOVERED_USER_MESSAGE = "PRIOR USER MESSAGE";
   const REPLAY_CALL_ID = "replay-1";
 
-  function sessionHistory(
-    bootstrap: LocalRuntimeBootstrap,
-  ): Promise<ReadonlyArray<Record<string, unknown>>> {
+  /**
+   * The session's mutable state cell. These tests both read the conversation
+   * the restore hydrated and write the republication a resumed turn performs,
+   * so they reach past the public type exactly where the runner does.
+   */
+  function sessionState(session: Session): {
+    readonly with: <T>(fn: (state: MutableSessionState) => T) => Promise<T>;
+  } {
     return (
-      bootstrap.session as unknown as {
+      session as unknown as {
         readonly state: {
-          with: <T>(
-            fn: (state: { history?: ReadonlyArray<Record<string, unknown>> }) => T,
+          readonly with: <T>(
+            fn: (state: MutableSessionState) => T,
           ) => Promise<T>;
         };
       }
-    ).state.with((state) => state.history ?? []);
+    ).state;
+  }
+
+  function sessionHistory(
+    bootstrap: LocalRuntimeBootstrap,
+  ): Promise<ReadonlyArray<Record<string, unknown>>> {
+    return sessionState(bootstrap.session).with((state) => state.history ?? []);
+  }
+
+  /** The queued user message `#hydrateRecoveredAgentState` wrote. */
+  function hasRecoveredUserMessage(
+    history: ReadonlyArray<Record<string, unknown>>,
+  ): boolean {
+    return history.some(
+      (message) =>
+        message.role === "user" && message.content === RECOVERED_USER_MESSAGE,
+    );
+  }
+
+  /** The result of the tool call the restore re-dispatched. */
+  function hasReplayedToolResult(
+    history: ReadonlyArray<Record<string, unknown>>,
+  ): boolean {
+    return history.some(
+      (message) =>
+        message.role === "tool" && message.toolCallId === REPLAY_CALL_ID,
+    );
   }
 
   /**
-   * Record every event type the session emits, from before bootstrap runs.
-   * Subscribing to `session.eventLog` after `restoreAgent` returns would miss
-   * a resume that already happened inside bootstrap, which is exactly the
+   * Observe every event the session emits, from before bootstrap runs.
+   * Subscribing to `session.eventLog` after `restoreAgent` returns would miss a
+   * resume that already happened inside bootstrap, which is exactly the
    * ordering these tests compare against.
    */
-  function recordEmittedEventTypes(): string[] {
-    const types: string[] = [];
+  function spyOnEmittedEvents(
+    observe: (event: Parameters<Session["emit"]>[0]) => void,
+  ): void {
     const emit = Session.prototype.emit;
     vi.spyOn(Session.prototype, "emit").mockImplementation(function (
       this: Session,
       event: Parameters<Session["emit"]>[0],
       appendOpts?: Parameters<Session["emit"]>[1],
     ) {
-      types.push(event.msg.type);
+      observe(event);
       return emit.call(this, event, appendOpts);
+    });
+  }
+
+  function recordEmittedEventTypes(): string[] {
+    const types: string[] = [];
+    spyOnEmittedEvents((event) => {
+      types.push(event.msg.type);
     });
     return types;
   }
 
   /**
-   * Record every `warning` cause the session emits, from before bootstrap runs.
-   * The runner records why it stopped waiting on a stalled resume through this
-   * channel, so it is durable in the rollout and reaches a client on attach.
+   * Record every `warning` cause the session emits. The runner records why it
+   * stopped waiting on a stalled resume through this channel, so it is durable
+   * in the rollout and reaches a client on attach.
    */
   function recordEmittedWarnings(): Array<{
     readonly cause: string;
@@ -253,23 +301,16 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
   }> {
     const warnings: Array<{ readonly cause: string; readonly message: string }> =
       [];
-    const emit = Session.prototype.emit;
-    vi.spyOn(Session.prototype, "emit").mockImplementation(function (
-      this: Session,
-      event: Parameters<Session["emit"]>[0],
-      appendOpts?: Parameters<Session["emit"]>[1],
-    ) {
-      if (event.msg.type === "warning") {
-        const payload = event.msg.payload as {
-          readonly cause?: unknown;
-          readonly message?: unknown;
-        };
-        warnings.push({
-          cause: String(payload.cause ?? ""),
-          message: String(payload.message ?? ""),
-        });
-      }
-      return emit.call(this, event, appendOpts);
+    spyOnEmittedEvents((event) => {
+      if (event.msg.type !== "warning") return;
+      const payload = event.msg.payload as {
+        readonly cause?: unknown;
+        readonly message?: unknown;
+      };
+      warnings.push({
+        cause: String(payload.cause ?? ""),
+        message: String(payload.message ?? ""),
+      });
     });
     return warnings;
   }
@@ -368,47 +409,264 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
     };
   }
 
-  it("drives the recovered turn only once a client can answer its approvals", async () => {
-    await stubProvider();
-    stubProviderAndMcp();
+  /**
+   * A turn that yields nothing and reports itself completed: what every stub
+   * below returns once it has done the one thing its test is about.
+   */
+  function completedTurn(): never {
+    return (async function* () {
+      return { reason: "completed" as const };
+    })() as never;
+  }
 
-    const runner = makeRunner();
-    const observations: ResumeObservation[] = [];
-    let approvalProbe: Promise<ReviewDecision> | undefined;
-    const resumeDriven = Promise.withResolvers<void>();
-
+  /** Run `onTurn` for every turn the runner drives, then complete that turn. */
+  function stubTurn(
+    onTurn: (session: Session, isResume: boolean) => void,
+  ): void {
     vi.spyOn(Session.prototype, "runTurn").mockImplementation(function (
       this: Session,
       _input: unknown,
       options?: { readonly resume?: unknown },
     ) {
-      const services = this.services as {
-        approvalResolver?: {
-          request: (ctx: unknown) => Promise<ReviewDecision>;
-        };
+      onTurn(this, options?.resume !== undefined);
+      return completedTurn();
+    });
+  }
+
+  /**
+   * Record which approval services the session carried on every turn the runner
+   * drove. `onResume` runs from inside the recovered turn, where a real tool
+   * would ask for its approval.
+   */
+  function recordResumeObservations(
+    onResume?: (session: Session) => void,
+  ): ResumeObservation[] {
+    const observations: ResumeObservation[] = [];
+    stubTurn((session, isResume) => {
+      const services = session.services as {
+        approvalResolver?: unknown;
         guardianApprovalReviewer?: unknown;
       };
-      const isResume = options?.resume !== undefined;
       observations.push({
         resume: isResume,
         hasApprovalResolver: services.approvalResolver !== undefined,
         hasGuardianApprovalReviewer:
           services.guardianApprovalReviewer !== undefined,
       });
-      if (isResume) {
-        // Ask for approval exactly the way `execute-tools` does, from inside
-        // the resumed turn. This is the property the issue is about: the
-        // request must become a pending decision the daemon can deliver to a
-        // client, not an instant refusal.
-        approvalProbe = services.approvalResolver?.request({
-          callId: APPROVAL_REQUEST_ID,
-          invocation: { session: { conversationId: CONVERSATION_ID } },
-        });
-        resumeDriven.resolve();
-      }
+      if (isResume) onResume?.(session);
+    });
+    return observations;
+  }
+
+  /**
+   * Replace the resumed turn with the two effects the runner reacts to: the
+   * `syncSessionState` republication that erases the daemon-recovered
+   * conversation (this fixture's checkpoint has `persistedMessageCount: 0`, so
+   * the prefix is empty), and the `turn_resumed` event that releases the start
+   * barrier. `settled` resolves once both have happened.
+   */
+  function stubResumedTurn(
+    opts: { readonly throwAfterStart?: boolean } = {},
+  ): { readonly settled: Promise<void> } {
+    const settled = Promise.withResolvers<void>();
+    vi.spyOn(Session.prototype, "runTurn").mockImplementation(function (
+      this: Session,
+      _input: unknown,
+      options?: { readonly resume?: unknown },
+    ) {
+      const session = this;
+      const isResume = options?.resume !== undefined;
       return (async function* () {
+        if (isResume) {
+          await sessionState(session).with((state) => {
+            state.history = [];
+          });
+          session.emit({
+            id: session.nextInternalSubId(),
+            msg: {
+              type: "turn_resumed",
+              payload: {
+                turnId: TURN_ID,
+                fromCheckpointSeq: 1,
+                fromIteration: 1,
+              },
+            },
+          } as never);
+          settled.resolve();
+          if (opts.throwAfterStart === true) {
+            throw new Error("resume failed after re-opening the turn");
+          }
+        }
         return { reason: "completed" as const };
       })() as never;
+    });
+    return { settled: settled.promise };
+  }
+
+  /**
+   * Stall the resume before any `turn_resumed` reaches the event log, which is
+   * where the review measured the daemon-startup block. `finished` stays false
+   * until `release` lets the stalled turn run on to completion.
+   */
+  function stubStalledResume(): {
+    readonly entered: () => boolean;
+    readonly finished: () => boolean;
+    readonly release: () => void;
+  } {
+    const stalled = Promise.withResolvers<void>();
+    let entered = false;
+    let finished = false;
+    vi.spyOn(Session.prototype, "runTurn").mockImplementation(function (
+      _input: unknown,
+      options?: { readonly resume?: unknown },
+    ) {
+      const isResume = options?.resume !== undefined;
+      return (async function* () {
+        if (isResume) {
+          entered = true;
+          await stalled.promise;
+          finished = true;
+        }
+        return { reason: "completed" as const };
+      })() as never;
+    });
+    return {
+      entered: () => entered,
+      finished: () => finished,
+      release: () => stalled.resolve(),
+    };
+  }
+
+  /**
+   * Observe the timers the runner installs. Both waits under test are timers:
+   * the start wait is one `setTimeout(durableResumeTimeoutMs)` and the slot
+   * poll is a run of `setTimeout(RECOVERED_HISTORY_SLOT_POLL_MS)` sleeps, so a
+   * poll that never starts and a bound that changed are both directly visible
+   * here instead of being asserted in prose.
+   */
+  function spyOnTimers(
+    onSet: (ms: number, timer: object) => void,
+    onClear?: (timer: object) => void,
+  ): void {
+    const realSetTimeout = globalThis.setTimeout as unknown as (
+      ...args: readonly unknown[]
+    ) => object;
+    const realClearTimeout = globalThis.clearTimeout as unknown as (
+      timer: unknown,
+    ) => void;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      ...args: readonly unknown[]
+    ) => {
+      const timer = realSetTimeout(...args);
+      const ms = args[1];
+      if (typeof ms === "number") onSet(ms, timer);
+      return timer;
+    }) as never);
+    if (onClear === undefined) return;
+    vi.spyOn(globalThis, "clearTimeout").mockImplementation(((
+      timer: unknown,
+    ) => {
+      if (typeof timer === "object" && timer !== null) onClear(timer);
+      realClearTimeout(timer);
+    }) as never);
+  }
+
+  /**
+   * Settle on whichever outcome happens first. A hang has to arrive as the
+   * outcome under test, so a failure names what did not happen instead of
+   * expiring as a bare vitest timeout.
+   */
+  function raceOutcome(
+    candidate: Promise<string>,
+    timedOut: string,
+    timeoutMs: number,
+  ): Promise<string> {
+    return Promise.race([
+      candidate,
+      new Promise<string>((resolve) =>
+        setTimeout(() => resolve(timedOut), timeoutMs),
+      ),
+    ]);
+  }
+
+  /** The delay `#reapplyRecoveredHistory` sleeps between slot re-checks. */
+  const SLOT_POLL_MS = 25;
+
+  /** Hold the session's turn slot the way a replacing client turn would. */
+  function holdTurnSlot(bootstrap: LocalRuntimeBootstrap): void {
+    vi.spyOn(bootstrap.session.activeTurn, "unsafePeek").mockReturnValue({
+      turnId: "client-turn-that-replaced-the-resume",
+    } as never);
+  }
+
+  function releaseTurnSlot(bootstrap: LocalRuntimeBootstrap): void {
+    vi.mocked(bootstrap.session.activeTurn.unsafePeek).mockReturnValue(null);
+  }
+
+  function setSessionHistory(
+    bootstrap: LocalRuntimeBootstrap,
+    history: ReadonlyArray<Record<string, unknown>>,
+  ): Promise<void> {
+    return sessionState(bootstrap.session).with((state) => {
+      state.history = history.map((message) => ({ ...message }));
+    });
+  }
+
+  /**
+   * Restore a run whose snapshot carried a conversation and settle its resumed
+   * turn. `holdSlot` puts a newer client turn in the session's turn slot from
+   * before the resume settles, which is the window the re-apply has to survive;
+   * `resumeThrows` fails the turn after it re-opened. The restore itself must
+   * succeed for any of that to be under test, so it is asserted here.
+   */
+  async function restoreRecoveredRun(opts: {
+    readonly durableResumeTimeoutMs: number;
+    readonly holdSlot?: boolean;
+    readonly resumeThrows?: boolean;
+  }): Promise<{
+    readonly runner: AgenCDelegateBackgroundAgentRunner;
+    readonly bootstrap: LocalRuntimeBootstrap;
+  }> {
+    const resumed = stubResumedTurn({ throwAfterStart: opts.resumeThrows });
+    let booted: LocalRuntimeBootstrap | undefined;
+    const runner = makeRunner(
+      (bootstrap) => {
+        booted = bootstrap;
+        if (opts.holdSlot === true) holdTurnSlot(bootstrap);
+      },
+      { durableResumeTimeoutMs: opts.durableResumeTimeoutMs },
+    );
+
+    await expect(
+      runner.restoreAgent(restoreParams(recoveredRunState())),
+    ).resolves.toBe(true);
+    await resumed.settled;
+    return { runner, bootstrap: booted! };
+  }
+
+  it("drives the recovered turn only once a client can answer its approvals", async () => {
+    await stubProvider();
+    stubProviderAndMcp();
+
+    const runner = makeRunner();
+    let approvalProbe: Promise<ReviewDecision> | undefined;
+    const resumeDriven = Promise.withResolvers<void>();
+    const observations = recordResumeObservations((session) => {
+      // Ask for approval exactly the way `execute-tools` does, from inside the
+      // resumed turn. This is the property the issue is about: the request must
+      // become a pending decision the daemon can deliver to a client, not an
+      // instant refusal.
+      approvalProbe = (
+        session.services as {
+          approvalResolver?: {
+            request: (ctx: unknown) => Promise<ReviewDecision>;
+          };
+        }
+      ).approvalResolver?.request({
+        callId: APPROVAL_REQUEST_ID,
+        invocation: { session: { conversationId: CONVERSATION_ID } },
+      });
+      resumeDriven.resolve();
     });
 
     await expect(runner.restoreAgent(restoreParams())).resolves.toBe(true);
@@ -465,14 +723,8 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
     stubProviderAndMcp();
 
     const resumesDrivenDuringBootstrap: boolean[] = [];
-    vi.spyOn(Session.prototype, "runTurn").mockImplementation(function (
-      _input: unknown,
-      options?: { readonly resume?: unknown },
-    ) {
-      if (options?.resume !== undefined) resumesDrivenDuringBootstrap.push(true);
-      return (async function* () {
-        return { reason: "completed" as const };
-      })() as never;
+    stubTurn((_session, isResume) => {
+      if (isResume) resumesDrivenDuringBootstrap.push(true);
     });
 
     const boot = await bootstrapLocalRuntimeSession({
@@ -508,12 +760,7 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
     // descriptor ever again, so a deferral that never fires drops it.
     await stubProvider();
     stubProviderAndMcp();
-    vi.spyOn(Session.prototype, "runTurn").mockImplementation(
-      () =>
-        (async function* () {
-          return { reason: "completed" as const };
-        })() as never,
-    );
+    stubTurn(() => undefined);
 
     const before = reconstructFromRollout(readRollout(rolloutPath));
     expect(before.resumableTurns.map((turn) => turn.turnId)).toEqual([TURN_ID]);
@@ -646,42 +893,17 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
     stubProviderAndMcp();
 
     const warnings = recordEmittedWarnings();
-    const stalled = Promise.withResolvers<void>();
-    let resumeEnteredTurn = false;
-    let resumeFinished = false;
-    vi.spyOn(Session.prototype, "runTurn").mockImplementation(function (
-      _input: unknown,
-      options?: { readonly resume?: unknown },
-    ) {
-      const isResume = options?.resume !== undefined;
-      return (async function* () {
-        if (isResume) {
-          resumeEnteredTurn = true;
-          // Stall exactly where the review measured it: inside the resume,
-          // before any `turn_resumed` reaches the event log.
-          await stalled.promise;
-          resumeFinished = true;
-        }
-        return { reason: "completed" as const };
-      })() as never;
-    });
+    const stalled = stubStalledResume();
 
     const runner = makeRunner(undefined, { durableResumeTimeoutMs: 500 });
     const restore = runner.restoreAgent(restoreParams());
-    const outcome = await Promise.race([
+    const outcome = await raceOutcome(
       restore.then(
         () => "restoreAgent returned while the recovered turn was still stalled",
       ),
-      new Promise<string>((resolve) =>
-        setTimeout(
-          () =>
-            resolve(
-              "restoreAgent never returned: the recovered turn stalled before turn_resumed",
-            ),
-          8_000,
-        ),
-      ),
-    ]);
+      "restoreAgent never returned: the recovered turn stalled before turn_resumed",
+      8_000,
+    );
     expect(outcome).toBe(
       "restoreAgent returned while the recovered turn was still stalled",
     );
@@ -689,7 +911,7 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
 
     // Expiry is recorded, never silent: the operator and the attaching client
     // both learn that the recovered turn had not started yet.
-    expect(resumeEnteredTurn).toBe(true);
+    expect(stalled.entered()).toBe(true);
     expect(
       warnings.filter(
         (warning) => warning.cause === "durable_resume_start_timeout",
@@ -699,10 +921,10 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
     // ...and the orphan is NOT abandoned. It is single-shot (see the
     // "replay persists its abort" test), so cancelling it at the deadline
     // would destroy the interrupted turn instead of merely delaying it.
-    expect(resumeFinished).toBe(false);
-    stalled.resolve();
+    expect(stalled.finished()).toBe(false);
+    stalled.release();
     await waitUntil(
-      () => resumeFinished,
+      () => stalled.finished(),
       "the resume to keep running in the background after the wait expired",
     );
 
@@ -726,65 +948,10 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
     await stubProvider();
     stubProviderAndMcp();
 
-    const resumeSettled = Promise.withResolvers<void>();
-    vi.spyOn(Session.prototype, "runTurn").mockImplementation(function (
-      this: Session,
-      _input: unknown,
-      options?: { readonly resume?: unknown },
-    ) {
-      const session = this;
-      const isResume = options?.resume !== undefined;
-      return (async function* () {
-        if (isResume) {
-          // What the real resumed turn does to history: `syncSessionState`
-          // assigns it from the checkpoint prefix, which this fixture's
-          // checkpoint (`persistedMessageCount: 0`) makes empty.
-          await (
-            session as unknown as {
-              readonly state: {
-                with: (fn: (state: { history?: unknown }) => void) => Promise<void>;
-              };
-            }
-          ).state.with((state) => {
-            state.history = [];
-          });
-          // `turn_resumed` is what releases the runner's start barrier.
-          session.emit({
-            id: session.nextInternalSubId(),
-            msg: {
-              type: "turn_resumed",
-              payload: {
-                turnId: TURN_ID,
-                fromCheckpointSeq: 1,
-                fromIteration: 1,
-              },
-            },
-          } as never);
-          resumeSettled.resolve();
-        }
-        return { reason: "completed" as const };
-      })() as never;
+    const { runner, bootstrap } = await restoreRecoveredRun({
+      durableResumeTimeoutMs: 30_000,
+      holdSlot: true,
     });
-
-    let booted: LocalRuntimeBootstrap | undefined;
-    const runner = makeRunner(
-      (bootstrap) => {
-        booted = bootstrap;
-        // Hold the slot from before the resume settles, so the re-apply finds
-        // a newer turn owning the history exactly as a replacing client turn
-        // would.
-        vi.spyOn(bootstrap.session.activeTurn, "unsafePeek").mockReturnValue({
-          turnId: "client-turn-that-replaced-the-resume",
-        } as never);
-      },
-      { durableResumeTimeoutMs: 30_000 },
-    );
-
-    await expect(
-      runner.restoreAgent(restoreParams(recoveredRunState())),
-    ).resolves.toBe(true);
-    const bootstrap = booted!;
-    await resumeSettled.promise;
 
     // While the newer turn owns the slot the recovered conversation stays
     // erased — appending it under a live turn would rewrite that turn's
@@ -798,24 +965,13 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
 
     // The slot frees; the recovered conversation must come back rather than
     // be dropped for good.
-    vi.mocked(bootstrap.session.activeTurn.unsafePeek).mockReturnValue(null);
+    releaseTurnSlot(bootstrap);
     await waitUntil(
-      async () =>
-        (await sessionHistory(bootstrap)).some(
-          (message) =>
-            message.role === "user" &&
-            message.content === RECOVERED_USER_MESSAGE,
-        ),
+      async () => hasRecoveredUserMessage(await sessionHistory(bootstrap)),
       "the recovered conversation to survive the turn that replaced the resume",
       10_000,
     );
-    const history = await sessionHistory(bootstrap);
-    expect(
-      history.some(
-        (message) =>
-          message.role === "tool" && message.toolCallId === REPLAY_CALL_ID,
-      ),
-    ).toBe(true);
+    expect(hasReplayedToolResult(await sessionHistory(bootstrap))).toBe(true);
 
     await runner.stopAgent(CONVERSATION_ID).catch(() => undefined);
   }, 60_000);
@@ -844,41 +1000,11 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
       ),
     ).toEqual([TURN_ID]);
 
-    const observations: ResumeObservation[] = [];
-    vi.spyOn(Session.prototype, "runTurn").mockImplementation(function (
-      this: Session,
-      _input: unknown,
-      options?: { readonly resume?: unknown },
-    ) {
-      const services = this.services as {
-        approvalResolver?: unknown;
-        guardianApprovalReviewer?: unknown;
-      };
-      observations.push({
-        resume: options?.resume !== undefined,
-        hasApprovalResolver: services.approvalResolver !== undefined,
-        hasGuardianApprovalReviewer:
-          services.guardianApprovalReviewer !== undefined,
-      });
-      return (async function* () {
-        return { reason: "completed" as const };
-      })() as never;
-    });
+    const observations = recordResumeObservations();
 
     let booted: LocalRuntimeBootstrap | undefined;
-    const bootstrapOptions: Array<Record<string, unknown>> = [];
-    const runner = new AgenCDelegateBackgroundAgentRunner({
-      bootstrap: async (options) => {
-        bootstrapOptions.push(options as unknown as Record<string, unknown>);
-        booted = await bootstrapLocalRuntimeSession(options);
-        return booted;
-      },
-      env: {
-        ...process.env,
-        AGENC_HOME: home,
-        AGENC_WORKSPACE: workspace,
-        HOME: home,
-      },
+    const runner = makeRunner((bootstrap) => {
+      booted = bootstrap;
     });
 
     await expect(
@@ -927,24 +1053,16 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
     stubProviderAndMcp();
 
     const decisions: Array<Record<string, unknown>> = [];
-    vi.spyOn(Session.prototype, "runTurn").mockImplementation(function (
-      this: Session,
-      _input: unknown,
-      options?: { readonly resume?: unknown },
-    ) {
-      if (options?.resume !== undefined) {
-        const context = this.permissionModeRegistry!.current();
-        decisions.push({
-          mode: context.mode,
-          glob: resolveUnattendedPermissionDecision(context, "Glob").behavior,
-          exec: resolveUnattendedPermissionDecision(context, "exec_command")
-            .behavior,
-          edit: resolveUnattendedPermissionDecision(context, "Edit").behavior,
-        });
-      }
-      return (async function* () {
-        return { reason: "completed" as const };
-      })() as never;
+    stubTurn((session, isResume) => {
+      if (!isResume) return;
+      const context = session.permissionModeRegistry!.current();
+      decisions.push({
+        mode: context.mode,
+        glob: resolveUnattendedPermissionDecision(context, "Glob").behavior,
+        exec: resolveUnattendedPermissionDecision(context, "exec_command")
+          .behavior,
+        edit: resolveUnattendedPermissionDecision(context, "Edit").behavior,
+      });
     });
 
     const runner = makeRunner();
@@ -965,143 +1083,6 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
 
     await runner.stopAgent(CONVERSATION_ID).catch(() => undefined);
   }, 60_000);
-
-  /**
-   * Replace the resumed turn with the two effects the runner reacts to: the
-   * `syncSessionState` republication that erases the daemon-recovered
-   * conversation (this fixture's checkpoint has `persistedMessageCount: 0`, so
-   * the prefix is empty), and the `turn_resumed` event that releases the start
-   * barrier. `settled` resolves once both have happened.
-   */
-  function stubResumedTurn(
-    opts: { readonly throwAfterStart?: boolean } = {},
-  ): { readonly settled: Promise<void> } {
-    const settled = Promise.withResolvers<void>();
-    vi.spyOn(Session.prototype, "runTurn").mockImplementation(function (
-      this: Session,
-      _input: unknown,
-      options?: { readonly resume?: unknown },
-    ) {
-      const session = this;
-      const isResume = options?.resume !== undefined;
-      return (async function* () {
-        if (isResume) {
-          await (
-            session as unknown as {
-              readonly state: {
-                with: (fn: (state: { history?: unknown }) => void) => Promise<void>;
-              };
-            }
-          ).state.with((state) => {
-            state.history = [];
-          });
-          session.emit({
-            id: session.nextInternalSubId(),
-            msg: {
-              type: "turn_resumed",
-              payload: {
-                turnId: TURN_ID,
-                fromCheckpointSeq: 1,
-                fromIteration: 1,
-              },
-            },
-          } as never);
-          settled.resolve();
-          if (opts.throwAfterStart === true) {
-            throw new Error("resume failed after re-opening the turn");
-          }
-        }
-        return { reason: "completed" as const };
-      })() as never;
-    });
-    return { settled: settled.promise };
-  }
-
-  /** Stall the resume before any `turn_resumed` reaches the event log. */
-  function stubStalledResume(): {
-    readonly entered: () => boolean;
-    readonly release: () => void;
-  } {
-    const stalled = Promise.withResolvers<void>();
-    let entered = false;
-    vi.spyOn(Session.prototype, "runTurn").mockImplementation(function (
-      _input: unknown,
-      options?: { readonly resume?: unknown },
-    ) {
-      const isResume = options?.resume !== undefined;
-      return (async function* () {
-        if (isResume) {
-          entered = true;
-          await stalled.promise;
-        }
-        return { reason: "completed" as const };
-      })() as never;
-    });
-    return { entered: () => entered, release: () => stalled.resolve() };
-  }
-
-  /**
-   * Observe the timers the runner installs. Both waits under test are timers:
-   * the start wait is one `setTimeout(durableResumeTimeoutMs)` and the slot
-   * poll is a run of `setTimeout(RECOVERED_HISTORY_SLOT_POLL_MS)` sleeps, so a
-   * poll that never starts and a bound that changed are both directly visible
-   * here instead of being asserted in prose.
-   */
-  function spyOnTimers(
-    onSet: (ms: number, timer: object) => void,
-    onClear?: (timer: object) => void,
-  ): void {
-    const realSetTimeout = globalThis.setTimeout as unknown as (
-      ...args: readonly unknown[]
-    ) => object;
-    const realClearTimeout = globalThis.clearTimeout as unknown as (
-      timer: unknown,
-    ) => void;
-    vi.spyOn(globalThis, "setTimeout").mockImplementation(((
-      ...args: readonly unknown[]
-    ) => {
-      const timer = realSetTimeout(...args);
-      const ms = args[1];
-      if (typeof ms === "number") onSet(ms, timer);
-      return timer;
-    }) as never);
-    if (onClear === undefined) return;
-    vi.spyOn(globalThis, "clearTimeout").mockImplementation(((
-      timer: unknown,
-    ) => {
-      if (typeof timer === "object" && timer !== null) onClear(timer);
-      realClearTimeout(timer);
-    }) as never);
-  }
-
-  /** The delay `#reapplyRecoveredHistory` sleeps between slot re-checks. */
-  const SLOT_POLL_MS = 25;
-
-  /** Hold the session's turn slot the way a replacing client turn would. */
-  function holdTurnSlot(bootstrap: LocalRuntimeBootstrap): void {
-    vi.spyOn(bootstrap.session.activeTurn, "unsafePeek").mockReturnValue({
-      turnId: "client-turn-that-replaced-the-resume",
-    } as never);
-  }
-
-  function releaseTurnSlot(bootstrap: LocalRuntimeBootstrap): void {
-    vi.mocked(bootstrap.session.activeTurn.unsafePeek).mockReturnValue(null);
-  }
-
-  function setSessionHistory(
-    bootstrap: LocalRuntimeBootstrap,
-    history: ReadonlyArray<Record<string, unknown>>,
-  ): Promise<void> {
-    return (
-      bootstrap.session as unknown as {
-        readonly state: {
-          with: (fn: (state: { history?: unknown }) => void) => Promise<void>;
-        };
-      }
-    ).state.with((state) => {
-      state.history = history.map((message) => ({ ...message }));
-    });
-  }
 
   it("neither polls nor warns when the recovered run has nothing to merge", async () => {
     // The emptiness test lives inside the merge thunk
@@ -1197,20 +1178,10 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
     stubProviderAndMcp();
 
     const warnings = recordEmittedWarnings();
-    const resumed = stubResumedTurn();
-    let booted: LocalRuntimeBootstrap | undefined;
-    const runner = makeRunner(
-      (bootstrap) => {
-        booted = bootstrap;
-        holdTurnSlot(bootstrap);
-      },
-      { durableResumeTimeoutMs: 400 },
-    );
-
-    await expect(
-      runner.restoreAgent(restoreParams(recoveredRunState())),
-    ).resolves.toBe(true);
-    await resumed.settled;
+    const { runner, bootstrap } = await restoreRecoveredRun({
+      durableResumeTimeoutMs: 400,
+      holdSlot: true,
+    });
 
     await waitUntil(
       () =>
@@ -1227,7 +1198,7 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
     expect(abandoned[0]!.message).toContain("400ms");
     // The warning is not decorative: the recovered conversation really is gone
     // from the session it was hydrated onto.
-    expect(await sessionHistory(booted!)).toEqual([]);
+    expect(await sessionHistory(bootstrap)).toEqual([]);
 
     await runner.stopAgent(CONVERSATION_ID).catch(() => undefined);
   }, 60_000);
@@ -1241,36 +1212,17 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
     await stubProvider();
     stubProviderAndMcp();
 
-    const resumed = stubResumedTurn({ throwAfterStart: true });
-    let booted: LocalRuntimeBootstrap | undefined;
-    const runner = makeRunner(
-      (bootstrap) => {
-        booted = bootstrap;
-      },
-      { durableResumeTimeoutMs: 30_000 },
-    );
-
-    await expect(
-      runner.restoreAgent(restoreParams(recoveredRunState())),
-    ).resolves.toBe(true);
-    await resumed.settled;
+    const { runner, bootstrap } = await restoreRecoveredRun({
+      durableResumeTimeoutMs: 30_000,
+      resumeThrows: true,
+    });
 
     await waitUntil(
-      async () =>
-        (await sessionHistory(booted!)).some(
-          (message) =>
-            message.role === "user" &&
-            message.content === RECOVERED_USER_MESSAGE,
-        ),
+      async () => hasRecoveredUserMessage(await sessionHistory(bootstrap)),
       "the recovered conversation to survive a resume that threw after starting",
       10_000,
     );
-    expect(
-      (await sessionHistory(booted!)).some(
-        (message) =>
-          message.role === "tool" && message.toolCallId === REPLAY_CALL_ID,
-      ),
-    ).toBe(true);
+    expect(hasReplayedToolResult(await sessionHistory(bootstrap))).toBe(true);
 
     await runner.stopAgent(CONVERSATION_ID).catch(() => undefined);
   }, 60_000);
@@ -1304,15 +1256,11 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
     );
     const abortedAt = Date.now();
     controller.abort(new Error("the caller cancelled the restore"));
-    const outcome = await Promise.race([
+    const outcome = await raceOutcome(
       settled,
-      new Promise<string>((resolve) =>
-        setTimeout(
-          () => resolve("the restore was still waiting out its own timeout"),
-          10_000,
-        ),
-      ),
-    ]);
+      "the restore was still waiting out its own timeout",
+      10_000,
+    );
     expect(outcome).toBe("the restore rejected");
     expect(Date.now() - abortedAt).toBeLessThan(10_000);
 
@@ -1331,21 +1279,10 @@ describe("durable resume reaches the daemon approval bridge (#2239)", () => {
     await stubProvider();
     stubProviderAndMcp();
 
-    const resumed = stubResumedTurn();
-    let booted: LocalRuntimeBootstrap | undefined;
-    const runner = makeRunner(
-      (bootstrap) => {
-        booted = bootstrap;
-        holdTurnSlot(bootstrap);
-      },
-      { durableResumeTimeoutMs: 30_000 },
-    );
-
-    await expect(
-      runner.restoreAgent(restoreParams(recoveredRunState())),
-    ).resolves.toBe(true);
-    const bootstrap = booted!;
-    await resumed.settled;
+    const { runner, bootstrap } = await restoreRecoveredRun({
+      durableResumeTimeoutMs: 30_000,
+      holdSlot: true,
+    });
 
     // What the replacing turn does that the busy-slot test never modelled: it
     // publishes its own history before it releases the slot.
