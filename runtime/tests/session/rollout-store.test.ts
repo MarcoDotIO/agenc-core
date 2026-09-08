@@ -31,7 +31,11 @@ import { RolloutStore } from "./rollout-store.js";
 import { getProjectDir, getSessionDir } from "./session-store.js";
 
 const TEST_RUN_TIMESTAMP = "2026-08-03T00:00:00.000Z";
-/** The two disk registries a validated rollout prefix owns while it is held. */
+/**
+ * The two disk registries a validated rollout prefix owns while it is held. A
+ * store holds one prefix per shape of bookkeeping question, up to the
+ * scanner's own limit of two.
+ */
 const scanRegistryEntries = [
   expect.stringMatching(/^agenc-c2-payloads-/u),
   expect.stringMatching(/^agenc-recovery-identities-/u),
@@ -288,6 +292,46 @@ describe("RolloutStore temporary authority", () => {
     }
     expect(readdirSync(rootA)).toEqual([]);
     expect(readdirSync(rootB)).toEqual([]);
+  });
+
+  it("holds at most the two rollout prefixes its bookkeeping asks about", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-prefix-cwd-"));
+    const root = join(agencHome, "session-temp-prefixes");
+    let store: RolloutStore | undefined;
+    try {
+      // Opening reconciles compactions, which is one shape of question.
+      store = openStore({
+        cwd,
+        sessionId: "prefix-lifetime",
+        sessionTempRoot: root,
+      });
+      expect(readdirSync(root).sort()).toEqual(scanRegistryEntries);
+
+      for (let index = 0; index < 32; index += 1) {
+        store.appendRollout({
+          type: "response_item",
+          payload: { role: "user", content: `prefix-lifetime-${index}` },
+        });
+      }
+      store.flushDurable();
+
+      // Preparing a compaction source is the other shape: it reduces active
+      // history, so it cannot answer from the prefix that does not.
+      store.prepareSource("prefix-lifetime-attempt", []);
+      expect(readdirSync(root).sort()).toEqual([
+        expect.stringMatching(/^agenc-c2-payloads-/u),
+        expect.stringMatching(/^agenc-c2-payloads-/u),
+        expect.stringMatching(/^agenc-recovery-identities-/u),
+        expect.stringMatching(/^agenc-recovery-identities-/u),
+      ]);
+
+      store.prepareSource("prefix-lifetime-attempt-2", []);
+      expect(readdirSync(root)).toHaveLength(4);
+    } finally {
+      store?.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+    expect(readdirSync(root)).toEqual([]);
   });
 });
 

@@ -313,6 +313,11 @@ export class StrictCanonicalJournalValidator {
    * while the validator stays open. A reader that already validated a prefix
    * of an append-only journal can prove the prefix, then push only the bytes
    * appended since instead of replaying the file from zero.
+   *
+   * Unlike `finish`, a rejected snapshot leaves the validator open and
+   * callable again: a record cut in half by the prefix boundary, or a
+   * compaction chunk chain the appended bytes go on to complete, is a
+   * legitimate state for a reader that has not reached the end of the file.
    */
   snapshot(): StrictCanonicalJournal {
     if (this.#finished)

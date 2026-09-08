@@ -124,6 +124,49 @@ describe("strict canonical journal contract", () => {
     expect(result.records[1]?.rollingSha256).toBe(result.sourceSha256);
   });
 
+  it("snapshots the proof of everything pushed so far without closing", () => {
+    const lines = [1, 2, 3].map((sequence) =>
+      validEvent(sequence, "turn_started"),
+    );
+    const validator = new StrictCanonicalJournalValidator();
+    validator.push(Buffer.from(lines[0]! + lines[1]!, "utf8"));
+
+    // A reader that has validated a prefix of an append-only journal proves
+    // that prefix, then pushes only what was appended since.
+    expect(validator.snapshot()).toEqual(
+      validateCanonicalJournalText(lines[0]! + lines[1]!),
+    );
+    validator.push(Buffer.from(lines[2]!, "utf8"));
+    expect(validator.snapshot()).toEqual(
+      validateCanonicalJournalText(lines.join("")),
+    );
+    expect(validator.finish().physicalLineCount).toBe(3);
+  });
+
+  it("keeps the validator usable after a rejected snapshot, unlike finish", () => {
+    const complete = validEvent(1, "turn_started");
+    const split = complete.length - 4;
+    const validator = new StrictCanonicalJournalValidator();
+    validator.push(Buffer.from(complete.slice(0, split), "utf8"));
+
+    // A record cut in half by the prefix boundary is a legitimate state for a
+    // reader that has not reached the end of the file.
+    expect(() => validator.snapshot()).toThrow(
+      expect.objectContaining({ reasonCode: "unterminated_record" }),
+    );
+    validator.push(Buffer.from(complete.slice(split), "utf8"));
+    expect(validator.snapshot().physicalLineCount).toBe(1);
+
+    const closing = new StrictCanonicalJournalValidator();
+    closing.push(Buffer.from(complete.slice(0, split), "utf8"));
+    expect(() => closing.finish()).toThrow(
+      expect.objectContaining({ reasonCode: "unterminated_record" }),
+    );
+    expect(() => closing.push(Buffer.from(complete.slice(split), "utf8")))
+      .toThrow(/validator is closed/u);
+    expect(() => closing.snapshot()).toThrow(/validator is closed/u);
+  });
+
   it("uses an existing digest as an anchor and never treats a fresh digest as proof", () => {
     const raw = validEvent(1, "turn_complete");
     const unanchored = validateCanonicalJournalText(raw);

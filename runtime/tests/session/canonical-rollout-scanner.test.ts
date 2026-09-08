@@ -1,4 +1,14 @@
-import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -271,6 +281,233 @@ describe("canonical rollout compaction scanner", () => {
       store.close();
     }
   }, 120_000);
+
+  it("does not carry an end-of-file bookkeeping conclusion into a later scan", async () => {
+    const store = createStore("post-commit-window");
+    const rolloutPath = store.rolloutPath;
+    const scanner = new CanonicalRolloutScanner();
+    const options = {
+      sessionTempRoot: join(temporaryHome, "scan-temp"),
+      expectedRunId: "post-commit-window",
+      expectedEpoch: 1,
+      maximumScanMilliseconds: 30_000,
+      compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
+    } as const;
+    try {
+      for (let index = 0; index < 200; index += 1) {
+        store.appendRollout({
+          type: "response_item",
+          payload: {
+            role: index % 2 === 0 ? "user" : "assistant",
+            content: `post-commit-${index}-${"detail ".repeat(64)}`,
+          },
+        });
+      }
+      store.flushDurable();
+      const prepared = store.prepareSource("window-source", []);
+      const harness = bindCompactionTransactionHarness(store, {
+        contextWindowTokens: 64_000,
+        maxOutputTokens: 512,
+      });
+      try {
+        const result = await compactConversationTransactionally(
+          harness.context,
+          {
+            customInstructions: "post-commit window",
+            automatic: true,
+            messagesToKeep: [],
+            completeSourceMessages: prepared.messages,
+            messagesToSummarize: prepared.messages,
+            summaryPlacement: "before_keep",
+            createBoundaryMarker: () => ({
+              role: "user",
+              originalRole: "developer",
+              content: "compaction boundary",
+            }),
+            createSummaryMessage: (content) => ({ role: "user", content }),
+          },
+        );
+        expect(result.transaction).toBeDefined();
+        // commit.ts stamps the causal boundary straight after an automatic
+        // commit and only then re-appends the session header, so a scan that
+        // lands in between sees a file ending mid-bookkeeping.
+        harness.session.emit({
+          eventId: "post-commit-boundary",
+          id: "post-commit-boundary",
+          msg: {
+            type: "context_compacted",
+            payload: { summary: "auto-compact boundary (turnId=window-turn)" },
+          },
+        });
+      } finally {
+        harness.close();
+      }
+      store.flushDurable();
+
+      const atBoundary = scanner.scan(rolloutPath, options);
+      const attemptId = [...atBoundary.attempts.keys()].at(-1)!;
+      expect(atBoundary.attempts.get(attemptId)?.hasLaterCanonicalWork).toBe(
+        true,
+      );
+
+      store.store.reAppendSessionMetadata();
+      store.flushDurable();
+
+      // The conclusion belonged to where the earlier scan stopped reading, so
+      // the scan that reads past it must answer as a full replay does.
+      const warm = scanner.scan(rolloutPath, options);
+      const cold = scanCanonicalRollout(rolloutPath, options);
+      expect(warm.attempts.get(attemptId)?.hasLaterCanonicalWork).toBe(false);
+      expect(comparable(warm)).toEqual(comparable(cold));
+    } finally {
+      scanner.close();
+      store.close();
+    }
+  }, 120_000);
+
+  it("keeps no prefix once its active history outgrows the retention ceiling", () => {
+    const store = createStore("prefix-history-ceiling");
+    const rolloutPath = store.rolloutPath;
+    const sessionTempRoot = join(temporaryHome, "ceiling-temp");
+    mkdirSync(sessionTempRoot, { recursive: true });
+    const scanner = new CanonicalRolloutScanner();
+    const options = {
+      sessionTempRoot,
+      expectedRunId: "prefix-history-ceiling",
+      expectedEpoch: 1,
+      maximumScanMilliseconds: 60_000,
+      compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
+      captureActiveHistory: true,
+    } as const;
+    try {
+      // Under the ceiling the prefix is worth its memory, and its two disk
+      // registries are the visible sign that a scanner is holding one.
+      for (let index = 0; index < 64; index += 1) {
+        store.appendRollout({
+          type: "response_item",
+          payload: { role: "user", content: `small-${"x".repeat(4_096)}` },
+        });
+      }
+      store.flushDurable();
+      const small = scanner.scan(rolloutPath, options);
+      expect(small.activeHistory?.messages).toHaveLength(64);
+      expect(readdirSync(sessionTempRoot)).toHaveLength(2);
+
+      // Past it the prefix would hold a second copy of the whole session, so
+      // it answers this scan and is released rather than kept.
+      for (let index = 0; index < 1_100; index += 1) {
+        store.appendRollout({
+          type: "response_item",
+          payload: { role: "assistant", content: `large-${"y".repeat(4_096)}` },
+        });
+      }
+      store.flushDurable();
+      const large = scanner.scan(rolloutPath, options);
+      expect(large.activeHistory?.messages).toHaveLength(1_164);
+      expect(statSync(rolloutPath).size).toBeGreaterThan(4 * 1_024 * 1_024);
+      expect(readdirSync(sessionTempRoot)).toEqual([]);
+
+      // The bookkeeping that reduces no history is the repeat-heavy part of a
+      // compaction step, and the ceiling does not cost it its prefix.
+      const bookkeeping = { ...options, captureActiveHistory: false } as const;
+      scanner.scan(rolloutPath, bookkeeping);
+      expect(readdirSync(sessionTempRoot)).toHaveLength(2);
+      scanner.scan(rolloutPath, bookkeeping);
+      expect(readdirSync(sessionTempRoot)).toHaveLength(2);
+    } finally {
+      scanner.close();
+      store.close();
+    }
+  }, 120_000);
+
+  it("keeps no prefix that is keyed to one attempt's history", () => {
+    const store = createStore("prefix-per-attempt");
+    const rolloutPath = store.rolloutPath;
+    const sessionTempRoot = join(temporaryHome, "per-attempt-temp");
+    mkdirSync(sessionTempRoot, { recursive: true });
+    const scanner = new CanonicalRolloutScanner();
+    const options = {
+      sessionTempRoot,
+      expectedRunId: "prefix-per-attempt",
+      expectedEpoch: 1,
+      maximumScanMilliseconds: 30_000,
+      compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
+    } as const;
+    try {
+      appendMarkedRows(store, 40);
+      scanner.scan(rolloutPath, options);
+      expect(readdirSync(sessionTempRoot)).toHaveLength(2);
+
+      // Rollback bookkeeping names the attempt it is reconstructing, so no
+      // later scan can ask this prefix its question: holding it would only
+      // evict one that a later scan can still use.
+      scanner.scan(rolloutPath, {
+        ...options,
+        captureHistoryAtAttemptIds: ["rollback-attempt"],
+      });
+      expect(readdirSync(sessionTempRoot)).toHaveLength(2);
+    } finally {
+      scanner.close();
+      store.close();
+    }
+  });
+
+  it("re-validates a rollout replaced at the same path", () => {
+    const store = createStore("prefix-inode-replaced");
+    const rolloutPath = store.rolloutPath;
+    const scanner = new CanonicalRolloutScanner();
+    const options = {
+      sessionTempRoot: join(temporaryHome, "scan-temp"),
+      expectedRunId: "prefix-inode-replaced",
+      expectedEpoch: 1,
+      maximumScanMilliseconds: 30_000,
+      compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
+    } as const;
+    try {
+      appendMarkedRows(store, 40);
+      const before = scanner.scan(rolloutPath, options);
+
+      // What an atomic rewrite leaves behind: the same path, the same length,
+      // other bytes, another inode. The prefix names an inode that no longer
+      // holds them, so it cannot stand in for the file.
+      replaceAtNewInode(rolloutPath, "row-0007-", "row-9999-");
+      const after = scanner.scan(rolloutPath, options);
+
+      expect(after.proof.sourceSha256).not.toBe(before.proof.sourceSha256);
+      expect(after.proof.recordCount).toBe(before.proof.recordCount);
+    } finally {
+      scanner.close();
+      store.close();
+    }
+  });
+
+  it("re-validates a rollout truncated under it", () => {
+    const store = createStore("prefix-truncated");
+    const rolloutPath = store.rolloutPath;
+    const scanner = new CanonicalRolloutScanner();
+    const options = {
+      sessionTempRoot: join(temporaryHome, "scan-temp"),
+      expectedRunId: "prefix-truncated",
+      expectedEpoch: 1,
+      maximumScanMilliseconds: 30_000,
+      compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
+    } as const;
+    try {
+      appendMarkedRows(store, 40);
+      const before = scanner.scan(rolloutPath, options);
+
+      // Same inode, fewer bytes: the prefix reaches past the end of the file
+      // it was built from, so there is nothing left for it to stand in for.
+      truncateAtRecordBoundary(rolloutPath, 20);
+      const after = scanner.scan(rolloutPath, options);
+
+      expect(after.proof.recordCount).toBe(20);
+      expect(before.proof.recordCount).toBe(41);
+    } finally {
+      scanner.close();
+      store.close();
+    }
+  });
 });
 
 
@@ -296,6 +533,53 @@ function comparable(scan: CanonicalRolloutScan): unknown {
     activeHistory: scan.activeHistory,
     historyAtAttempts: [...scan.historyAtAttempts],
   };
+}
+
+/** Fixed-width markers so a record can be rewritten without resizing it. */
+function appendMarkedRows(store: RolloutStore, rows: number): void {
+  for (let index = 0; index < rows; index += 1) {
+    store.appendRollout({
+      type: "response_item",
+      payload: {
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `row-${String(index).padStart(4, "0")}-${"x".repeat(256)}`,
+      },
+    });
+  }
+  store.flushDurable();
+}
+
+/** Rewrite one record and publish the result as a new file at the same path. */
+function replaceAtNewInode(path: string, find: string, replace: string): void {
+  if (find.length !== replace.length) {
+    throw new Error("replacement must preserve the rollout length");
+  }
+  const bytes = readFileSync(path);
+  const offset = bytes.indexOf(find);
+  if (offset === -1) throw new Error(`rollout has no ${find} record`);
+  bytes.write(replace, offset, "utf8");
+  const staged = `${path}.staged`;
+  writeFileSync(staged, bytes);
+  const before = statSync(path);
+  renameSync(staged, path);
+  const after = statSync(path);
+  if (before.ino === after.ino) throw new Error("rollout kept its inode");
+  if (before.size !== after.size) throw new Error("rollout changed size");
+}
+
+/** Drop every record after the first `keepRecords` lines, in place. */
+function truncateAtRecordBoundary(path: string, keepRecords: number): void {
+  const bytes = readFileSync(path);
+  let offset = 0;
+  for (let record = 0; record < keepRecords; record += 1) {
+    const next = bytes.indexOf(0x0a, offset);
+    if (next === -1) throw new Error("rollout has fewer records than that");
+    offset = next + 1;
+  }
+  const before = statSync(path);
+  truncateSync(path, offset);
+  const after = statSync(path);
+  if (before.ino !== after.ino) throw new Error("truncation replaced the file");
 }
 
 function createStore(sessionId: string): RolloutStore {

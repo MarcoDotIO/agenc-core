@@ -329,6 +329,20 @@ interface ValidatedPrefix {
  */
 const MAX_VALIDATED_PREFIXES = 2;
 
+/**
+ * How much active history a scanner keeps between scans of one rollout.
+ *
+ * A prefix that reduces active history holds a second copy of the whole
+ * conversation, next to the one the runtime already has, and that copy grows
+ * with the session. Everything else a prefix holds is the compaction
+ * lifecycle, which its own retention budget already bounds. So a prefix that
+ * grew past this ceiling answers its scan and is then released: the sessions
+ * large enough to reach it are exactly the ones that can least afford the
+ * second copy, and the bookkeeping calls that reduce no history - six of the
+ * eight per compaction step - keep their prefix either way.
+ */
+const MAX_RETAINED_ACTIVE_HISTORY_BYTES = 4 * 1_024 * 1_024;
+
 /** Validated prefixes, most recently used first. */
 interface PrefixOwner {
   readonly prefixes: ValidatedPrefix[];
@@ -343,6 +357,10 @@ interface PrefixOwner {
  * scan of the same inode. The second pass still reads the whole file and its
  * digest must equal the incrementally maintained one, so a prefix that changed
  * underneath a reused validator fails the scan instead of answering from it.
+ *
+ * What it keeps is bounded: a prefix that reduced more than
+ * `MAX_RETAINED_ACTIVE_HISTORY_BYTES` of active history, and a prefix keyed to
+ * one attempt, are released once they have answered.
  *
  * Every prefix owns two disk registries, so a scanner must be closed.
  */
@@ -411,24 +429,24 @@ function scanCanonicalRolloutUntimed(
     }
     checkOperationalBudget();
     const fingerprint = prefixFingerprint(options);
+    const carried = reusablePrefix(owner, rolloutPath, fingerprint, snapshot);
     const prefix =
-      reusablePrefix(owner, rolloutPath, fingerprint, snapshot) ??
-      retainPrefix(
-        owner,
-        beginPrefix(rolloutPath, options, fingerprint, snapshot),
-      );
+      carried ?? beginPrefix(rolloutPath, options, fingerprint, snapshot);
     prefix.budget.check = checkOperationalBudget;
     const state = prefix.state;
     try {
       streamCanonicalTail(fd, snapshot.size, prefix, checkOperationalBudget);
       const first = prefix.validator.snapshot();
 
-      if (
-        state.latestCommittedAttempt !== undefined &&
+      // A file that ends mid-bookkeeping is a conclusion about where this
+      // scan stopped reading, not about the bytes: the session_meta that
+      // completes the window is appended straight after the boundary. Keeping
+      // it out of the carried-over state is what makes a reused prefix answer
+      // exactly as a full replay of the same bytes would.
+      const awaitingPostCommitMeta =
         state.postCommitBookkeeping === "await_meta"
-      ) {
-        state.latestCommittedAttempt.laterWork = true;
-      }
+          ? state.latestCommittedAttempt
+          : undefined;
       assertAttemptsReconstructed(state.attempts);
 
       checkOperationalBudget();
@@ -510,7 +528,7 @@ function scanCanonicalRolloutUntimed(
       assertMatchingProof(first, second);
       assertPinnedSnapshot(fd, snapshot);
       checkOperationalBudget();
-      return {
+      const scan: CanonicalRolloutScan = {
         proof: withoutRecords(first),
         attempts: new Map(
           [...state.attempts].map(([attemptId, attempt]) => [
@@ -519,7 +537,8 @@ function scanCanonicalRolloutUntimed(
               intent: attempt.intent!,
               records: Object.freeze(attempt.records.slice()),
               admissionValid: validAdmission(attempt),
-              hasLaterCanonicalWork: attempt.laterWork,
+              hasLaterCanonicalWork:
+                attempt.laterWork || attempt === awaitingPostCommitMeta,
               sourceHistoryRetained: attempt.sourceHistoryValidated === true,
               ...(attempt.sourceHistoryManifest !== undefined
                 ? { sourceHistoryManifest: attempt.sourceHistoryManifest }
@@ -544,6 +563,21 @@ function scanCanonicalRolloutUntimed(
           : {}),
         historyAtAttempts: new Map(state.historyAtAttempts),
       };
+      // Whether this prefix is worth keeping is only knowable now: how much
+      // history it reduced is a fact about the bytes it read. Deciding here
+      // also keeps a prefix that is about to be released from taking a slot
+      // away from one a later scan can still use. A prefix keyed to one
+      // attempt's history is never worth keeping - no later scan asks its
+      // question.
+      if (
+        (options.captureHistoryAtAttemptIds ?? []).length > 0 ||
+        state.activeSourceBytes > MAX_RETAINED_ACTIVE_HISTORY_BYTES
+      ) {
+        discardPrefix(owner, prefix);
+      } else if (carried === undefined) {
+        retainPrefix(owner, prefix);
+      }
+      return scan;
     } catch (error) {
       // Whatever failed may have left this prefix out of step with the
       // file: a partial push, or a second pass that rejected the digest it
