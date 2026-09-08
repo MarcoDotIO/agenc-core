@@ -1004,6 +1004,11 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
               }
             : {}),
           deferSessionStartHooks: true,
+          // A daemon restore is exactly the case where an orphaned in-flight
+          // turn exists, and bootstrap would resume-continue it before this
+          // method can install the approval bridge or register the agent.
+          // Keep that one step for `#driveDeferredDurableResume` below (#2239).
+          deferDurableTurnResume: true,
           ...(params.resumeSuspendedRun === true ||
           params.resumeStartupActivationPending === true
             ? {
@@ -1314,6 +1319,10 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           onReplayToolResult: params.onReplayToolResult,
         });
         params.signal?.throwIfAborted();
+        // Last: this generation now owns `#active`, the approval bridge, and
+        // the canonical event bridge, so a resumed turn that needs approval
+        // reaches a client instead of the arbiter default deny.
+        this.#driveDeferredDurableResume(active);
         return true;
       } catch (error) {
         const cleanupErrors: unknown[] = [];
@@ -4217,6 +4226,43 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       active.lastActiveAt = this.#now();
     }
     return resolved;
+  }
+
+  /**
+   * Drive the durable-turn resume bootstrap withheld from its startup prewarm.
+   *
+   * Ordering is the whole point (#2239): the resumed turn is a real model turn
+   * that can call tools needing approval, and it must run AFTER
+   * `#installDaemonApprovalBridge` published `services.approvalResolver` and
+   * AFTER `#active.set`, because `#requestDaemonToolDecision` denies outright
+   * for an agent that is not registered.
+   *
+   * Deliberately NOT awaited by `restoreAgent`: an approval has no default
+   * timeout, so awaiting it would block the whole restore — and the daemon's
+   * own startup — on a human decision that cannot be delivered until restore
+   * returns and a client attaches. The permission request is buffered on the
+   * agent until then. The promise is retained on the generation so the
+   * in-flight resume stays observable; stopping the agent aborts the session,
+   * which ends the resumed turn.
+   *
+   * A user message that arrives while the resumed turn waits for its approval
+   * is never queued behind it: `Session.spawnTask` aborts the running turn as
+   * `replaced`, so the new message wins exactly as it does for any other
+   * in-flight turn.
+   */
+  #driveDeferredDurableResume(active: ActiveBackgroundAgent): void {
+    const runDeferredDurableTurnResume =
+      active.bootstrap.runDeferredDurableTurnResume;
+    if (typeof runDeferredDurableTurnResume !== "function") return;
+    active.durableResumeComplete = (async () => {
+      try {
+        await runDeferredDurableTurnResume();
+      } catch {
+        // The resume is best-effort and already records its own failure on
+        // the conversation thread record; it must never surface as an
+        // unhandled rejection on a live daemon.
+      }
+    })();
   }
 
   #installDaemonApprovalBridge(

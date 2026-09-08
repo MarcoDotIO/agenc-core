@@ -716,6 +716,14 @@ interface ActiveBackgroundAgent {
   messageSubmissionQueue: Promise<void>;
   /** Resolves only after this exact generation has relinquished #active. */
   cleanupComplete: Promise<void>;
+  /**
+   * Settles when the deferred durable-turn resume this generation started has
+   * finished. Retained so the in-flight resume is observable to the runner
+   * and its tests; never rejects. Stopping the agent aborts the session,
+   * which ends the resumed turn, so quiescence deliberately does not wait on
+   * it — that would block stop on a pending approval (#2239).
+   */
+  durableResumeComplete?: Promise<void>;
   pendingMessageSubmissionCount: number;
   readonly messageSubmissionsById: Map<string, ActiveMessageSubmission>;
   pendingShellExecutionCount: number;
