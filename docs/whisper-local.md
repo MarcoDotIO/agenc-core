@@ -16,6 +16,11 @@ Without this override, macOS checks `/opt/homebrew/bin/whisper-cli` and
 `/usr/bin/whisper-cli`. Client params and client environment snapshots cannot
 choose an executable, filesystem path, URL, shell argument, or engine provider.
 
+The AgenC Desktop distribution handles its own pinned native-engine packaging
+and supplies the bundled executable through the host startup override. The
+standalone Core package and this service do not download or install executable
+code; the one-click model action still downloads only verified model weights.
+
 Desktop Settings must request a model installation explicitly. Status checks
 never download a model or create storage. Base is approximately 148 MB and Small
 488 MB (decimal). Models are multilingual, pinned to ggml repository revision
@@ -78,6 +83,12 @@ Use a dedicated client connection so inference/download does not block the norma
 daemon control lane. Errors contain stable codes and user-safe messages, never
 native stderr or temporary audio paths.
 
+The canonical protocol schema includes `WhisperInternalRequest`, its three
+request definitions and the `WhisperStatus`/`WhisperTranscription` result
+definitions. `x-agenc-whisper-internal-methods` identifies this opt-in extension.
+It deliberately remains outside the public request union and public method list;
+publishing these validation definitions does not grant remote access.
+
 ## Licenses and redistribution
 
 [whisper.cpp](https://github.com/ggml-org/whisper.cpp/blob/v1.9.2/LICENSE)
@@ -87,7 +98,8 @@ not a Google language model. Preserve applicable copyright and MIT permission
 notices with any future redistribution of the engine or models; private repository
 visibility does not replace license obligations. This implementation introduces
 no FFmpeg, SDL, Silero, or Google runtime dependency. Native binary packaging,
-platform signing, and bundled-license verification remain separate release work.
+platform signing, and bundled-license verification belong to the distributing
+application's release pipeline, separate from this Core service.
 
 ## Verification
 

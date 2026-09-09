@@ -15,6 +15,32 @@ describe("local Whisper daemon RPC", () => {
   it("never adds audio to the browser remote grant surface", () => {
     for (const method of ["audio.whisper.status", "audio.whisper.install", "audio.whisper.transcribe"]) expect(BROWSER_METHODS).not.toContain(method);
   });
+  it("denies every Whisper handler on a remote connection even if its boundary admits the method", async () => {
+    const service = handlers(); const { dispatcher, connection: local } = fixture(service);
+    const remote = dispatcher.createConnection({ remoteAccess: { authorize: async () => {}, allowsMethod: () => true, projection: () => ({}) } as never });
+    try {
+      await initialize(remote);
+      for (const method of ["audio.whisper.status", "audio.whisper.install", "audio.whisper.transcribe"]) {
+        expect(await remote.dispatch(request(method, method))).toHaveProperty("error");
+      }
+      expect(service.status).not.toHaveBeenCalled(); expect(service.install).not.toHaveBeenCalled(); expect(service.transcribe).not.toHaveBeenCalled();
+    } finally { await remote.close(); await local.close(); await dispatcher.close(); }
+  });
+  it("does not let another local connection cancel an in-flight Whisper request", async () => {
+    let observed: AbortSignal | undefined;
+    const pending = vi.fn((_params: unknown, signal: AbortSignal) => { observed = signal; return new Promise<never>(() => {}); });
+    const { dispatcher, connection } = fixture({ ...handlers(), install: pending });
+    const other = dispatcher.createConnection();
+    try {
+      await initialize(connection); await initialize(other);
+      const work = connection.dispatch(request("install", "audio.whisper.install", { model: "base" }));
+      await vi.waitFor(() => expect(observed).toBeDefined());
+      expect(await other.dispatch(request("cancel-other", "request.cancel", { requestId: "install" }))).toMatchObject({ result: { cancelled: false } });
+      expect(observed?.aborted).toBe(false);
+      await connection.dispatch(request("cancel-owner", "request.cancel", { requestId: "install" }));
+      expect(await work).toMatchObject({ error: { data: { code: "REQUEST_CANCELLED" } } });
+    } finally { await other.close(); await connection.close(); await dispatcher.close(); }
+  });
   it("advertises only configured handlers and requires initialize", async () => {
     const enabled = fixture(handlers()); const disabled = fixture();
     try {
