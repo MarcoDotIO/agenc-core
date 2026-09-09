@@ -44,6 +44,30 @@ async function fixture() {
   return { root, directory, file, record, keys, socketRoot, socketPath, config: { ...config, desktopAuthority: proof } };
 }
 describe("operator-bootstrapped Desktop control authority", () => {
+  it("requires exact own proof and record keys without sorting protocol fields", async () => {
+    const f = await fixture();
+    const proof = f.config.desktopAuthority;
+    expect(desktopAuthorityProofIssue({ signature: proof.signature, id: proof.id })).toBeUndefined();
+    const inherited = Object.assign(Object.create(proof), { "id,signature": true });
+    const hiddenExtra = Object.defineProperty({ ...proof }, "extra", { value: true });
+    for (const malformed of [
+      { id: proof.id }, { ...proof, extra: true },
+      { "id,signature": proof.signature }, inherited, hiddenExtra,
+      { ...proof, [Symbol("extra")]: true },
+    ]) expect(desktopAuthorityProofIssue(malformed)).toBeTruthy();
+    const reordered = { socketPath: f.record.socketPath, publicKey: f.record.publicKey, version: f.record.version, expiresAt: f.record.expiresAt };
+    await writeFile(f.file, JSON.stringify(reordered));
+    expect(hasDesktopAuthority(await verifyDesktopAuthority(f.config, f.root))).toBe(true);
+    for (const missingKey of Object.keys(f.record)) {
+      const missing: Record<string, unknown> = { ...f.record };
+      delete missing[missingKey];
+      await writeFile(f.file, JSON.stringify(missing));
+      await expect(verifyDesktopAuthority(f.config, f.root)).rejects.toThrow("could not be verified");
+    }
+    await writeFile(f.file, JSON.stringify({ ...f.record, extra: true }));
+    await expect(verifyDesktopAuthority(f.config, f.root)).rejects.toThrow("could not be verified");
+  });
+
   it.each(["durable", "live"] as const)("allows only audited inspection through the %s unknown-outcome admission gate", async (gate) => {
     const f = await fixture();
     const grant = await verifyDesktopAuthority(f.config, f.root);
@@ -180,6 +204,13 @@ describe("operator-bootstrapped Desktop control authority", () => {
     await expect(attestDesktopEndpoint(config, rebound)).rejects.toThrow("Live Desktop");
     expect(rebound).toHaveBeenCalledOnce();
     expect(new Headers(rebound.mock.calls[0][1]?.headers).has("authorization")).toBe(false);
+    const extraField: typeof fetch = async (url, init) => {
+      const valid = await live(url, init);
+      return new Response(JSON.stringify({ ...await valid.json(), extra: true }));
+    };
+    await expect(attestDesktopEndpoint(config, extraField)).rejects.toThrow("Live Desktop");
+    const oversized: typeof fetch = async () => new Response(" ".repeat(1025));
+    await expect(attestDesktopEndpoint(config, oversized)).rejects.toThrow("Live Desktop");
   });
   it("fails closed on expired records, unsafe modes, symlinks and malformed proof", async () => {
     const f = await fixture();

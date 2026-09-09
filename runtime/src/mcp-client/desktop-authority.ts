@@ -13,6 +13,13 @@ const READS = new Set(["desktop_state", "desktop_window_state", "browser_tabs", 
 // owner-targeted tabs, automatic downloads blocked before any file creation.
 const UI_MUTATIONS = new Set(["desktop_settings_open", "desktop_settings_update", "desktop_window", "desktop_session_open", "desktop_session_update", "desktop_project_select", "browser_open_tab", "browser_select_tab", "browser_close_tab", "browser_navigate", "browser_click", "browser_type", "browser_press_key", "browser_scroll", "browser_back", "browser_forward", "browser_reload", "browser_evaluate"]);
 
+/** Exact protocol keys, independent of insertion order or host locale. */
+function hasExactOwnKeys(value: object, expected: readonly string[]): boolean {
+  const keys = Reflect.ownKeys(value);
+  return keys.length === expected.length &&
+    keys.every(key => typeof key === "string" && expected.includes(key));
+}
+
 async function privateSocketIdentity(socketPath: unknown): Promise<string> {
   const uid = process.getuid?.();
   if (uid === undefined || typeof socketPath !== "string" || !isAbsolute(socketPath) ||
@@ -40,7 +47,7 @@ export function desktopAuthorityProofIssue(value: unknown): string | undefined {
   if (value === undefined) return undefined;
   if (!value || typeof value !== "object" || Array.isArray(value)) return "desktopAuthority must be an object";
   const object = value as Record<string, unknown>;
-  if (Object.keys(object).sort().join(",") !== "id,signature" || typeof object.id !== "string" || !UUID.test(object.id) ||
+  if (!hasExactOwnKeys(object, ["id", "signature"]) || typeof object.id !== "string" || !UUID.test(object.id) ||
     typeof object.signature !== "string" || !/^[A-Za-z0-9+/]{86}==$/.test(object.signature)) return "desktopAuthority requires a UUID and Ed25519 signature";
   return undefined;
 }
@@ -68,7 +75,7 @@ export async function verifyDesktopAuthority(config: {
       const stat = await file.stat();
       if (!stat.isFile() || stat.uid !== uid || stat.nlink !== 1 || (stat.mode & 0o7777) !== 0o600 || stat.size > 4096) throw deny();
       const record = JSON.parse(await file.readFile("utf8")) as Record<string, unknown>;
-      if (Object.keys(record).sort().join(",") !== "expiresAt,publicKey,socketPath,version" || record.version !== 2 || typeof record.publicKey !== "string" ||
+      if (!hasExactOwnKeys(record, ["expiresAt", "publicKey", "socketPath", "version"]) || record.version !== 2 || typeof record.publicKey !== "string" ||
         !Number.isSafeInteger(record.expiresAt) || (record.expiresAt as number) <= Date.now() || (record.expiresAt as number) > Date.now() + 13 * 60 * 60 * 1000) throw deny();
       const socketIdentity = await privateSocketIdentity(record.socketPath);
       const key = createPublicKey(record.publicKey);
@@ -101,12 +108,26 @@ export async function attestDesktopEndpoint(config: {
     await assertDesktopSocketBinding(grant);
     const response = await fetcher(`${config.endpoint}/authority`, { method: "POST", redirect: "error", signal: AbortSignal.timeout(5000), headers: { "content-type": "application/json" }, body: JSON.stringify({ nonce, authorizationHash }) });
     if (!response.ok || !response.body) throw deny();
-    const reader = response.body.getReader(); let size = 0; const chunks: Uint8Array[] = [];
+    const reader = response.body.getReader();
+    let size = 0;
+    const chunks: Uint8Array[] = [];
     try {
-      for (;;) { const item = await reader.read(); if (item.done) break; size += item.value.length; if (size > 1024) throw deny(); chunks.push(item.value); }
-    } finally { await reader.cancel(); }
+      for (;;) {
+        const item = await reader.read();
+        if (item.done) {
+          break;
+        }
+        size += item.value.length;
+        if (size > 1024) {
+          throw deny();
+        }
+        chunks.push(item.value);
+      }
+    } finally {
+      await reader.cancel();
+    }
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
-    if (Object.keys(body).join(",") !== "signature" || typeof body.signature !== "string" || !/^[A-Za-z0-9+/]{86}==$/.test(body.signature)) throw deny();
+    if (!hasExactOwnKeys(body, ["signature"]) || typeof body.signature !== "string" || !/^[A-Za-z0-9+/]{86}==$/.test(body.signature)) throw deny();
     const material = JSON.stringify([3, config.name, config.endpoint, authorizationHash, nonce, grant.socketPath]);
     if (!verify(null, Buffer.from(material), key, Buffer.from(body.signature, "base64"))) throw deny();
   } catch { throw deny(); }
