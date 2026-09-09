@@ -130,6 +130,18 @@ turn, tool, and arguments all match; JSON input cannot manufacture that proof.
 Read/UI classifications use a closed product-owned list, never MCP annotations.
 Ordinary approvals and plan restrictions still apply.
 
+Only those authenticated, audited inspection tools declare an `idempotent`
+recovery category: `desktop_state`, `desktop_window_state`, `browser_tabs`,
+`browser_screenshot`, `browser_downloads`, `browser_console`, `terminal_list`,
+and `terminal_read`. They can inspect a session that has a prior unresolved
+outcome without clearing it or
+replaying the original action. All mutations remain behind the session-wide
+unknown-outcome gate. Generic MCP read-only annotations grant no exemption, and
+captured inspection tools still refuse remote turns or expired host authority.
+`browser_snapshot`, `browser_read_text`, and `browser_wait_for` remain gated:
+their page-main-world JavaScript may invoke page-defined code, so permission-level
+read classification alone is not sufficient to declare safe recovery/replay.
+
 The visible native PTY is **not Core-sandboxed**. `terminal_open`, `terminal_run`,
 `terminal_type`, and `terminal_close` require an already full-access session and
 its current authenticated sandbox broker; one-shot approval/escalation is not

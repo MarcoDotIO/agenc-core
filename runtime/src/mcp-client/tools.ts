@@ -630,6 +630,13 @@ function exactDesktopInvocation(
 }
 
 const DESKTOP_NATIVE_TERMINALS = new Set(["terminal_open", "terminal_run", "terminal_type", "terminal_close"]);
+// Narrower than permission-level reads: snapshot/read_text/wait_for execute
+// page-main-world JavaScript and may invoke page-defined getters or setters.
+// Do not replay those while another effect is unresolved.
+const DESKTOP_IDEMPOTENT_INSPECTIONS = new Set([
+  "desktop_state", "desktop_window_state", "browser_tabs", "browser_screenshot",
+  "browser_downloads", "browser_console", "terminal_list", "terminal_read",
+]);
 function nativeDesktopTerminalAllowed(args: Record<string, unknown>, callId: string,
   toolName: string, options: MCPToolBridgePermissionOptions | undefined): boolean {
   const context = exactDesktopInvocation(args, callId, toolName, options);
@@ -944,7 +951,9 @@ export async function createToolBridge(
 
   const tools: Tool[] = providerSafeMcpTools.map((mcpTool) => {
     const namespacedName = `mcp.${serverName}.${mcpTool.name}`;
-    const desktopClass = desktopToolClassification(options.serverConfig?.desktopAuthorityGrant, mcpTool.name);
+    const desktopClass = serverName === "agenc-desktop-control" && options.serverConfig?.localOnly === true
+      ? desktopToolClassification(options.serverConfig.desktopAuthorityGrant, mcpTool.name)
+      : undefined;
     const defaultPermissionMode = perMcpToolApprovalMode(
       options.serverConfig,
       mcpTool.name,
@@ -974,7 +983,12 @@ export async function createToolBridge(
       ...(virtualNoFsWrites || desktopClass === "ui-mutation"
         ? { metadata: { mutating: true, virtualNoFsWrites: true } }
         : {}),
+      // Only the signed product-owned inspection list is safe to repeat after
+      // an unknown effect. Generic MCP readOnlyHint/isReadOnly annotations are
+      // not recovery authority. Live local/host checks below still apply.
       ...(desktopClass === "read" ? { isReadOnly: true, metadata: { mutating: false } } : {}),
+      ...(desktopClass === "read" && DESKTOP_IDEMPOTENT_INSPECTIONS.has(mcpTool.name)
+        ? { recoveryCategory: "idempotent" as const } : {}),
       ...(desktopClass === "ui-mutation" || (hasDesktopAuthority(options.serverConfig?.desktopAuthorityGrant) && DESKTOP_NATIVE_TERMINALS.has(mcpTool.name)) ? { requiresApproval: true } : {}),
       ...(defaultPermissionMode !== undefined ? { defaultPermissionMode } : {}),
 

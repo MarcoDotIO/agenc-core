@@ -13,10 +13,19 @@ import { createEmptyToolPermissionContext } from "../permissions/types.js";
 import { freshDenialTracking } from "../permissions/denial-tracking.js";
 import { attachToolRuntimeContext, type ToolRuntimeAttemptContext } from "../tools/runtimes/context.js";
 import { SandboxExecutionBroker, attachSandboxExecutionBroker } from "../sandbox/execution-broker.js";
+import { runAdmittedToolCall } from "../../src/budget/admitted-tool-call.js";
+import { poisonLiveEffect } from "../../src/budget/effect-settlement-supervisor.js";
+import { RolloutStore } from "../../src/session/rollout-store.js";
+import { openStateDatabases } from "../../src/state/sqlite-driver.js";
+import { recordInFlightToolCallUnknownOutcome } from "../../src/state/tool-output-rotation.js";
+import { listUnresolvedUnknownOutcomeEffects } from "../../src/state/unknown-outcome-gate.js";
+import { buildToolRegistry } from "../../src/tool-registry.js";
+import type { Tool } from "../../src/tools/types.js";
+import { bindAdmittedToolHarness } from "../helpers/admitted-tool-harness.js";
 
 const roots: string[] = [];
 const servers: Server[] = [];
-afterEach(async () => { vi.useRealTimers(); await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve())))); await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
+afterEach(async () => { vi.useRealTimers(); vi.restoreAllMocks(); await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve())))); await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "agenc-desktop-authority-")); roots.push(root);
   await chmod(root, 0o700);
@@ -35,6 +44,92 @@ async function fixture() {
   return { root, directory, file, record, keys, socketRoot, socketPath, config: { ...config, desktopAuthority: proof } };
 }
 describe("operator-bootstrapped Desktop control authority", () => {
+  it.each(["durable", "live"] as const)("allows only audited inspection through the %s unknown-outcome admission gate", async (gate) => {
+    const f = await fixture();
+    const grant = await verifyDesktopAuthority(f.config, f.root);
+    const reads = ["desktop_state", "desktop_window_state", "browser_tabs", "browser_screenshot", "browser_downloads", "browser_console", "terminal_list", "terminal_read"];
+    const gated = ["desktop_settings_open", "desktop_settings_update", "desktop_window", "desktop_session_open", "desktop_session_update", "desktop_project_select", "browser_open_tab", "browser_select_tab", "browser_close_tab", "browser_navigate", "browser_click", "browser_type", "browser_press_key", "browser_scroll", "browser_back", "browser_forward", "browser_reload", "browser_evaluate", "terminal_open", "terminal_run", "terminal_type", "terminal_close", "browser_snapshot", "browser_read_text", "browser_wait_for"];
+    const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "inspection" }] }));
+    const client = { listTools: async () => ({ tools: [...reads, ...gated].map(name => ({ name, annotations: { readOnlyHint: true, idempotentHint: true } })) }), callTool, close: async () => {} };
+    const bridge = await createToolBridge(client, f.config.name, undefined, { environment: {}, serverConfig: toToolCatalogPolicyConfig({ ...f.config, desktopAuthorityGrant: grant }) });
+    const registry = buildToolRegistry({ workspaceRoot: f.root, agencHome: f.root, mcpToolsProvider: { getTools: () => bridge.tools } });
+    const { session, events, acquire } = bindAdmittedToolHarness({ workspaceRoot: f.root, label: "desktop-inspection" });
+    const driver = openStateDatabases({ cwd: f.root, agencHome: f.root });
+    const prior = { sessionId: session.conversationId, toolCallId: "prior-browser-unknown", toolName: "Browser", recoveryCategory: "side-effecting" as const, observedAt: new Date(0).toISOString() };
+    recordInFlightToolCallUnknownOutcome(driver, prior);
+    const before = listUnresolvedUnknownOutcomeEffects(driver, session.conversationId);
+    // Invoke the production RolloutStore gate over the real isolated database;
+    // the lightweight harness supplies only admission/event-journal plumbing.
+    Object.assign(session.rolloutStore!, { assertToolAdmissionAllowed: (category: NonNullable<Tool["recoveryCategory"]>) => RolloutStore.prototype.assertToolAdmissionAllowed.call({ stateDriver: driver, sessionId: session.conversationId } as never, category) });
+    if (gate === "live") poisonLiveEffect(session, { runId: "prior-run", stepId: "prior-step", callId: prior.toolCallId, toolName: prior.toolName, recoveryCategory: prior.recoveryCategory });
+    let call = 0;
+    const admit = (tool: Tool, local = true) => withLocalMcpAccess(local, () => runAdmittedToolCall({
+      session, turnId: "turn-desktop-inspection", callId: `inspect-${++call}`, tool, args: {},
+      invoke: async ({ crossEffectBoundary }) => { crossEffectBoundary(); return tool.execute({}); },
+    }));
+    try {
+      for (const name of reads) {
+        const tool = registry.tools.find(tool => tool.name === `mcp.${f.config.name}.${name}`)!;
+        expect(tool).toMatchObject({ isReadOnly: true, recoveryCategory: "idempotent" });
+        expect((await admit(tool)).isError).not.toBe(true);
+      }
+      expect(callTool).toHaveBeenCalledTimes(reads.length);
+      expect(acquire).toHaveBeenCalledTimes(reads.length);
+      for (const name of gated) {
+        const tool = registry.tools.find(tool => tool.name === `mcp.${f.config.name}.${name}`)!;
+        expect(tool.recoveryCategory).toBe("side-effecting");
+        await expect(admit(tool)).rejects.toMatchObject({ code: "UNKNOWN_OUTCOME_MUTATION_BLOCKED" });
+      }
+      const capturedRead = bridge.tools[0];
+      expect((await admit(capturedRead, false)).isError).toBe(true);
+      vi.spyOn(Date, "now").mockReturnValue(f.record.expiresAt + 1);
+      expect((await admit(capturedRead)).isError).toBe(true);
+      expect(callTool).toHaveBeenCalledTimes(reads.length);
+      expect(listUnresolvedUnknownOutcomeEffects(driver, session.conversationId)).toEqual(before);
+      expect(events.some(event => event.msg.type === "effect_review_resolved")).toBe(false);
+      expect(events.filter(event => event.msg.type === "effect_intent").every(event => event.msg.type === "effect_intent" && event.msg.payload.recoveryCategory === "idempotent")).toBe(true);
+    } finally { driver.close(); await bridge.dispose(); }
+  });
+
+  it("never grants inspection recovery to unsigned, forged, stale or nonlocal catalogs", async () => {
+    const f = await fixture(); const grant = await verifyDesktopAuthority(f.config, f.root);
+    const client = { listTools: async () => ({ tools: [{ name: "desktop_state", annotations: { readOnlyHint: true, idempotentHint: true } }] }), callTool: vi.fn(async () => ({ content: [] })), close: async () => {} };
+    const config = { ...f.config, desktopAuthorityGrant: grant };
+    const variants = [
+      { ...config, desktopAuthorityGrant: undefined },
+      { ...config, desktopAuthorityGrant: { ...grant! } },
+      { ...config, localOnly: false },
+      { ...config, name: "unrelated-server" },
+    ];
+    const { session, acquire } = bindAdmittedToolHarness({ workspaceRoot: f.root, label: "spoofed-inspection" });
+    const driver = openStateDatabases({ cwd: f.root, agencHome: f.root });
+    recordInFlightToolCallUnknownOutcome(driver, { sessionId: session.conversationId, toolCallId: "prior-browser-unknown", toolName: "Browser", recoveryCategory: "side-effecting", observedAt: new Date(0).toISOString() });
+    Object.assign(session.rolloutStore!, { assertToolAdmissionAllowed: (category: NonNullable<Tool["recoveryCategory"]>) => RolloutStore.prototype.assertToolAdmissionAllowed.call({ stateDriver: driver, sessionId: session.conversationId } as never, category) });
+    const assertGated = async (bridge: Awaited<ReturnType<typeof createToolBridge>>) => {
+      expect(bridge.tools[0].recoveryCategory).toBeUndefined();
+      expect(bridge.tools[0].isReadOnly).toBeUndefined();
+      const registry = buildToolRegistry({ workspaceRoot: f.root, agencHome: f.root, mcpToolsProvider: { getTools: () => bridge.tools } });
+      const tool = registry.tools.find(tool => tool.name === bridge.tools[0].name)!;
+      expect(tool.recoveryCategory).toBe("side-effecting");
+      await expect(withLocalMcpAccess(true, () => runAdmittedToolCall({ session, turnId: "turn-spoofed-inspection", callId: "spoofed-read", tool, args: {}, invoke: () => tool.execute({}) }))).rejects.toMatchObject({ code: "UNKNOWN_OUTCOME_MUTATION_BLOCKED" });
+    };
+    try {
+      for (const variant of variants) {
+        const bridge = await createToolBridge(client, variant.name, undefined, { environment: {}, serverConfig: toToolCatalogPolicyConfig(variant) });
+        try { await assertGated(bridge); } finally { await bridge.dispose(); }
+      }
+      vi.spyOn(Date, "now").mockReturnValue(f.record.expiresAt + 1);
+      const expired = await createToolBridge(client, config.name, undefined, { environment: {}, serverConfig: toToolCatalogPolicyConfig(config) });
+      try {
+        await assertGated(expired);
+        expect((await withLocalMcpAccess(true, () => expired.tools[0].execute({}))).isError).toBe(true);
+      } finally { await expired.dispose(); }
+      expect(acquire).not.toHaveBeenCalled();
+      expect(client.callTool).not.toHaveBeenCalled();
+      expect(listUnresolvedUnknownOutcomeEffects(driver, session.conversationId)).toHaveLength(1);
+    } finally { driver.close(); }
+  });
+
   it("requires a signed, private operator record bound to endpoint and credential", async () => {
     const f = await fixture();
     const grant = await verifyDesktopAuthority(f.config, f.root);
