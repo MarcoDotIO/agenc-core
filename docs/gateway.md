@@ -72,6 +72,30 @@ agenc onboard channel
 agenc gateway install-service
 ```
 
+`install-service` records the selected canonical `AGENC_HOME` in the systemd
+unit or launchd plist. The service uses that home's config, pairing store,
+daemon socket and native credential namespace even when the service manager
+has a different environment. Reinstall the service after selecting a different
+home, or to update an older definition that did not record one.
+
+Only `AGENC_HOME` is added to the service environment. Provider keys, channel
+tokens and unrelated shell exports are not copied into the definition. Home
+paths containing control characters, unpaired Unicode surrogates or Unicode
+noncharacters are rejected before a service file is written or a service
+manager is called.
+
+Executable and entrypoint paths are recorded as literal arguments, including
+spaces, quotes, backslashes, percent signs, dollar signs and XML characters.
+The Linux unit uses `/usr/bin/env --` to execute Node because systemd rejects
+quotes and backslashes in the executable field itself. The unit disables
+environment expansion for that command and escapes percent specifiers.
+`/usr/bin/env` must be available. No shell parses the command.
+
+Both paths must be absolute file paths without control characters or invalid
+Unicode. A missing entrypoint or rejected path leaves an existing definition
+unchanged and does not invoke the service manager. Reinstall older service
+definitions to apply the corrected argument quoting.
+
 ## Channels
 
 ### stdio (dev)

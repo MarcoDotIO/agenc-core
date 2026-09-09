@@ -15,6 +15,55 @@ in-tree README:
 - All real work still flows through the **daemon**; the TUI is a client view
   onto daemon-owned sessions.
 
+## Daemon transcript replay
+
+The TUI retains the first 1,000 daemon events for local subscribers that mount
+after the shared daemon connection opens. This matches the transport's initial
+replay capacity. Each subscriber also has a pending queue capped at 1,000 events
+to preserve replay-to-live order, including events emitted from a callback.
+The transcript reducer deduplicates replay/live overlap by canonical event
+identity rather than message text.
+
+Identical assistant replies remain separate across turn starts and visible user
+messages, including queued human prompts and realtime replies. Within a turn,
+matching assistant and terminal-fallback text produces one row. Canonical event
+deduplication still prevents repeated delivery from creating extra rows.
+The active turn retains its fallback correlation when another user prompt is
+shown, so a late completion does not repeat the prior answer. Repeated start
+events for that same active turn also preserve the correlation.
+
+Existing live subscribers continue receiving events after the retained history
+fills. A later subscription fails before delivering any incomplete history or
+live events. A subscriber whose pending queue overflows is removed and reports
+the same `DAEMON_EVENT_REPLAY_GAP` error. Other live subscribers remain active.
+
+The transcript error remains visible with instructions to reopen the
+conversation and reload its durable history. Exit the TUI and reopen that
+conversation to create a fresh adapter. Retrying a subscription on the old
+adapter cannot repair its replay gap. Failed transcript subscriptions release
+their event-log listener and pending coalescing timer.
+
+## Retrying daemon submissions
+
+Each model submission gets a client message ID. If a request fails and the TUI
+restores its draft, submitting that unchanged draft again reuses the ID, model
+input, skill expansion, and attachment snapshot. Editing the draft or attaching
+new work starts a new submission. Agent and Editor drafts retain separate retry
+records; a late failure cannot replace a newer draft.
+
+For an existing daemon session, a completed duplicate reports the recorded
+success, failure, or cancellation without executing again. The recovery notice
+does not recreate missed tool events. Reopen the conversation to inspect its
+durable history. An admitted submission without a recorded terminal result
+reports an unknown outcome and refuses to run again. Inspect the history and
+any tool effects before deliberately starting a new submission.
+
+Silence is not proof that the daemon rejected a request. The acknowledgement
+watchdog reports uncertainty and does not release an outstanding request's busy
+state. Retry records last for the current TUI mount. Initial conversation
+creation and moving to a different daemon session are separate operations, not
+idempotent retries of an existing session's message.
+
 ## Layouts
 
 | Layout                                          | When                                                   |

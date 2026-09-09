@@ -40,8 +40,23 @@ Ready-wait timeout for clients that start the daemon
 
 | Client                                                         | Default      |
 | -------------------------------------------------------------- | ------------ |
-| Published launcher (`packages/agenc`)                          | **2000** ms  |
+| Published launcher (`packages/agenc`)                          | **45000** ms |
 | Runtime daemon autostart / `agenc daemon` / SDK socket connect | **45000** ms |
+
+The launcher and SDK use one deadline from the initial probe through readiness.
+The SDK includes its socket connection and initialize handshake. The launcher's
+old 2s default covered only polling after the starter finished; the 45s total
+budget now includes that starter. Both pass the remaining budget to the nested
+daemon-start command.
+
+Timeout or caller cancellation terminates the owned starter, with `SIGKILL`
+after 100 ms if needed. Waiting for `close` can add up to 1s. Cleanup failure is
+reported rather than treated as proof of termination. An existing or already
+detached daemon is not signalled by this cleanup. Custom launcher
+`spawnDaemonFn` callbacks must honor the supplied `signal` and register bounded
+child cleanup with `registerCleanup(promise)` if they manage their own child.
+An unresolved callback alone cannot expose a hidden child for termination.
+The launcher still continues to the requested command after autostart failure.
 
 ```bash
 AGENC_DAEMON_READY_TIMEOUT_MS=45000
@@ -134,6 +149,12 @@ const client = await connect(); // socket + cookie under AGENC_HOME
 ```
 
 ## Protocol
+
+The daemon's local socket and the MCP stdio server accept at most 16 MiB of
+UTF-8 payload per JSON line, excluding the LF, CRLF, or CR delimiter. A line
+exactly at the limit is valid. An oversized line closes the input before JSON
+parsing or dispatch, including when the terminating newline arrives in the
+chunk that crosses the limit. Multiple bounded lines can share a chunk.
 
 - Envelope: **JSON-RPC 2.0** over newline-delimited messages.
 - Protocol version constant: **`1.9.0`**
@@ -291,6 +312,12 @@ legacy FIFO/co-driving behavior is unchanged for 1.0/1.1 clients.
 Hidden-user submissions persist a non-rendering `message_submission` marker
 with a SHA-256 content fingerprint, so their idempotency identity also survives
 a process crash without duplicating the hidden prompt in that marker.
+
+When `clientMessageId` is omitted, the daemon assigns a collision-resistant
+ID with a random UUID suffix. Concurrent requests remain separate submissions
+even if they have identical content or arrive in the same millisecond. Treat
+the generated ID as opaque. Clients that need retry deduplication must provide
+their own stable `clientMessageId` before the first attempt.
 
 `session.transcript.v2` returns `schemaVersion: 2`, `runId`, `historyEpoch`,
 `asOfSequence`, and stable identity-bearing messages. Canonical messages carry
@@ -832,6 +859,19 @@ unavailability before treating a live agent as stale. Any successful
 snapshot clears the stamp. A daemon-restart recovery that restored the
 record without an attached runtime (`recovered === true` and no
 runtime) is immediately reapable because it cannot resume on its own.
+
+### Agent session termination
+
+Agent stop, runner termination, daemon shutdown, stale-agent reaping, and
+failed-create rollback terminate sessions through the client multiplexer.
+Termination removes session routes, client attachments, and buffered
+capability events. Late events cannot recreate a closed session's route
+or reach status observers.
+
+If a termination hook throws after the session closes, routing is still
+removed and the error is reported. Agent shutdown attempts every owned
+session before reporting termination errors. A failed termination that
+leaves the session live keeps its routing so termination can be retried.
 
 ### Admission step identity on keep-alive turns
 

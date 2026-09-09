@@ -7,7 +7,8 @@
 
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
-import { AgenCDaemonResponseError } from "../app-server/agent-cli.js";
+import { AgenCDaemonResponseError, MAX_BUFFERED_SESSION_EVENTS_PER_SESSION } from "../app-server/agent-cli.js";
+import { DaemonEventReplay } from "./daemon-event-replay.js";
 import { classifyTurnTerminal, createTurnFailedEvent } from "../contracts/turn-terminal.js";
 import type {
   AgentAttachParams,
@@ -18,6 +19,7 @@ import type {
   JsonValue,
   MessageContentBlock,
   MessageStreamParams,
+  MessageStreamResult,
   RequestId,
   SessionMcpStatusResult,
   SessionMcpAddServerParams,
@@ -146,7 +148,7 @@ import { mcpServerNameValidationIssue } from "../mcp-client/server-name.js";
 import { isRecord } from "../utils/record.js";
 import { logForDebugging } from "../utils/debug.js";
 import type { AgentRoleWorkspace } from "../agents/role-workspace.js";
-import type { SessionEditorInteraction } from "../session/autonomous-mode.js";
+import type { SessionSubmitOptions } from "../session/autonomous-mode.js";
 import type { RunRuntimeSettingsSnapshot } from "../contracts/run-contracts.js";
 import {
   applyDaemonTuiRuntimeSettingsAuthority,
@@ -383,10 +385,7 @@ export interface AgenCTuiBridgeSession extends AgenCCompactProgressControls {
   } | null;
   submit?(
     message: string,
-    opts?: {
-      readonly displayUserMessage?: string | null;
-      readonly editorInteraction?: SessionEditorInteraction;
-    },
+    opts?: SessionSubmitOptions,
   ): Promise<void>;
   enqueueIdleInput?(input: unknown, ownership?: IdleInputOwnership): number;
   enqueueIdleInputBatch?(
@@ -429,10 +428,7 @@ export type AgenCDaemonBackedTuiSession<
   subscribeToEvents(cb: (event: unknown) => void): () => void;
   submit(
     message: string,
-    opts?: {
-      readonly displayUserMessage?: string | null;
-      readonly editorInteraction?: SessionEditorInteraction;
-    },
+    opts?: SessionSubmitOptions,
   ): Promise<void>;
   enqueueIdleInput(input: unknown, ownership?: IdleInputOwnership): number;
   enqueueIdleInputBatch(
@@ -778,17 +774,7 @@ export function createDaemonTuiSession<
     readonly ownership?: IdleInputOwnership;
   };
   const queuedInputs: DaemonQueuedInput[] = [];
-  const eventSubscribers = new Set<(event: unknown) => void>();
-  // Backlog of received daemon events, replayed to subscribers that register
-  // LATE. The daemon replays the session's early events exactly once when the
-  // RPC subscription opens — a local subscriber that registers after that
-  // single replay (the transcript hook mounts after other subscriptions)
-  // would otherwise lose early events FOREVER: the user's first prompt
-  // (user_message) never reached the transcript hook and the message was
-  // invisible until ctrl+o. Replay from the same received stream — ids match,
-  // so the reducer's eventKey dedupe collapses any overlap with live events.
-  const receivedEvents: unknown[] = [];
-  const REPLAY_BACKLOG_LIMIT = 500;
+  const eventReplay = new DaemonEventReplay(MAX_BUFFERED_SESSION_EVENTS_PER_SESSION);
   let activeTurnSnapshot: { readonly turnId: string } | null = null;
   let lastObservedTurnId: string | undefined;
   let daemonTurnStartGeneration = 0;
@@ -907,12 +893,7 @@ export function createDaemonTuiSession<
   };
   const broadcastDaemonEvent = (event: unknown): void => {
     noteDaemonActivity(event);
-    if (receivedEvents.length < REPLAY_BACKLOG_LIMIT) {
-      receivedEvents.push(event);
-    }
-    for (const subscriber of [...eventSubscribers]) {
-      subscriber(event);
-    }
+    eventReplay.publish(event);
   };
   const realtime = createRealtimeTuiControls({
     threadId: realtimeThreadId,
@@ -1050,7 +1031,7 @@ export function createDaemonTuiSession<
   };
   const maybeStopDaemonEvents = (): void => {
     if (
-      eventSubscribers.size > 0 ||
+      eventReplay.size > 0 ||
       mcpProjection.hasSubscribers() ||
       runtimeSettingsReconciler !== undefined ||
       unsubscribeDaemonEvents === null
@@ -1201,9 +1182,12 @@ export function createDaemonTuiSession<
       if (queued.length === 0 && message.length === 0) return;
       inFlightInputCount += submittedInputCount;
       inFlightInputBytes += submittedInputBytes;
-      const streamId = `${clientId}:${Date.now()}`;
-      terminalDaemonTurnObserved = false;
-      activeTurnSnapshot = { turnId: streamId };
+      const clientMessageId = opts?.clientMessageId ?? randomUUID();
+      const streamId = `${clientId}:${randomUUID()}`;
+      if (activeTurnSnapshot === null) {
+        terminalDaemonTurnObserved = false;
+        activeTurnSnapshot = { turnId: streamId };
+      }
       const content =
         queued.length === 0
           ? message
@@ -1213,6 +1197,7 @@ export function createDaemonTuiSession<
                 ? [{ type: "text", text: message } as MessageContentBlock]
                 : []),
             ];
+      let recovered: MessageStreamResult | undefined;
       try {
         const metadata: JsonObject = {
           ...(opts?.displayUserMessage !== undefined
@@ -1250,12 +1235,31 @@ export function createDaemonTuiSession<
               }
             : {}),
         };
-        await client.request("message.stream", {
+        const result = await client.request("message.stream", {
           sessionId,
           content,
           ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+          clientMessageId,
           streamId,
         } satisfies MessageStreamParams);
+        if (result.disposition === "duplicate") {
+          if (
+            result.duplicateState !== "completed" ||
+            result.terminal === undefined
+          ) {
+            throw new Error(
+              `Submission ${clientMessageId} was already admitted, but its terminal outcome is unknown. It was not run again. Inspect the session history and tool effects before starting a new submission.`,
+            );
+          }
+          recovered = result;
+          if (
+            activeTurnSnapshot?.turnId === streamId ||
+            activeTurnSnapshot?.turnId === result.turnId
+          ) {
+            activeTurnSnapshot = null;
+            terminalDaemonTurnObserved = true;
+          }
+        }
         const submitted = new Set(queuedEntries);
         for (const [token, admission] of idleInputAdmissions) {
           if (admission.entries.every((entry) => submitted.has(entry))) {
@@ -1269,7 +1273,7 @@ export function createDaemonTuiSession<
         // startup messages) were already drained out of `queuedInputs` above;
         // if we don't roll them back the user's content is lost permanently
         // with no transcript entry. Re-prepend the drained blocks so the next
-        // submit re-sends them, preserving at-least-once delivery.
+        // submit re-sends them.
         if (queuedEntries.length > 0) {
           const originalEntries = new Set(queuedInputsBeforeSubmission);
           const admittedAfterSubmission = queuedInputs.filter(
@@ -1284,7 +1288,7 @@ export function createDaemonTuiSession<
           queuedInputCount += submittedInputCount;
           queuedInputBytes += submittedInputBytes;
         }
-        activeTurnSnapshot = null;
+        if (activeTurnSnapshot?.turnId === streamId) activeTurnSnapshot = null;
         throw error;
       } finally {
         inFlightInputCount = Math.max(
@@ -1295,6 +1299,16 @@ export function createDaemonTuiSession<
           0,
           inFlightInputBytes - submittedInputBytes,
         );
+      }
+      if (recovered?.terminal !== undefined) {
+        broadcastDaemonEvent({
+          type: "message_submission_recovered",
+          payload: {
+            clientMessageId,
+            ...(recovered.turnId === undefined ? {} : { turnId: recovered.turnId }),
+            ...recovered.terminal,
+          },
+        });
       }
     },
     enqueueIdleInput: (input, ownership) => {
@@ -1723,16 +1737,16 @@ export function createDaemonTuiSession<
         sessionId,
       } satisfies WorkspaceEditorPredictionFeedbackParams),
     subscribeToEvents: (cb) => {
-      // Late registrants get the backlog first (see receivedEvents above) —
-      // without this, a subscriber mounting after the daemon's one-shot RPC
-      // replay permanently misses every event that preceded it.
-      for (const event of receivedEvents) {
-        cb(event);
+      const unsubscribe = eventReplay.subscribe(cb);
+      try {
+        ensureDaemonEventsSubscribed();
+      } catch (error) {
+        unsubscribe();
+        maybeStopDaemonEvents();
+        throw error;
       }
-      eventSubscribers.add(cb);
-      ensureDaemonEventsSubscribed();
       return () => {
-        eventSubscribers.delete(cb);
+        unsubscribe();
         maybeStopDaemonEvents();
       };
     },
@@ -2916,6 +2930,9 @@ function transcriptEventFromSessionEvent(params: JsonObject): JsonObject | null 
   if (!isJsonObject(params.event)) return null;
   return {
     ...params.event,
+    ...(typeof params.clientMessageId === "string"
+      ? { clientMessageId: params.clientMessageId }
+      : {}),
     ...(typeof params.eventId === "string" && params.eventId.length > 0
       ? { eventId: params.eventId }
       : {}),

@@ -76,6 +76,47 @@ it and recovery never writes bare mode into the session toggle.
 `--bare` also takes precedence over `runtimeOptions.allowUntrustedHooks`; an
 untrusted-command capability cannot lift hard hook suppression.
 
+## Interrupted runtime-state publication
+
+`RuntimeStateRepository` reconciles interrupted `state.json` publications before
+an initial read, update, or freshness reload. Recovery and normal updates use
+the same configuration authority lock. A process that dies while holding that
+lock can leave it unavailable until its existing 30-second stale interval
+expires. Do not remove the lock while another AgenC process is running.
+Lock contention during a freshness reload invalidates the cache. The next
+read retries recovery even if `state.json` has not emitted another change.
+
+Each replacement has a versioned transaction journal and matching temporary
+and quarantine filenames. The journal binds the prior and replacement file
+identities, modes, ownership, sizes, modification times, and SHA-256 digests.
+The journal and file data are synchronized before the prior canonical file is
+moved. The exclusive link at the canonical path is the commit point.
+
+Recovery restores the prior state if publication did not reach that point.
+If the canonical path contains the recorded replacement, recovery keeps it.
+Expected two-link stages must match their recorded canonical partner before
+cleanup. Recovery synchronizes the parent directory between namespace changes
+and retains the journal until the surviving canonical file is verified.
+Direct users of the low-level publication and recovery functions must hold
+the configuration authority lock themselves.
+
+Malformed or multiple transactions, changed artifacts, unexpected links, and
+legacy stages whose unrelated IDs cannot prove a transaction stop startup
+with a recovery error. An interrupted first publication with no committed
+state also requires operator recovery. None of these cases becomes an empty
+runtime state. Preserve the reported files and the AgenC home before any
+manual recovery. Do not delete a stage because its timestamp looks older.
+
+Directory synchronization support depends on the operating system and
+filesystem. An unsupported directory sync does not establish power-loss
+durability. A sync failure before publication stops the update; a failure
+after publication preserves artifacts not yet cleaned up and reports an
+indeterminate commit durability. See the [Node.js file synchronization contract](https://nodejs.org/download/release/v26.5.0/docs/api/fs.html#fsfsyncsyncfd).
+
+The canonical JSON schema remains `state_version = 1`. After successful
+cleanup, the prior release can read the document. Finish any pending
+transaction with this release before downgrading.
+
 ## Layer order
 
 Later layers win:
@@ -309,6 +350,25 @@ otherwise.
 | `agent.retention.snapshot_max_count` | `10000` |
 | `agent.retention.snapshot_max_bytes` | `67108864` |
 | `agent.retention.rollout_days` | `30` (0 keeps every session) |
+
+Session snapshots stay dirty until persistence succeeds. Failed writes retain
+their serialized payload and timestamp. New events remain pending for the next
+snapshot. Timer retries start at 250 ms and double to a 30-second cap; explicit
+and periodic flushes can also retry. A failed session or project does not block
+the remaining periodic writes. A retry verifies any existing database row,
+accepting identical content instead of inserting a duplicate or replacing
+different content. New pending
+write files carry this verification flag through startup replay. Older pending
+files keep their existing replay behavior, and older runtimes do not enforce the
+new flag. Finish pending recovery before downgrading.
+
+If a dirty session cannot be persisted during eviction, the policy refuses the
+new session rather than exceeding its tracking cap. A failed close retains the
+session and its database driver, stops timers, and reports a cleanup error. An
+in-process owner can repair storage and retry close. Daemon shutdown reports a
+nonzero exit status but does not wait indefinitely for storage repair. Memory
+cannot survive process exit; if storage failed before a recovery file became
+durable, shutdown or a forced kill can still lose that unpersisted state.
 
 `max_turns` is unset by default; an unset turn cap does not impose a
 synthetic stop. `stream_watchdog_timeout_ms` defaults to `600000` (ten
