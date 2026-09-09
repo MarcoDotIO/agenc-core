@@ -2300,6 +2300,31 @@
         },
         "required": {
           "type": "boolean"
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "localOnly": {
+          "type": "boolean"
+        },
+        "desktopAuthority": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "signature"
+          ]
         }
       },
       "required": [
@@ -2316,6 +2341,9 @@
         },
         "config": {
           "$ref": "#/definitions/SessionMcpServerConfig"
+        },
+        "replace": {
+          "type": "boolean"
         }
       },
       "required": [
