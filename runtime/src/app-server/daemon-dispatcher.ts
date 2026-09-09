@@ -9,6 +9,7 @@
 
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
+import { WhisperError, type WhisperService } from "../audio/whisper.js";
 import { RemoteError, REMOTE_METHODS, type RemoteMethod } from "../remote/types.js";
 import type { RemoteAccessBoundary } from "../remote/access.js";
 import type { RemoteService } from "../remote/service.js";
@@ -299,6 +300,7 @@ export const COMMAND_EXEC_EXECUTION_ADMISSION_DIAGNOSTIC =
   "commandExec.start is disabled: daemon command execution has no session-bound run/step admission identity; use an ordinary admitted session tool until command execution admission is implemented";
 
 interface AgenCDaemonServerCapabilityInputs {
+  readonly whisper: WhisperService | undefined;
   readonly agentManager: AgenCDaemonDispatcherOptions["agentManager"];
   readonly initializeAuthenticator: AgenCDaemonDispatcherOptions["initializeAuthenticator"];
   readonly sessionManager: AgenCDaemonDispatcherOptions["sessionManager"];
@@ -330,6 +332,9 @@ function buildServerCapabilities(
     ...Object.fromEntries(OWNER_TELEGRAM_METHODS.map((method) => [method, inputs.ownerTelegram !== undefined && inputs.initializeAuthenticator !== undefined])) as Record<OwnerTelegramMethod, boolean>,
     initialize: true,
     "request.cancel": true,
+    "audio.whisper.status": inputs.whisper !== undefined,
+    "audio.whisper.install": inputs.whisper !== undefined,
+    "audio.whisper.transcribe": inputs.whisper !== undefined,
     "agent.create": hasMethod(agentManager, "createAgent"),
     "agent.list": hasMethod(agentManager, "listAgents"),
     "agent.attach": hasMethod(agentManager, "attachAgent"),
@@ -600,6 +605,7 @@ export interface AgenCDaemonDispatcherOptions {
   };
   readonly health?: Pick<AgenCDaemonHealthService, "ping" | "ready" | "stats">;
   readonly realtime?: AgenCRealtimeRpcHandlers;
+  readonly whisper?: WhisperService;
   readonly runInspection?: Pick<
     AgenCDaemonRunInspectionService,
     "status" | "result" | "replay" | "evidence"
@@ -715,6 +721,7 @@ export class AgenCDaemonJsonRpcDispatcher {
     | undefined;
   readonly #health: Pick<AgenCDaemonHealthService, "ping" | "ready" | "stats">;
   readonly #realtime: AgenCRealtimeRpcHandlers;
+  readonly #whisper: WhisperService | undefined;
   readonly #runInspection:
     | Pick<
         AgenCDaemonRunInspectionService,
@@ -757,6 +764,7 @@ export class AgenCDaemonJsonRpcDispatcher {
         stateCounter: options.healthStateCounter,
       });
     this.#realtime = options.realtime ?? new AgenCRealtimeRpcService();
+    this.#whisper = options.whisper;
     this.#runInspection = options.runInspection;
     this.#workflow = options.workflow;
     this.#routines = options.routines;
@@ -781,6 +789,7 @@ export class AgenCDaemonJsonRpcDispatcher {
       health: this.#health,
       initializeAuthenticator: this.#initializeAuthenticator,
       realtime: this.#realtime,
+      whisper: this.#whisper,
       runInspection: this.#runInspection,
       sessionManager: this.#sessionManager,
       workflow: this.#workflow,
@@ -984,6 +993,15 @@ export class AgenCDaemonJsonRpcDispatcher {
     signal: AbortSignal,
   ): Promise<AgenCDaemonResponse> {
     switch (method) {
+      case "audio.whisper.status":
+        if (!this.#whisper || connection.remoteAccess) return methodNotImplementedResponse(id, method);
+        return successResponse(id, await this.#whisper.status(params));
+      case "audio.whisper.install":
+        if (!this.#whisper || connection.remoteAccess) return methodNotImplementedResponse(id, method);
+        return successResponse(id, await this.#whisper.install(params, signal));
+      case "audio.whisper.transcribe":
+        if (!this.#whisper || connection.remoteAccess) return methodNotImplementedResponse(id, method);
+        return successResponse(id, await this.#whisper.transcribe(params, signal));
       case "routine.capabilities":
         if (this.#routines === undefined) return methodNotImplementedResponse(id, method);
         return successResponse(id, this.#routines.capabilities(params));
@@ -2340,6 +2358,8 @@ function methodSupportsRequestCancellation(
 ): boolean {
   return (
     method === "agent.create" ||
+    method === "audio.whisper.install" ||
+    method === "audio.whisper.transcribe" ||
     method === "fs.fuzzy_search" ||
     method === "commandExec.start" ||
     method === "csvJob.review.list" ||
@@ -5649,6 +5669,7 @@ function mapDispatchError(
   id: RequestId | null,
   error: unknown,
 ): AgenCDaemonResponse {
+  if (error instanceof WhisperError) return errorResponse(id, error.code === "WHISPER_INVALID_ARGUMENT" ? -32602 : -32000, error.message, { code: error.code });
   if (error instanceof RemoteError) return errorResponse(id, -32000, error.code, { code: error.code });
   if (error instanceof RoutineError) return errorResponse(id, -32602, error.message, { code: error.code });
   if (error instanceof DaemonOperationTimeoutError) {
