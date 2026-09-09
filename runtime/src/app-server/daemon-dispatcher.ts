@@ -8,6 +8,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { sessionMcpAttachmentIssue } from "../mcp-client/local-control.js";
 import { isAbsolute } from "node:path";
 import { RemoteError, REMOTE_METHODS, type RemoteMethod } from "../remote/types.js";
 import type { RemoteAccessBoundary } from "../remote/access.js";
@@ -154,6 +155,7 @@ import {
   type SessionClearParams,
   type SessionMcpStatusParams,
   type SessionMcpAddServerParams,
+  type SessionMcpServerConfig,
   type SessionMcpServerByNameParams,
   type WorkspaceEditorAcquireParams,
   type WorkspaceEditorBufferSync,
@@ -1518,6 +1520,7 @@ export class AgenCDaemonJsonRpcDispatcher {
           connection.initializeState?.serverCapabilities[
             AGENC_DAEMON_METHOD_CAPABILITIES_KEY
           ]["session.transcript.v2"] === true,
+          connection.remoteAccess === undefined,
         );
       case "message.stream":
         return this.#streamMessage(
@@ -1527,6 +1530,7 @@ export class AgenCDaemonJsonRpcDispatcher {
           connection.initializeState?.serverCapabilities[
             AGENC_DAEMON_METHOD_CAPABILITIES_KEY
           ]["session.transcript.v2"] === true,
+          connection.remoteAccess === undefined,
         );
       case "thread/realtime/start":
         return successResponse(
@@ -1962,6 +1966,7 @@ export class AgenCDaemonJsonRpcDispatcher {
     params: JsonObject,
     signal: AbortSignal,
     identitySafeCancellation: boolean,
+    localMcpAccess: boolean,
   ): Promise<AgenCDaemonResponse> {
     const sendParams = validateMessageSendParams(params);
     const messageId = sendParams.clientMessageId ?? this.#createMessageId();
@@ -1982,6 +1987,7 @@ export class AgenCDaemonJsonRpcDispatcher {
           streamId: messageId,
           acceptedAt,
           methodName: "message.send",
+          localMcpAccess,
           ...(sendParams.ifBusy !== undefined
             ? { ifBusy: sendParams.ifBusy }
             : {}),
@@ -2014,6 +2020,7 @@ export class AgenCDaemonJsonRpcDispatcher {
     params: JsonObject,
     signal: AbortSignal,
     identitySafeCancellation: boolean,
+    localMcpAccess: boolean,
   ): Promise<AgenCDaemonResponse> {
     const streamParams = validateMessageStreamParams(params);
     const messageId = streamParams.clientMessageId ?? this.#createMessageId();
@@ -2034,6 +2041,7 @@ export class AgenCDaemonJsonRpcDispatcher {
           messageId,
           streamId,
           acceptedAt,
+          localMcpAccess,
           ...(streamParams.ifBusy !== undefined
             ? { ifBusy: streamParams.ifBusy }
             : {}),
@@ -3295,8 +3303,12 @@ function validateSessionMcpAddServerParams(
     methodName: "session.mcp.addServer",
     stringFields: ["sessionId"],
     objectFields: ["config"],
+    valueFields: ["replace"],
   });
   validateRequiredString(validated, "session.mcp.addServer", "sessionId");
+  if (validated.replace !== undefined && typeof validated.replace !== "boolean") {
+    throw invalidParams("session.mcp.addServer replace must be a boolean");
+  }
   const config = validated.config;
   if (!isPlainJsonObject(config)) {
     throw invalidParams("session.mcp.addServer requires config");
@@ -3305,7 +3317,8 @@ function validateSessionMcpAddServerParams(
     methodName: "session.mcp.addServer.config",
     stringFields: ["name", "transport", "command", "endpoint"],
     stringArrayFields: ["args"],
-    valueFields: ["enabled", "required"],
+    objectFields: ["headers", "desktopAuthority"],
+    valueFields: ["enabled", "required", "localOnly"],
   });
   validateRequiredString(config, "session.mcp.addServer.config", "name");
   if (
@@ -3327,6 +3340,8 @@ function validateSessionMcpAddServerParams(
       );
     }
   }
+  const attachmentIssue = sessionMcpAttachmentIssue(config as SessionMcpServerConfig);
+  if (attachmentIssue) throw invalidParams(`session.mcp.addServer.config ${attachmentIssue}`);
   return validated as SessionMcpAddServerParams;
 }
 

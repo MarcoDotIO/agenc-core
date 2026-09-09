@@ -463,6 +463,25 @@ describe("AgenC daemon protocol surface", () => {
     ).toBe(false);
   });
 
+  it("publishes the private Desktop attachment without loosening other request fields", () => {
+    const validate = compileRequestValidator(readProtocolSchema());
+    const config = {
+      name: "agenc-desktop-control", transport: "http",
+      endpoint: "http://127.0.0.1:12345/mcp", localOnly: true,
+      headers: { Authorization: "Bearer fixture-only" },
+      desktopAuthority: { id: "fixture-authority", signature: "fixture-proof" },
+    };
+    const request = (patch: Record<string, unknown> = {}) => ({
+      jsonrpc: JSON_RPC_VERSION, id: "desktop-attach", method: "session.mcp.addServer",
+      params: { sessionId: "session_1", config, replace: true, ...patch },
+    });
+    expect(validate(request()), JSON.stringify(validate.errors)).toBe(true);
+    expect(validate(request({ config: { ...config, headers: { Authorization: 1 } } }))).toBe(false);
+    expect(validate(request({ config: { ...config, desktopAuthority: { ...config.desktopAuthority, trusted: true } } }))).toBe(false);
+    expect(validate(request({ replace: "true" }))).toBe(false);
+    expect(validate(request({ trusted: true }))).toBe(false);
+  });
+
   it("publishes only passive, non-authority MCP status fields", () => {
     const validate = compileDefinitionValidator(
       readProtocolSchema(),
