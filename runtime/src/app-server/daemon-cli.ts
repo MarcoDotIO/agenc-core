@@ -4957,8 +4957,17 @@ class AgenCDaemonSnapshotPolicyRegistry {
   }
 
   flushPeriodic(): void {
+    const errors: unknown[] = [];
     for (const entry of this.#policies.values()) {
-      entry.policy.flushPeriodic();
+      try {
+        entry.policy.flushPeriodic();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) {
+      for (const error of errors) this.#onError(error);
+      throw new AggregateError(errors, "daemon periodic snapshot flush failed");
     }
   }
 
@@ -4978,21 +4987,28 @@ class AgenCDaemonSnapshotPolicyRegistry {
       clearInterval(this.#periodicTimer);
       this.#periodicTimer = undefined;
     }
-    for (const entry of this.#policies.values()) {
+    const errors: unknown[] = [];
+    for (const [key, entry] of this.#policies) {
       // Flush dirty sessions synchronously before the state DB goes away.
       try {
         entry.policy.close();
+        entry.driver.close();
+        this.#policies.delete(key);
       } catch (error) {
+        errors.push(error);
         this.#onError(error);
       }
-      entry.driver.close();
     }
     for (const store of this.#threadStores.values()) {
       store.close();
     }
-    this.#policies.clear();
-    this.#sessionPolicyKeys.clear();
+    for (const [sessionId, key] of this.#sessionPolicyKeys) {
+      if (!this.#policies.has(key)) this.#sessionPolicyKeys.delete(sessionId);
+    }
     this.#threadStores.clear();
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "daemon snapshot policies retained unpersisted sessions");
+    }
   }
 
   recordSessionEvent(sessionId: string, event: JsonObject): void {
