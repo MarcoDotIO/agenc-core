@@ -136,10 +136,11 @@ describe("native Desktop authority filesystem reservation", () => {
         'printf forged > "$1"; echo "overwrite:$?"',
         'printf forged > "$2/new.json"; echo "create:$?"',
         '/bin/rm "$1"; echo "unlink:$?"',
+        '/bin/ln "$1" "$6"; echo "hardlink:$?"',
         '/bin/mv "$3" "$3-moved"; echo "home-move:$?"',
         '/bin/mv "$4" "$4-moved"; echo "ancestor-move:$?"',
         'printf allowed > "$5"; echo "normal:$?"',
-      ].join("\n"), "authority-probe", record, alias, f.home, path.dirname(f.home), path.join(f.workspace, "allowed.txt")];
+      ].join("\n"), "authority-probe", record, alias, f.home, path.dirname(f.home), path.join(f.workspace, "allowed.txt"), path.join(f.workspace, "hardlink.json")];
       const args = createSeatbeltCommandArgs({ command, fileSystemSandboxPolicy: profile.fileSystem,
         networkSandboxPolicy: "disabled", sandboxPolicyCwd: f.workspace, sessionTempRoot: f.temp, enforceManagedNetwork: false });
       const result = spawnSync("/usr/bin/sandbox-exec", args, { cwd, encoding: "utf8", timeout: 10_000 });
@@ -148,6 +149,7 @@ describe("native Desktop authority filesystem reservation", () => {
       expect(result.stdout).toMatch(/overwrite:[1-9]/);
       expect(result.stdout).toMatch(/create:[1-9]/);
       expect(result.stdout).toMatch(/unlink:[1-9]/);
+      expect(result.stdout).toMatch(/hardlink:[1-9]/);
       expect(result.stdout).toMatch(/home-move:[1-9]/);
       expect(result.stdout).toMatch(/ancestor-move:[1-9]/);
       expect(result.stdout).toContain("normal:0");

@@ -224,12 +224,19 @@ try {
     const restrictedResult = await refused.result();
     assert.equal(calls.length, 1, "restricted session dispatched an unsandboxed native terminal operation");
     const restrictedTranscript = JSON.stringify(await attached.session.transcript());
-    const restrictedToolResults = sdkRequests.slice(restrictedRequestStart).flatMap(request => (request.messages ?? request.input ?? []).filter(message => message.role === "tool" || message.type === "function_call_output"));
+    const restrictedToolResults = sdkRequests.slice(restrictedRequestStart).flatMap(request => {
+      const messages = request.messages ?? request.input ?? [];
+      const terminalCalls = new Set(messages.flatMap(message => message.type === "function_call" ? [message] : message.tool_calls ?? [])
+        .filter(call => (call.name ?? call.function?.name)?.endsWith("terminal_open"))
+        .map(call => call.call_id ?? call.id));
+      return messages.filter(message => (message.role === "tool" || message.type === "function_call_output") && terminalCalls.has(message.call_id ?? message.tool_call_id));
+    });
     if (!/sandbox|full-access|permission denied|not permitted|write target/i.test(JSON.stringify(restrictedToolResults))) {
       const diagnostic = JSON.stringify({ restrictedEvents, restrictedResult, restrictedTranscript, restrictedToolResults });
       for (const secret of secrets) assert(!diagnostic.includes(secret));
       console.error("Restricted terminal diagnostic", diagnostic.slice(-12000));
     }
+    assert(restrictedToolResults.length > 0, "restricted session did not attempt the terminal tool");
     assert(/sandbox|full-access|permission denied|not permitted|write target/i.test(JSON.stringify(restrictedToolResults)), "restricted terminal refusal was not surfaced to the model");
     for (const secret of secrets) assert(!JSON.stringify({ restrictedEvents, restrictedResult, restrictedTranscript }).includes(secret));
     console.log(JSON.stringify({ terminalPolicy: "PASS", fullAccessDispatched: true, restrictedDispatched: false, restrictedSessionId: attached.session.sessionId }));

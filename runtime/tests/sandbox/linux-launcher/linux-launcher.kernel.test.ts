@@ -66,6 +66,7 @@ test("protects custom Desktop authority records and their ancestor namespace wit
             overwrite: attempt(() => fs.writeFileSync(record, 'forged')),
             create: attempt(() => fs.writeFileSync(alias + '/new.json', 'forged')),
             unlink: attempt(() => fs.unlinkSync(record)),
+            hardlink: attempt(() => fs.linkSync(record, allowed + '.link')),
             homeMove: attempt(() => fs.renameSync(home, home + '-moved')),
             ancestorMove: attempt(() => fs.renameSync(ancestor, ancestor + '-moved')),
             normal: attempt(() => fs.writeFileSync(allowed, 'allowed')),
@@ -77,13 +78,13 @@ test("protects custom Desktop authority records and their ancestor namespace wit
           { path: { kind: "path", path: authority }, access: "write" },
           { path: { kind: "path", path: record }, access: "write" },
         ] } },
-      }).run(command => spawnSync(command.program, [...command.args], {
+      }).run(async command => spawnSync(command.program, [...command.args], {
         cwd: command.cwd, env: command.env, encoding: "utf8", timeout: 8_000,
       }));
       expect(result.error).toBeUndefined();
       expect(result.status, result.stderr).toBe(0);
       const evidence = JSON.parse(result.stdout);
-      for (const key of ["overwrite", "create", "unlink", "homeMove", "ancestorMove"]) expect(evidence[key], JSON.stringify(evidence)).not.toBe("ALLOWED");
+      for (const key of ["overwrite", "create", "unlink", "hardlink", "homeMove", "ancestorMove"]) expect(evidence[key], JSON.stringify(evidence)).not.toBe("ALLOWED");
       expect(evidence.normal).toBe("ALLOWED");
       expect(readFileSync(record, "utf8")).toBe("native-public-record");
       expect(existsSync(join(authority, "new.json"))).toBe(false);
