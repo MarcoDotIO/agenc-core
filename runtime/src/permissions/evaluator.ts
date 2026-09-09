@@ -42,6 +42,7 @@
  */
 
 import {
+  freshDenialTracking,
   handleDenialLimitExceeded,
   recordDenial,
   recordSuccess,
@@ -50,6 +51,12 @@ import {
 import { SAFE_YOLO_ALLOWLISTED_TOOLS } from "./classifier.js";
 import { commandHasAnyCd } from "../tools/BashTool/bashPermissions.js";
 import { checkReadOnlyConstraints } from "../tools/BashTool/readOnlyValidation.js";
+import { checkPathConstraints } from "../tools/BashTool/pathValidation.js";
+import {
+  readOnlyGrantRefusalMessage,
+  readOnlyGrantVerdict,
+  type ShellGateDeps,
+} from "./read-only-grant.js";
 import {
   getAskRuleForTool,
   getDenyRuleForTool,
@@ -60,6 +67,7 @@ import {
   unattendedAllowDecision,
   unattendedDenyDecision,
   unattendedPauseDecision,
+  unattendedPolicyForContext,
 } from "./unattended-policy.js";
 import type { Session } from "../session/session.js";
 import {
@@ -446,6 +454,110 @@ const SHELL_TOOL_NAMES: ReadonlySet<string> = new Set([
  * into the normal checks; anything it cannot parse, cannot classify or that
  * writes stays denied with the plan-mode message (#2205).
  */
+/**
+ * The two shipped gates the grant leans on. `checkReadOnlyConstraints` answers
+ * "does this command change anything"; `checkPathConstraints` answers "does it
+ * stay inside this project". Neither is sufficient alone: the first says yes to
+ * `cat ~/.ssh/id_rsa`, and the second says nothing about `rm`.
+ */
+const READ_ONLY_GRANT_DEPS: ShellGateDeps = {
+  checkReadOnly: (input) =>
+    checkReadOnlyConstraints(
+      input as Parameters<typeof checkReadOnlyConstraints>[0],
+      commandHasAnyCd(input.command),
+    ) as { behavior: string },
+  checkPaths: (input, cwd, context) =>
+    checkPathConstraints(
+      input as Parameters<typeof checkPathConstraints>[0],
+      cwd,
+      context,
+    ) as { behavior: string },
+};
+
+/**
+ * Where a relative path in a granted command resolves from. Containment itself
+ * is decided by the context's working directories, not by this value; this only
+ * has to name the folder the run was started in.
+ */
+function readOnlyGrantWorkingDirectory(
+  context: ToolPermissionContext,
+): string {
+  const [first] = context.additionalWorkingDirectories.keys();
+  return first ?? process.cwd();
+}
+
+/**
+ * The whole decision for a run with nobody attached: proceed on read-only
+ * work, refuse everything else. Never returns "ask", because an ask is what
+ * this policy exists to remove.
+ */
+async function decideReadOnlyGrant(
+  tool: ToolLike,
+  input: unknown,
+  context: ToolEvaluatorContext,
+  permissionContext: ToolPermissionContext,
+  unattended: { readonly behavior: string; readonly toolName: string },
+): Promise<PermissionDecision> {
+  const appState = context.getAppState();
+  // A refused call is the end of that road, and the model needs to hear that
+  // it is: left to a plain refusal it re-issues the same tool until the turn
+  // errors, which costs minutes and loses the report it was about to write.
+  const refuse = (message: string): PermissionDecision => {
+    const next = recordDenial(
+      context.denialTracking ?? appState.denialTracking ?? freshDenialTracking(),
+    );
+    persistDenialState(context, next);
+    return unattendedReadOnlyDenyDecision(
+      tool.name,
+      next.consecutiveDenials >= 2
+        ? `${message} This run has now been refused ${next.consecutiveDenials} times. Stop calling tools and write your findings as your final answer.`
+        : message,
+    );
+  };
+  // An operator naming the tool explicitly is a decision already made; the
+  // set decides everything else.
+  if (unattended.behavior !== "allow") {
+    const verdict = readOnlyGrantVerdict(
+      tool,
+      input,
+      readOnlyGrantWorkingDirectory(permissionContext),
+      permissionContext,
+      READ_ONLY_GRANT_DEPS,
+    );
+    if (!verdict.granted) {
+      return refuse(readOnlyGrantRefusalMessage(tool.name, verdict.refusal));
+    }
+  }
+  // Being admitted is not authority to skip the tool's own check. Anything
+  // that still wants a human is refused here too.
+  const toolResult = await resolveToolPermissionResult(tool, input, context);
+  if (toolResult.behavior === "ask" || toolResult.behavior === "deny") {
+    return refuse(readOnlyGrantRefusalMessage(tool.name, { kind: "interactive" }));
+  }
+  // A granted call clears the streak, so an occasional refusal mid-report does
+  // not accumulate into the escalated wording.
+  persistDenialState(
+    context,
+    recordSuccess(context.denialTracking ?? appState.denialTracking ?? freshDenialTracking()),
+  );
+  return unattendedAllowDecision(unattended.toolName, input);
+}
+
+function unattendedReadOnlyDenyDecision(
+  toolName: string,
+  message: string,
+): PermissionDenyDecision {
+  return Object.freeze({
+    behavior: "deny" as const,
+    message,
+    decisionReason: Object.freeze({
+      type: "other" as const,
+      reason: `unattended read-only run refused ${toolName}`,
+    }),
+    ruleSuggestions: null,
+  });
+}
+
 function planModeReadOnlyShellCommand(tool: ToolLike, input: unknown): boolean {
   if (!SHELL_TOOL_NAMES.has(tool.name)) return false;
   if (typeof input !== "object" || input === null) return false;
@@ -627,6 +739,24 @@ async function checkUnattendedPolicy(
   // so behavior is unchanged when no operator denylist is set.
   if (unattended.behavior === "deny") {
     return unattendedDenyDecision(unattended.toolName);
+  }
+
+  // A run with nobody attached cannot be asked anything, so `pause` never
+  // resolves and the run parks until a person cancels it. Under this policy it
+  // proceeds alone on read-only work and refuses the rest, which is how the
+  // run finishes its report rather than stopping at the first tool.
+  //
+  // This sits ABOVE the mode gate below on purpose: a routine still carrying
+  // permissionMode "plan" keeps `mode: "plan"` through `preserveMode`, so a
+  // branch placed after that early return would never run for it.
+  if (unattendedPolicyForContext(permissionContext).readOnly) {
+    return decideReadOnlyGrant(
+      tool,
+      input,
+      context,
+      permissionContext,
+      unattended,
+    );
   }
 
   // The allowlist / pause behaviors are the additive subset semantics that
