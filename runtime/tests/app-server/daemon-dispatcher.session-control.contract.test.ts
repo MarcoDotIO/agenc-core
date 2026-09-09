@@ -48,18 +48,18 @@ describe("daemon session-control internal method dispatch", () => {
     expect(addMcpServerToSession).toHaveBeenCalledOnce();
   });
 
-  it("derives local/remote turn authority from the connection, not user metadata", async () => {
+  it.each(["message.send", "message.stream"])("derives %s local/remote turn authority from the connection, not user metadata", async (method) => {
     const streamAgentMessage = vi.fn(async () => ({ disposition: "started", acceptedAt: "2026-09-09T00:00:00Z" }));
     const dispatcher = new AgenCDaemonJsonRpcDispatcher({ agentManager: { streamAgentMessage } as never });
     const local = dispatcher.createConnection();
     await initialize(local);
-    await local.dispatch({ jsonrpc: JSON_RPC_VERSION, id: "local", method: "message.send", params: { sessionId: "s", content: "open settings", metadata: { localMcpAccess: false } } });
+    await local.dispatch({ jsonrpc: JSON_RPC_VERSION, id: "local", method, params: { sessionId: "s", content: "open settings", metadata: { localMcpAccess: false } } });
     expect(streamAgentMessage).toHaveBeenLastCalledWith(expect.objectContaining({ localMcpAccess: true }));
     const remote = dispatcher.createConnection({ remoteAccess: { authorize: async (method: string) => { if (method === "session.mcp.addServer") throw new Error("denied"); }, allowsMethod: () => true, projection: () => ({}) } as never });
     await initialize(remote);
-    await remote.dispatch({ jsonrpc: JSON_RPC_VERSION, id: "remote", method: "message.send", params: { sessionId: "s", content: "open settings", metadata: { localMcpAccess: true } } });
+    await remote.dispatch({ jsonrpc: JSON_RPC_VERSION, id: "remote", method, params: { sessionId: "s", content: "open settings", metadata: { localMcpAccess: true } } });
     expect(streamAgentMessage).toHaveBeenLastCalledWith(expect.objectContaining({ localMcpAccess: false }));
-    const forged = await local.dispatch({ jsonrpc: JSON_RPC_VERSION, id: "forged", method: "message.send", params: { sessionId: "s", content: "open settings", localMcpAccess: true } });
+    const forged = await local.dispatch({ jsonrpc: JSON_RPC_VERSION, id: "forged", method, params: { sessionId: "s", content: "open settings", localMcpAccess: true } });
     expect(forged).toMatchObject({ error: { code: -32602 } });
   });
 

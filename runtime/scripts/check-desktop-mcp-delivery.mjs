@@ -5,13 +5,18 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { randomBytes, randomUUID, generateKeyPairSync, createHash, sign } from "node:crypto";
-import { readFile, mkdir, writeFile, appendFile, mkdtemp, chmod, realpath, rm } from "node:fs/promises";
+import { readFile, mkdir, writeFile, appendFile, mkdtemp, chmod, realpath, rm, access } from "node:fs/promises";
+import { constants } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { connect } from "../../packages/agenc-sdk/dist/index.js";
 import { createTuiGateState, createTuiGateProject, writeTuiGateDefaultConfig, writeTuiGateTrust, startTuiGateDaemon, teardownTuiGateState } from "./tui-gate-state.mjs";
 
 const bin = fileURLToPath(new URL("../dist/bin/agenc.js", import.meta.url));
+// Desktop inventory runs the CLI directly. Official package mode
+// canonicalization intentionally leaves dist JS non-executable; use the
+// shipped executable wrapper, as an installed app does.
+const desktopBin = fileURLToPath(new URL("../bin/agenc", import.meta.url));
 const sdkRequests = [];
 const calls = [];
 let token = randomBytes(24).toString("hex");
@@ -157,7 +162,8 @@ try {
   const before = await readFile(configPath, "utf8");
   await startTuiGateDaemon(state, bin);
   if (serve) {
-    const launch = { bin, project, provider: "openai", model, env: state.env, prompt: "DESKTOP_CONTROL_SMOKE: inspect Desktop state and window, then open Appearance settings using the authenticated Desktop tools." };
+    await access(desktopBin, constants.X_OK);
+    const launch = { bin: desktopBin, project, provider: "openai", model, env: state.env, prompt: "DESKTOP_CONTROL_SMOKE: inspect Desktop state and window, then open Appearance settings using the authenticated Desktop tools." };
     const path = join(state.root, "desktop-launch.json");
     await writeFile(path, JSON.stringify(launch, null, 2), { mode: 0o600 });
     console.log(JSON.stringify({ status: "READY", launchRecipe: path, agencHome: state.agencHome, modelBaseUrl: provider.url, project }));
